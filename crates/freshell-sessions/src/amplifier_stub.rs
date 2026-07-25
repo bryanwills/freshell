@@ -200,7 +200,9 @@ pub fn ensure_session(
 /// otherwise per-turn synchronous + atomic tmp+rename, so no transient
 /// mid-write windows exist and synchronous exit-hook GC is safe with this
 /// predicate.) A dir without parseable metadata is NOT recognizably a stub
-/// — never touched.
+/// — never touched. Conservative on I/O errors: any error other than
+/// NotFound on transcript.jsonl or events.jsonl means we cannot PROVE the
+/// never-used signature — keep.
 pub fn stub_is_unused(session_dir: &Path) -> bool {
     let Ok(raw) = std::fs::read_to_string(session_dir.join("metadata.json")) else {
         return false;
@@ -213,15 +215,30 @@ pub fn stub_is_unused(session_dir: &Path) -> bool {
     }
     match std::fs::metadata(session_dir.join("transcript.jsonl")) {
         Ok(m) if m.len() > 0 => return false,
-        _ => {}
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        // Cannot prove the transcript is empty — keep.
+        Err(_) => return false,
     }
-    // Substring scan is deliberate: the event line shape is the CLI's own
-    // (hooks-logging module), and any `"prompt:submit"` hit — parseable or
-    // not — must veto deletion.
-    if let Ok(events) = std::fs::read_to_string(session_dir.join("events.jsonl")) {
-        if events.contains("\"prompt:submit\"") {
-            return false;
+    // Substring scan over raw BYTES is deliberate: the event line shape is
+    // the CLI's own (hooks-logging module), and any `"prompt:submit"` hit —
+    // parseable or not — must veto deletion. Bytes (not read_to_string)
+    // because the exact kill-mid-first-turn scenario this guard exists for
+    // can truncate events.jsonl mid multi-byte codepoint, making it invalid
+    // UTF-8; a decode failure must not skip the veto.
+    const PROMPT_SUBMIT: &[u8] = b"\"prompt:submit\"";
+    match std::fs::read(session_dir.join("events.jsonl")) {
+        Ok(events) => {
+            if events
+                .windows(PROMPT_SUBMIT.len())
+                .any(|w| w == PROMPT_SUBMIT)
+            {
+                return false;
+            }
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        // Cannot prove the absence of a prompt:submit trace — keep.
+        Err(_) => return false,
     }
     true
 }
@@ -437,6 +454,19 @@ mod tests {
         )
         .unwrap();
         assert!(!stub_is_unused(&g));
+        // Conservative byte-scan (fix round 1): a SIGHUP kill can truncate
+        // events.jsonl mid multi-byte codepoint, making it invalid UTF-8 —
+        // the `prompt:submit` veto must still fire on raw bytes.
+        let h = write_gc_fixture(&home, "h", meta_unused, Some(""));
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend_from_slice(b"{\"event\":\"prompt:submit\"}\n");
+        bytes.push(0xFF); // trailing truncated codepoint
+        std::fs::write(h.join("events.jsonl"), bytes).unwrap();
+        assert!(!stub_is_unused(&h));
+        // Unparseable (present but invalid JSON) metadata.json: NOT
+        // recognizably a stub — never delete.
+        let i = write_gc_fixture(&home, "i", "{not json", Some(""));
+        assert!(!stub_is_unused(&i));
         // Missing metadata.json: NOT recognizably a stub — never delete.
         let f = home.join("projects").join("-p").join("sessions").join("f");
         std::fs::create_dir_all(&f).unwrap();
