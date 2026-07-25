@@ -52,7 +52,7 @@ use freshell_platform::detect::{host_os_live, is_windows, is_wsl_env_live};
 use freshell_platform::mcp_inject::{cleanup_mcp_config, generate_mcp_injection, RealMcpRuntime};
 use freshell_platform::spawn::{
     cli_provider_target, resolve_coding_cli_command, resolve_mcp_cwd, resolve_shell,
-    CliLaunchInputs, LaunchIntent, McpInjection,
+    resolve_unix_shell_cwd, CliLaunchInputs, LaunchIntent, McpInjection,
 };
 use freshell_platform::{
     build_cli_spawn_spec, build_spawn_spec, build_windows_cli_spawn_spec, Env, RealEnv,
@@ -974,7 +974,7 @@ async fn handle_create(
     // `resolve_create_cwd`): explicit `create.cwd`, else `settings.defaultCwd`,
     // else (non-Windows) `$HOME`. `mcp_cwd` derives from THIS resolved value
     // (spec §3.3 rev 2.1 — getting it wrong flips opencode's throw-vs-launch).
-    let resolved_cwd = resolve_create_cwd(
+    let mut resolved_cwd = resolve_create_cwd(
         create.cwd.as_deref(),
         state.settings.default_cwd.as_deref(),
         host_os,
@@ -996,12 +996,30 @@ async fn handle_create(
                 .as_deref()
                 .filter(|s| !s.is_empty())
                 .is_none();
+        // Launcher-assigned amplifier identity (plan §1), the fresh-claude
+        // preallocation's sibling: a FRESH amplifier pane gets a
+        // server-minted session id, and (below, once `terminal_id` exists)
+        // a pre-created stub dir — `amplifier resume <uuid>` of that stub
+        // IS the fresh launch. CRITICAL: `launch_intent` STAYS `Resume` —
+        // amplifier's manifest has resumeArgs only; `Start` without
+        // createSessionArgs is a hard StartIntentUnsupported error
+        // (cli_launch.rs:431-445; pinned by golden G-A4).
+        let should_preallocate_fresh_amplifier = mode == "amplifier"
+            && create.restore != Some(true)
+            && create.session_ref.is_none()
+            && create
+                .resume_session_id
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .is_none();
         if should_preallocate_fresh_claude {
             // `reserveClaudeFreshSessionId` → randomUUID() (`ws:969-975`); the
             // per-requestId dedupe cache is a retry concern this single-shot
             // handler does not have.
             resume_session_id = Some(Uuid::new_v4().to_string());
             launch_intent = LaunchIntent::Start;
+        } else if should_preallocate_fresh_amplifier {
+            resume_session_id = Some(Uuid::new_v4().to_string());
         } else {
             // `requestedSessionRef.provider === mode ? sessionRef.sessionId :
             // m.resumeSessionId` (`ws:2040-2047`). This INCLUDES codex: legacy
@@ -1214,6 +1232,114 @@ async fn handle_create(
             .await
         }
     };
+
+    // Amplifier pre-create (plan §1/§3/§5): make `amplifier resume <id>`
+    // guaranteed-resumable BEFORE spawn. Fresh creates get a brand-new stub;
+    // requested resumes whose dir is gone (e.g. a GC'd never-used stub from
+    // a previous run) are re-stubbed under the SAME id so restore keeps
+    // working; existing sessions are found and left untouched.
+    // HARD INVARIANT (plan §5, validated fix F4): ONE effective spawn cwd.
+    // The stub slug is computed from the SAME final value the spawn spec
+    // receives — run through the SAME launch-cwd transformation
+    // `build_cli_spawn_spec` applies internally (`resolve_unix_shell_cwd`,
+    // path.rs:642-665: e.g. on WSL a Windows-shaped `C:\...` cwd becomes
+    // `/mnt/c/...`; slugging the raw pre-conversion value would place the
+    // stub where the CLI never looks), existence-validated, then assigned
+    // back into `resolved_cwd` so the spawn-spec construction below uses it.
+    let mut amplifier_stub: Option<freshell_sessions::amplifier_stub::EnsuredSession> = None;
+    if mode == "amplifier" {
+        if let Some(session_id) = resume_session_id.as_deref() {
+            let Some(mut effective_cwd) =
+                resolve_unix_shell_cwd(resolved_cwd.as_deref(), &RealEnv, is_wsl)
+            else {
+                return send_create_error(
+                    ws_tx,
+                    ErrorCode::PtySpawnFailed,
+                    "Amplifier requires a resolvable working directory (cwd is part of the session identity contract).".to_string(),
+                    &create.request_id,
+                )
+                .await;
+            };
+            if !std::path::Path::new(&effective_cwd).is_dir() {
+                // Reject a vanished/bogus dir instead of letting
+                // canonical_cwd fall back to the raw path — a stub under
+                // slug(<gone dir>) plus the PTY layer's cwd-less spawn retry
+                // (inherits the BROKER's cwd) is a silently doomed resume.
+                return send_create_error(
+                    ws_tx,
+                    ErrorCode::PtySpawnFailed,
+                    format!("Amplifier working directory '{effective_cwd}' does not exist."),
+                    &create.request_id,
+                )
+                .await;
+            }
+            let ensured = freshell_sessions::amplifier_stub::resolve_amplifier_home()
+                .ok_or_else(|| "amplifier home unresolvable (no FRESHELL_AMPLIFIER_HOME and no HOME)".to_string())
+                .and_then(|amp_home| {
+                    freshell_sessions::amplifier_stub::ensure_session(
+                        &amp_home,
+                        session_id,
+                        &effective_cwd,
+                        &terminal_id,
+                    )
+                    .map_err(|e| e.to_string())
+                });
+            match ensured {
+                Ok(ensured) => {
+                    // Requested resume FOUND under a different slug than
+                    // slug(effective_cwd) (F4): cwd is part of amplifier's
+                    // identity contract — resuming from elsewhere finds
+                    // nothing. Spawn at the session's own working_dir, or
+                    // reject loudly if it no longer exists.
+                    if ensured.found_under_divergent_slug {
+                        match ensured
+                            .working_dir_of_existing
+                            .as_deref()
+                            .filter(|d| std::path::Path::new(d).is_dir())
+                        {
+                            Some(existing_dir) => effective_cwd = existing_dir.to_string(),
+                            None => {
+                                return send_create_error(
+                                    ws_tx,
+                                    ErrorCode::PtySpawnFailed,
+                                    format!(
+                                        "Amplifier session {session_id} was created in {}, which no longer exists.",
+                                        ensured
+                                            .working_dir_of_existing
+                                            .as_deref()
+                                            .unwrap_or("an unknown directory")
+                                    ),
+                                    &create.request_id,
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                    // CRITICAL (F4): hand the SAME value to the spawn spec —
+                    // `build_cli_spawn_spec(..., resolved_cwd.as_deref(), ...)`
+                    // below now receives the validated effective cwd
+                    // (re-resolution is idempotent: an absolute unix path
+                    // passes through resolve_unix_shell_cwd unchanged,
+                    // path.rs:651-653).
+                    resolved_cwd = Some(effective_cwd);
+                    amplifier_stub = Some(ensured);
+                }
+                Err(detail) => {
+                    // Fail LOUD: spawning `amplifier resume <id>` without a
+                    // resumable dir would hang a doomed CLI (the exact
+                    // failure mode this feature deletes).
+                    return send_create_error(
+                        ws_tx,
+                        ErrorCode::PtySpawnFailed,
+                        format!("Failed to pre-create amplifier session {session_id}: {detail}"),
+                        &create.request_id,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+    let _ = &amplifier_stub; // consumed by the exit-hook GC (Task 11)
 
     // `buildTerminalBaseEnv` (`tr:1529-1542`): FRESHELL/FRESHELL_URL/FRESHELL_TOKEN/
     // FRESHELL_TERMINAL_ID/+TAB/PANE. U6 resolution: the Rust server's canonical
