@@ -607,7 +607,7 @@ pub(crate) async fn spawn_terminal_pane(
         .get("shell")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let cwd = body.get("cwd").and_then(Value::as_str).map(str::to_string);
+    let mut cwd = body.get("cwd").and_then(Value::as_str).map(str::to_string);
 
     // Validate `cwd` up front: a nonexistent directory would otherwise fail
     // INSIDE the spawned child (post-fork), which a synchronous `registry.create`
@@ -626,6 +626,121 @@ pub(crate) async fn spawn_terminal_pane(
 
     let terminal_id = Uuid::new_v4().to_string();
     let stream_id = Uuid::new_v4().to_string();
+
+    // Launcher-assigned amplifier identity, REST half (plan §2): the SAME
+    // freshell-sessions/freshell-terminal helpers the WS path uses — this
+    // crate cannot reach freshell-ws (circular dep), so the shared logic
+    // lives below both. Covers POST /api/tabs creates AND pane splits.
+    let mut amplifier_stub: Option<freshell_sessions::amplifier_stub::EnsuredSession> = None;
+    if mode == "amplifier" {
+        if resume_session_id
+            .as_deref()
+            .is_some_and(|s| s.starts_with("terminal:"))
+        {
+            return Err(fail_json(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Invalid amplifier sessionRef '{}': synthetic terminal placeholder ids are not resumable sessions.",
+                    resume_session_id.as_deref().unwrap_or_default()
+                ),
+            ));
+        }
+        let is_restore = body.get("restore").and_then(Value::as_bool) == Some(true);
+        if resume_session_id.as_deref().filter(|s| !s.is_empty()).is_none() && !is_restore {
+            resume_session_id = Some(Uuid::new_v4().to_string());
+        }
+        if let Some(session_id) = resume_session_id.as_deref() {
+            if freshell_terminal::registry::has_live_resume(
+                &registry.identity_probe_rows(),
+                "amplifier",
+                session_id,
+            ) {
+                return Err(fail_json(
+                    StatusCode::CONFLICT,
+                    format!("Amplifier session {session_id} is already open in a live terminal."),
+                ));
+            }
+            // ONE effective spawn cwd (plan §5 hard invariant; validated fix
+            // F4). The falsified path this closes: cwd=None used to flow
+            // into `build_cli_spawn_spec(l, is_wsl, cwd.as_deref(), ...)`
+            // (anchor `cwd.as_deref()` at :808-810) → `spec.cwd = None` →
+            // pty.rs:210-214 never calls `cmd.cwd`, so the PTY inherited the
+            // BROKER's own cwd while the stub sat under slug($HOME) —
+            // silent divergence. Compute the effective cwd ONCE (explicit
+            // validated cwd, else $HOME), verify it is a dir, slug the stub
+            // from it, and assign it back into `cwd` below so the spawn
+            // plumbing receives the SAME value.
+            let mut effective_cwd = match cwd
+                .clone()
+                .or_else(|| std::env::var("HOME").ok().filter(|v| !v.is_empty()))
+            {
+                Some(c) => c,
+                None => {
+                    return Err(fail_json(
+                        StatusCode::BAD_REQUEST,
+                        "Amplifier requires a resolvable working directory (cwd is part of the session identity contract).".to_string(),
+                    ));
+                }
+            };
+            if !std::path::Path::new(&effective_cwd).is_dir() {
+                return Err(fail_json(
+                    StatusCode::BAD_REQUEST,
+                    format!("Amplifier working directory \"{effective_cwd}\" does not exist."),
+                ));
+            }
+            match freshell_sessions::amplifier_stub::resolve_amplifier_home()
+                .ok_or_else(|| "amplifier home unresolvable (no FRESHELL_AMPLIFIER_HOME and no HOME)".to_string())
+                .and_then(|amp_home| {
+                    freshell_sessions::amplifier_stub::ensure_session(
+                        &amp_home,
+                        session_id,
+                        &effective_cwd,
+                        &terminal_id,
+                    )
+                    .map_err(|e| e.to_string())
+                }) {
+                Ok(ensured) => {
+                    // Requested resume FOUND under a different slug than
+                    // slug(effective_cwd) (F4): spawn at the session's own
+                    // working_dir, or reject loudly if it's gone — resuming
+                    // from any other cwd finds nothing.
+                    if ensured.found_under_divergent_slug {
+                        match ensured
+                            .working_dir_of_existing
+                            .as_deref()
+                            .filter(|d| std::path::Path::new(d).is_dir())
+                        {
+                            Some(existing_dir) => effective_cwd = existing_dir.to_string(),
+                            None => {
+                                return Err(fail_json(
+                                    StatusCode::BAD_REQUEST,
+                                    format!(
+                                        "Amplifier session {session_id} was created in {}, which no longer exists.",
+                                        ensured
+                                            .working_dir_of_existing
+                                            .as_deref()
+                                            .unwrap_or("an unknown directory")
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    amplifier_stub = Some(ensured);
+                }
+                Err(detail) => {
+                    return Err(fail_json(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to pre-create amplifier session {session_id}: {detail}"),
+                    ));
+                }
+            }
+            // CRITICAL (F4): assign the effective cwd back so the existing
+            // spawn plumbing receives it — `build_cli_spawn_spec(..., cwd.as_deref(), ...)`
+            // (:808-810) and the registry row now record the effective cwd,
+            // never None (None would inherit the broker's own cwd).
+            cwd = Some(effective_cwd.clone());
+        }
+    }
 
     let mut cli: Option<CliLaunch> = None;
     let mut mcp_cwd: Option<String> = None;
@@ -845,6 +960,13 @@ pub(crate) async fn spawn_terminal_pane(
         let registry_for_exit = registry.clone();
         let amplifier_locator = state.amplifier_locator.clone();
         let opencode_locator = state.opencode_locator.clone();
+        // Amplifier stub GC (plan §8) — REST twin of the WS exit-hook GC.
+        // Never-used signature includes the F3 prompt:submit guard (Task 4).
+        let amplifier_stub_gc_for_exit = amplifier_stub
+            .as_ref()
+            .filter(|s| s.created)
+            .map(|s| s.session_dir.clone())
+            .zip(resume_session_id.clone());
         Some(Box::new(move |exit_code: i64| {
             cleanup_mcp_config(&RealMcpRuntime, &tid, &cleanup_mode, cleanup_cwd.as_deref());
             registry_for_exit.finish_pty_exit(&tid, exit_code);
@@ -854,6 +976,20 @@ pub(crate) async fn spawn_terminal_pane(
             // path's on_exit (`crates/freshell-ws/src/terminal.rs`).
             freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
                 .notify_terminal_exit(&tid);
+            if let Some((dir, sid)) = &amplifier_stub_gc_for_exit {
+                // GC-vs-second-resume race (validated fix F5/V7): skip GC
+                // when another live terminal already holds this resume id —
+                // deleting the dir would doom its resume. REST twin of the
+                // WS exit hook's guard.
+                if !freshell_terminal::registry::has_other_live_resume(
+                    &registry_for_exit.identity_probe_rows(),
+                    "amplifier",
+                    sid,
+                    &tid,
+                ) {
+                    let _ = freshell_sessions::amplifier_stub::gc_stub_if_unused(dir);
+                }
+            }
             if let Some(locator) = &amplifier_locator {
                 locator.disarm(&tid);
             }
@@ -890,6 +1026,26 @@ pub(crate) async fn spawn_terminal_pane(
             freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
                 .discard(launch)
                 .await;
+        }
+        // Task 7's race-free in-registry enforcement: map to the same reject
+        // as the friendly pre-check. ORDER IS LOAD-BEARING: this early-return
+        // must precede the stub GC below — `ensure_session` is not
+        // serialized, so under true concurrency the LOSER here can hold
+        // `created == true` while the WINNER's live terminal is already
+        // using the dir; GC on this path would delete the winner's session
+        // (same rationale as the WS twin, Task 10 Step 3).
+        if err.kind() == std::io::ErrorKind::AlreadyExists {
+            return Err(fail_json(
+                StatusCode::CONFLICT,
+                format!(
+                    "Amplifier session {} is already open in a live terminal.",
+                    resume_session_id.as_deref().unwrap_or_default()
+                ),
+            ));
+        }
+        // A stub written for a spawn that never happened is pure litter.
+        if let Some(stub) = amplifier_stub.as_ref().filter(|s| s.created) {
+            let _ = freshell_sessions::amplifier_stub::gc_stub_if_unused(&stub.session_dir);
         }
         let label = mode_label(&mode, cli.as_ref());
         let env_var = state
@@ -960,6 +1116,12 @@ pub(crate) async fn spawn_terminal_pane(
     if let Some(cd) = body.get("codexDurability").filter(|v| v.is_object()) {
         pane_content["codexDurability"] = cd.clone();
     }
+    // Launcher-assigned amplifier identity (plan §2/§6): the amplifier
+    // pre-create branch above assigns the minted/requested resume id into
+    // `resume_session_id` before this point, so fresh amplifier panes get
+    // their `sessionRef` synthesized right here — the REST twin of the WS
+    // path's terminal.created.sessionRef, preserving EDEV-07's
+    // sessionRef-XOR-resumeSessionId contract.
     // `paneContent` sessionRef/resumeSessionId, still mutually exclusive like
     // `router.ts:762-771` -- but with the EDEV-07 upgrade over legacy: a legacy
     // `resumeSessionId` for a known session provider is PROMOTED to the
@@ -1469,7 +1631,27 @@ mod tests {
     use std::sync::Arc;
     use tower::util::ServiceExt;
 
+    fn isolated_amplifier_home() -> std::path::PathBuf {
+        use std::sync::OnceLock;
+        static HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
+        HOME.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!(
+                "freshell-freshagent-test-amplifier-home-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            // FRESHELL_AMPLIFIER_HOME, not AMPLIFIER_HOME: the broker's
+            // single home resolution (Task 2's retarget) never consults the
+            // CLI's cache-only AMPLIFIER_HOME (validated F1).
+            // Edition-2021 `set_var` is safe; revisit on an edition bump.
+            std::env::set_var("FRESHELL_AMPLIFIER_HOME", &dir);
+            dir
+        })
+        .clone()
+    }
+
     fn state_with_registry() -> FreshAgentState {
+        isolated_amplifier_home(); // F7: eager per-process amplifier-home isolation
         let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
         FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx))
             .with_terminal_registry(freshell_terminal::TerminalRegistry::new())
@@ -2235,6 +2417,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "replaced by rest_amplifier_* tests; deleted with the locator in the deletion task"]
     async fn create_amplifier_tab_fresh_spawns_recorded_argv_with_no_resume_and_arms_locator() {
         let home = unique_temp_home("amplifier-fresh");
         let argv_file = unique_argv_file("amplifier-fresh");
@@ -2275,6 +2458,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "replaced by rest_amplifier_* tests; deleted with the locator in the deletion task"]
     async fn create_amplifier_tab_disarms_locator_on_exit() {
         let home = unique_temp_home("amplifier-disarm");
         let argv_file = unique_argv_file("amplifier-disarm");
@@ -2732,6 +2916,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "replaced by rest_amplifier_* tests; deleted with the locator in the deletion task"]
     async fn send_keys_enter_feeds_amplifier_locator_and_tick_locates_session() {
         let home = unique_temp_home("amplifier-e2e");
         let argv_file = unique_argv_file("amplifier-e2e");
@@ -2805,6 +2990,212 @@ mod tests {
 
         state.terminal_registry.clone().unwrap().kill(&terminal_id);
         let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
+    // ── Launcher-assigned amplifier identity: REST pre-create (plan §2) ─────
+
+    fn find_session_dir(home: &std::path::Path, session_id: &str) -> Option<std::path::PathBuf> {
+        for entry in std::fs::read_dir(home.join("projects")).ok()?.flatten() {
+            let candidate = entry.path().join("sessions").join(session_id);
+            if candidate.is_dir() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn rest_amplifier_create_preallocates_identity_and_stub() {
+        let home = isolated_amplifier_home();
+        let cwd = std::env::temp_dir().join(format!("fa-amp-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let argv_file = unique_argv_file("amplifier-precreate");
+        let state =
+            state_with_registry().with_cli_commands(std::sync::Arc::new(vec![recording_cli_spec(
+                "amplifier",
+                &argv_file,
+            )]));
+        let result = spawn_terminal_pane(
+            &state,
+            &serde_json::json!({ "mode": "amplifier", "cwd": cwd.to_string_lossy() }),
+            "tab-1",
+            "pane-1",
+        )
+        .await
+        .expect("spawn ok");
+
+        let sid = result.pane_content["sessionRef"]["sessionId"]
+            .as_str()
+            .expect("REST pane_content must carry the preallocated sessionRef")
+            .to_string();
+        assert_eq!(result.pane_content["sessionRef"]["provider"], "amplifier");
+        assert_eq!(sid.len(), 36, "server-minted uuid: {sid}");
+        // EDEV-07 mutual exclusivity (server/agent-api/router.ts:762-771,
+        // pinned by the kept tests at :2480/:2612): the existing promotion
+        // synthesizes sessionRef FROM the minted resume id — resumeSessionId
+        // must NOT ride alongside it in pane_content.
+        assert!(
+            result.pane_content.get("resumeSessionId").is_none(),
+            "sessionRef and resumeSessionId are mutually exclusive in pane_content"
+        );
+        assert!(find_session_dir(&home, &sid).is_some(), "stub on disk");
+        // Registry meta records it (identity_probe_rows is the shared truth).
+        let registry = state.terminal_registry.clone().unwrap();
+        let row = registry
+            .identity_probe_rows()
+            .into_iter()
+            .find(|r| r.resume_session_id.as_deref() == Some(sid.as_str()))
+            .expect("registry row carries the resume id");
+        assert_eq!(row.mode, "amplifier");
+        // F4: the spawn spec / registry row records the EFFECTIVE cwd (the
+        // same value the stub was slugged from) — never None.
+        assert_eq!(
+            row.cwd.as_deref(),
+            Some(cwd.to_string_lossy().as_ref()),
+            "spawn must receive the effective cwd the stub was slugged from"
+        );
+        registry.kill(&row.terminal_id);
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
+    #[tokio::test]
+    async fn rest_amplifier_create_without_cwd_spawns_and_stubs_in_home() {
+        // Falsified A7 (validated fix F4): cwd=None used to flow into
+        // build_cli_spawn_spec(..., None, ...) so the PTY inherited the
+        // BROKER's cwd while the stub sat under slug($HOME) — silent
+        // divergence. Now ONE effective cwd ($HOME here) feeds both.
+        let home = isolated_amplifier_home();
+        let argv_file = unique_argv_file("amplifier-nocwd");
+        let state =
+            state_with_registry().with_cli_commands(std::sync::Arc::new(vec![recording_cli_spec(
+                "amplifier",
+                &argv_file,
+            )]));
+        let result = spawn_terminal_pane(
+            &state,
+            &serde_json::json!({ "mode": "amplifier" }),
+            "tab-nocwd",
+            "pane-nocwd",
+        )
+        .await
+        .expect("spawn ok");
+        let sid = result.pane_content["sessionRef"]["sessionId"]
+            .as_str()
+            .expect("sessionRef present")
+            .to_string();
+        let user_home = std::env::var("HOME").expect("HOME set in tests");
+        let dir = find_session_dir(&home, &sid).expect("stub on disk");
+        let expected_slug = freshell_sessions::amplifier_stub::cwd_slug(
+            &freshell_sessions::amplifier_stub::canonical_cwd(&user_home).to_string_lossy(),
+        );
+        assert_eq!(
+            dir.parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            expected_slug,
+            "stub slug is slug($HOME), the effective spawn cwd"
+        );
+        let registry = state.terminal_registry.clone().unwrap();
+        let row = registry
+            .identity_probe_rows()
+            .into_iter()
+            .find(|r| r.resume_session_id.as_deref() == Some(sid.as_str()))
+            .expect("registry row");
+        assert_eq!(
+            row.cwd.as_deref(),
+            Some(user_home.as_str()),
+            "spawn spec must receive the effective cwd, not None (which inherits the broker's cwd)"
+        );
+        registry.kill(&row.terminal_id);
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
+    #[tokio::test]
+    async fn rest_amplifier_create_rejects_poisoned_and_duplicate_ids() {
+        let home = isolated_amplifier_home();
+        let cwd = std::env::temp_dir().join(format!("fa-amp-cwd2-{}", std::process::id()));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let argv_file = unique_argv_file("amplifier-rejects");
+        let state =
+            state_with_registry().with_cli_commands(std::sync::Arc::new(vec![recording_cli_spec(
+                "amplifier",
+                &argv_file,
+            )]));
+
+        // terminal:-poisoned ref → 400. NOTE: assert with `is_err()`, NOT
+        // `expect_err(..)` — `TerminalSpawnResult` (terminal_tabs.rs:509)
+        // does not derive Debug, so `expect_err` (which requires
+        // `T: Debug`) would not compile.
+        let poisoned = spawn_terminal_pane(
+            &state,
+            &serde_json::json!({
+                "mode": "amplifier",
+                "cwd": cwd.to_string_lossy(),
+                "sessionRef": { "provider": "amplifier", "sessionId": "terminal:deadbeef" },
+            }),
+            "tab-2",
+            "pane-2",
+        )
+        .await;
+        assert!(poisoned.is_err(), "poisoned ref must be rejected");
+
+        // Path-traversal id → rejected by ensure_session's single-segment
+        // gate (Task 3; io::ErrorKind::InvalidInput) through this handler's
+        // EXISTING ensure_session error path. The no-disk-write property of
+        // the gate is pinned by Task 3's unit test (the shared OnceLock
+        // home makes a "projects/ absent" assertion racy here); this case
+        // pins the end-to-end reject only.
+        let traversal = spawn_terminal_pane(
+            &state,
+            &serde_json::json!({
+                "mode": "amplifier",
+                "cwd": cwd.to_string_lossy(),
+                "sessionRef": { "provider": "amplifier", "sessionId": "../../escape" },
+            }),
+            "tab-2b",
+            "pane-2b",
+        )
+        .await;
+        assert!(traversal.is_err(), "path-traversal ids must be rejected");
+
+        // Double resume of one id → second create rejected.
+        let sid = "12121212-3434-5656-7878-909090909090";
+        let ok = spawn_terminal_pane(
+            &state,
+            &serde_json::json!({
+                "mode": "amplifier",
+                "cwd": cwd.to_string_lossy(),
+                "sessionRef": { "provider": "amplifier", "sessionId": sid },
+            }),
+            "tab-3",
+            "pane-3",
+        )
+        .await
+        .expect("first resume spawns");
+        assert!(
+            find_session_dir(&home, sid).is_some(),
+            "ensure-stub for requested resume"
+        );
+        let dup = spawn_terminal_pane(
+            &state,
+            &serde_json::json!({
+                "mode": "amplifier",
+                "cwd": cwd.to_string_lossy(),
+                "sessionRef": { "provider": "amplifier", "sessionId": sid },
+            }),
+            "tab-4",
+            "pane-4",
+        )
+        .await;
+        assert!(dup.is_err(), "same-id double resume must be rejected");
+        let registry = state.terminal_registry.clone().unwrap();
+        registry.kill(&ok.pane_content["terminalId"].as_str().unwrap().to_string());
         let _ = std::fs::remove_file(&argv_file);
     }
 
