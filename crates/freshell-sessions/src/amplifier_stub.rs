@@ -188,6 +188,55 @@ pub fn ensure_session(
     })
 }
 
+/// The verified-unambiguous "never used" signature (validated fix F3/V4):
+/// `metadata.json` lacks `turn_count` AND `transcript.jsonl` is empty or
+/// absent AND `events.jsonl` (if present) contains NO `prompt:submit`
+/// event. A lifecycle-only `events.jsonl` of any size is tolerated
+/// (zero-turn resumes leave metadata byte-identical but may write a small
+/// events file). The `prompt:submit` clause is a data-loss guard: the CLI
+/// handles only SIGINT, a PTY close is SIGHUP, and a kill mid-FIRST-turn
+/// persists nothing to metadata/transcript — but the user's typed prompt is
+/// already in events.jsonl; deleting the dir would destroy it. (Saves are
+/// otherwise per-turn synchronous + atomic tmp+rename, so no transient
+/// mid-write windows exist and synchronous exit-hook GC is safe with this
+/// predicate.) A dir without parseable metadata is NOT recognizably a stub
+/// — never touched.
+pub fn stub_is_unused(session_dir: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(session_dir.join("metadata.json")) else {
+        return false;
+    };
+    let Ok(meta) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    if meta.get("turn_count").is_some() {
+        return false;
+    }
+    match std::fs::metadata(session_dir.join("transcript.jsonl")) {
+        Ok(m) if m.len() > 0 => return false,
+        _ => {}
+    }
+    // Substring scan is deliberate: the event line shape is the CLI's own
+    // (hooks-logging module), and any `"prompt:submit"` hit — parseable or
+    // not — must veto deletion.
+    if let Ok(events) = std::fs::read_to_string(session_dir.join("events.jsonl")) {
+        if events.contains("\"prompt:submit\"") {
+            return false;
+        }
+    }
+    true
+}
+
+/// Delete a broker-created stub iff it is still unused ("own our litter" —
+/// without this, every never-typed-in terminal becomes a permanent '0 msgs'
+/// row in the user's `amplifier session list`). Returns whether the dir was
+/// removed. Best-effort: IO errors just leave the dir in place.
+pub fn gc_stub_if_unused(session_dir: &Path) -> bool {
+    if !stub_is_unused(session_dir) {
+        return false;
+    }
+    std::fs::remove_dir_all(session_dir).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +368,98 @@ mod tests {
         assert!(!home.join("projects").exists());
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    fn write_gc_fixture(
+        home: &PathBuf,
+        id: &str,
+        metadata: &str,
+        transcript: Option<&str>,
+    ) -> PathBuf {
+        let dir = home.join("projects").join("-p").join("sessions").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("metadata.json"), metadata).unwrap();
+        if let Some(t) = transcript {
+            std::fs::write(dir.join("transcript.jsonl"), t).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn stub_is_unused_recognizes_only_the_never_used_signature() {
+        let home = unique_temp_home("gc");
+        let meta_unused =
+            r#"{"session_id":"s","working_dir":"/x","created":"2026-03-01T00:00:00.000Z"}"#;
+        let meta_used = r#"{"session_id":"s","working_dir":"/x","created":"2026-03-01T00:00:00.000Z","turn_count":1}"#;
+
+        // Never used: no turn_count + empty transcript.
+        assert!(stub_is_unused(&write_gc_fixture(
+            &home,
+            "a",
+            meta_unused,
+            Some("")
+        )));
+        // Never used: no turn_count + transcript ABSENT.
+        assert!(stub_is_unused(&write_gc_fixture(
+            &home,
+            "b",
+            meta_unused,
+            None
+        )));
+        // Used: turn_count present.
+        assert!(!stub_is_unused(&write_gc_fixture(
+            &home,
+            "c",
+            meta_used,
+            Some("")
+        )));
+        // Used: non-empty transcript (even without turn_count).
+        assert!(!stub_is_unused(&write_gc_fixture(
+            &home,
+            "d",
+            meta_unused,
+            Some("{\"role\":\"user\"}\n")
+        )));
+        // A zero-turn resume may create a small events.jsonl of session
+        // LIFECYCLE events — tolerated (still unused).
+        let e = write_gc_fixture(&home, "e", meta_unused, Some(""));
+        std::fs::write(e.join("events.jsonl"), "{\"event\":\"session:start\"}\n").unwrap();
+        assert!(stub_is_unused(&e));
+        // VALIDATED data-loss guard (F3/V4): an events.jsonl holding a
+        // `prompt:submit` event means the user TYPED a prompt — a SIGHUP
+        // mid-first-turn persists nothing to metadata/transcript, so this is
+        // the ONLY trace of their content. NOT unused, even with empty
+        // transcript and no turn_count.
+        let g = write_gc_fixture(&home, "g", meta_unused, Some(""));
+        std::fs::write(
+            g.join("events.jsonl"),
+            "{\"event\":\"session:start\"}\n{\"event\":\"prompt:submit\",\"data\":{\"prompt\":\"hi there\"}}\n",
+        )
+        .unwrap();
+        assert!(!stub_is_unused(&g));
+        // Missing metadata.json: NOT recognizably a stub — never delete.
+        let f = home.join("projects").join("-p").join("sessions").join("f");
+        std::fs::create_dir_all(&f).unwrap();
+        assert!(!stub_is_unused(&f));
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn gc_stub_if_unused_deletes_only_unused_dirs() {
+        let home = unique_temp_home("gc-rm");
+        let meta_unused =
+            r#"{"session_id":"s","working_dir":"/x","created":"2026-03-01T00:00:00.000Z"}"#;
+        let meta_used = r#"{"session_id":"s","working_dir":"/x","created":"2026-03-01T00:00:00.000Z","turn_count":2}"#;
+        let unused = write_gc_fixture(&home, "u", meta_unused, Some(""));
+        let used = write_gc_fixture(&home, "v", meta_used, Some(""));
+
+        assert!(gc_stub_if_unused(&unused));
+        assert!(!unused.exists());
+        assert!(!gc_stub_if_unused(&used));
+        assert!(used.exists());
+
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
