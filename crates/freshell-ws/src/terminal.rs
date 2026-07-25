@@ -1382,7 +1382,18 @@ async fn handle_create(
             }
         }
     }
-    let _ = &amplifier_stub; // consumed by the exit-hook GC (Task 11)
+    // Amplifier stub GC (plan §8): on exit, delete OUR never-used stub so a
+    // never-typed-in terminal doesn't become a permanent '0 msgs' row in the
+    // user's `amplifier session list`. Only dirs THIS create wrote
+    // (`created == true`), and only while still carrying the never-used
+    // signature (no turn_count + empty transcript + no `prompt:submit` in
+    // events.jsonl — the validated F3 data-loss guard).
+    let amplifier_stub_gc_for_exit = amplifier_stub
+        .as_ref()
+        .filter(|s| s.created)
+        .map(|s| s.session_dir.clone())
+        .zip(resume_session_id.clone());
+    let registry_for_amplifier_gc = state.registry.clone();
 
     // `buildTerminalBaseEnv` (`tr:1529-1542`): FRESHELL/FRESHELL_URL/FRESHELL_TOKEN/
     // FRESHELL_TERMINAL_ID/+TAB/PANE. U6 resolution: the Rust server's canonical
@@ -1471,6 +1482,44 @@ async fn handle_create(
             freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
                 .notify_terminal_exit(&tid);
             identity.retire(&tid);
+            if let Some((dir, sid)) = &amplifier_stub_gc_for_exit {
+                // GC-vs-second-resume race (validated fix F5/V7): by the
+                // time this hook runs, our own row is already Exited (or
+                // removed by kill) — a NEW terminal may already be live on
+                // this same resume id, and deleting the dir out from under
+                // it would doom its resume. Skip GC in that case; the new
+                // terminal's own exit hook is not responsible either
+                // (`created == false` for it), which is correct: the dir is
+                // in use.
+                // ACCEPTED RESIDUAL (recorded in Self-Review 1b(c)): this
+                // guard reads registry rows, so a concurrent re-resume that
+                // has already passed `ensure_session` (found our stub) but
+                // has NOT yet inserted its registry row is invisible here —
+                // its dir can be GC'd in that sub-second window and its
+                // `amplifier resume <id>` then fails LOUDLY in-terminal;
+                // reopening the pane re-stubs the same id (ensure-after-GC,
+                // Phase 6). Closing it fully needs a cross-handler
+                // reservation keyed on resume id — out of proportion to a
+                // loud, one-click-recoverable, sub-second race.
+                if freshell_terminal::registry::has_other_live_resume(
+                    &registry_for_amplifier_gc.identity_probe_rows(),
+                    "amplifier",
+                    sid,
+                    &tid,
+                ) {
+                    tracing::debug!(
+                        terminal_id = %tid,
+                        session_id = %sid,
+                        "amplifier_stub_gc: skipped — another live terminal holds this resume id"
+                    );
+                } else if freshell_sessions::amplifier_stub::gc_stub_if_unused(dir) {
+                    tracing::debug!(
+                        terminal_id = %tid,
+                        dir = %dir.display(),
+                        "amplifier_stub_gc: removed never-used pre-created session"
+                    );
+                }
+            }
             if let Some(locator) = &amplifier_locator {
                 locator.disarm(&tid);
             }
@@ -1527,6 +1576,10 @@ async fn handle_create(
                 &create.request_id,
             )
             .await;
+        }
+        // A stub written for a spawn that never happened is pure litter.
+        if let Some(stub) = amplifier_stub.as_ref().filter(|s| s.created) {
+            let _ = freshell_sessions::amplifier_stub::gc_stub_if_unused(&stub.session_dir);
         }
         let label = mode_label(&mode, cli.as_ref());
         let env_var = state

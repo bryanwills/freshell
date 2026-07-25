@@ -243,6 +243,76 @@ async fn amplifier_creates_carry_launcher_assigned_identity() {
     assert!(dup["message"].as_str().unwrap_or_default().contains(resumed_id));
     registry.kill(&first_tid);
 
+    // ── Phase 4 (plan §8): stub GC. Phase 3's `first` terminal was a
+    // zero-turn CREATED stub — killing it must delete the dir.
+    {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while session_dir_for(&home, resumed_id).is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never-used stub must be GC'd on exit"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    // ── Phase 5 (plan §8 tolerance + used-session survival): a USED session
+    // survives exit. Create fresh, stamp the "used" signature, kill.
+    let capture3 = std::env::temp_dir().join(format!(
+        "freshell-amp-argv-used-{}.txt",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&capture3);
+    std::env::set_var("AMPLIFIER_ARGV_CAPTURE_PATH", &capture3);
+    let used = create_amplifier_terminal(
+        &mut ws,
+        "req-amp-used",
+        json!({ "cwd": cwd.to_string_lossy() }),
+    )
+    .await;
+    assert_eq!(used["type"], json!("terminal.created"));
+    let used_tid = used["terminalId"].as_str().unwrap().to_string();
+    let used_sid = session_ref_of(&used).unwrap()["sessionId"].as_str().unwrap().to_string();
+    let used_dir = session_dir_for(&home, &used_sid).expect("used stub dir");
+    // Simulate amplifier's first-turn save (the real-CLI contract test pins
+    // that a real turn writes turn_count).
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(used_dir.join("metadata.json")).unwrap())
+            .unwrap();
+    meta["turn_count"] = json!(1);
+    std::fs::write(used_dir.join("metadata.json"), meta.to_string()).unwrap();
+    std::fs::write(used_dir.join("transcript.jsonl"), "{\"role\":\"user\"}\n").unwrap();
+    registry.kill(&used_tid);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        session_dir_for(&home, &used_sid).is_some(),
+        "used sessions must survive exit"
+    );
+
+    // ── Phase 6 (ensure-after-GC): resuming the Phase-3 id (whose stub was
+    // GC'd in Phase 4) re-stubs it under the same id — restore keeps working
+    // for never-used panes across restarts.
+    let capture4 = std::env::temp_dir().join(format!(
+        "freshell-amp-argv-regc-{}.txt",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&capture4);
+    std::env::set_var("AMPLIFIER_ARGV_CAPTURE_PATH", &capture4);
+    let restored = create_amplifier_terminal(
+        &mut ws,
+        "req-amp-restore-after-gc",
+        json!({
+            "cwd": cwd.to_string_lossy(),
+            "sessionRef": { "provider": "amplifier", "sessionId": resumed_id },
+        }),
+    )
+    .await;
+    assert_eq!(restored["type"], json!("terminal.created"), "{restored}");
+    assert!(session_dir_for(&home, resumed_id).is_some(), "re-stubbed after GC");
+    let argv4 = wait_for_captured_argv(&capture4);
+    assert_eq!(argv4, vec!["resume".to_string(), resumed_id.to_string()]);
+    registry.kill(restored["terminalId"].as_str().unwrap());
+
     std::env::remove_var("AMPLIFIER_ARGV_CAPTURE_PATH");
     std::env::remove_var("AMPLIFIER_CMD");
 }
