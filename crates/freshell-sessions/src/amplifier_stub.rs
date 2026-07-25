@@ -254,6 +254,89 @@ pub fn gc_stub_if_unused(session_dir: &Path) -> bool {
     std::fs::remove_dir_all(session_dir).is_ok()
 }
 
+/// Outcome of the boot-time layout canary ([`verify_amplifier_layout_contract`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanaryOutcome {
+    Pass {
+        sessions_checked: usize,
+    },
+    /// No amplifier home / no sessions with a `working_dir` — nothing to
+    /// verify (amplifier unused or brand new). Not an error.
+    NothingToCheck,
+    Broken {
+        detail: String,
+    },
+}
+
+/// Cheap, re-runnable self-test of the on-disk contract this whole feature
+/// rests on (undocumented upstream; microsoft/amplifier#315/#316 track a
+/// `--session-id` flag that would collapse this layer into a flag): for a
+/// bounded sample of sessions AMPLIFIER ITSELF wrote, verify the project dir
+/// name equals [`cwd_slug`] of the session's own `working_dir`. A mismatch
+/// means amplifier changed its slug/layout and our pre-created stubs would
+/// silently diverge — callers log ERROR loudly but MUST NOT block broker
+/// start.
+///
+/// VALIDATED skip classes (F6/V5 full-corpus census: 5216/5216 parseable
+/// sessions match, incl. all 2700 subagent sessions; 0 mismatches) — these
+/// are real shapes in real data, NOT violations, and must be skipped rather
+/// than reported Broken: (a) session dirs with no/unparseable
+/// `metadata.json` (2.4% of the corpus — events.jsonl-only sessions) or no
+/// `working_dir`; (b) `projects/` entries with no `sessions/` subdir (a
+/// literal `{project}` template dir exists in real data). The `continue`s
+/// below implement exactly these skips.
+pub fn verify_amplifier_layout_contract(amplifier_home: &Path) -> CanaryOutcome {
+    const MAX_SESSIONS: usize = 20;
+    let projects = amplifier_home.join("projects");
+    let Ok(project_dirs) = std::fs::read_dir(&projects) else {
+        return CanaryOutcome::NothingToCheck;
+    };
+    let mut checked = 0usize;
+    for project in project_dirs.flatten() {
+        let Some(project_name) = project.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Ok(sessions) = std::fs::read_dir(project.path().join("sessions")) else {
+            continue;
+        };
+        for session in sessions.flatten() {
+            if checked >= MAX_SESSIONS {
+                return CanaryOutcome::Pass {
+                    sessions_checked: checked,
+                };
+            }
+            let Ok(raw) = std::fs::read_to_string(session.path().join("metadata.json")) else {
+                continue;
+            };
+            let Ok(meta) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                continue;
+            };
+            let Some(working_dir) = meta.get("working_dir").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            // `working_dir` was written RESOLVED by amplifier — slug it
+            // directly (no canonicalize: the dir may no longer exist).
+            let expected = cwd_slug(working_dir);
+            if expected != project_name {
+                return CanaryOutcome::Broken {
+                    detail: format!(
+                        "session {} has working_dir {working_dir} → expected project slug {expected}, but lives under {project_name}",
+                        session.path().display()
+                    ),
+                };
+            }
+            checked += 1;
+        }
+    }
+    if checked == 0 {
+        CanaryOutcome::NothingToCheck
+    } else {
+        CanaryOutcome::Pass {
+            sessions_checked: checked,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,6 +572,109 @@ mod tests {
         assert!(!gc_stub_if_unused(&used));
         assert!(used.exists());
 
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn canary_passes_when_real_session_dirs_match_our_slug() {
+        let home = unique_temp_home("canary-pass");
+        let dir = home
+            .join("projects")
+            .join(cwd_slug("/home/user/repos/app"))
+            .join("sessions")
+            .join("s1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("metadata.json"),
+            r#"{"session_id":"s1","working_dir":"/home/user/repos/app","created":"2026-03-01T00:00:00.000Z","turn_count":1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            verify_amplifier_layout_contract(&home),
+            CanaryOutcome::Pass {
+                sessions_checked: 1
+            }
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn canary_reports_broken_on_slug_divergence() {
+        let home = unique_temp_home("canary-broken");
+        // amplifier "changed" its slug algorithm: dir name no longer matches.
+        let dir = home
+            .join("projects")
+            .join("home_user_repos_app") // hypothetical new scheme
+            .join("sessions")
+            .join("s1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("metadata.json"),
+            r#"{"session_id":"s1","working_dir":"/home/user/repos/app","created":"2026-03-01T00:00:00.000Z"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            verify_amplifier_layout_contract(&home),
+            CanaryOutcome::Broken { .. }
+        ));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn canary_has_nothing_to_check_on_an_empty_or_missing_home() {
+        let home = unique_temp_home("canary-empty");
+        assert_eq!(
+            verify_amplifier_layout_contract(&home),
+            CanaryOutcome::NothingToCheck
+        );
+        assert_eq!(
+            verify_amplifier_layout_contract(&home.join("missing")),
+            CanaryOutcome::NothingToCheck
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn canary_skips_validated_real_world_shapes_without_false_alarms() {
+        // VALIDATED skip classes (F6/V5 census of the real corpus:
+        // 5216/5216 parseable sessions match the slug, 0 mismatches; 2.4%
+        // of sessions have NO metadata.json — events.jsonl-only; one
+        // literal `{project}` template dir with no `sessions/` exists).
+        let home = unique_temp_home("canary-skip");
+        let slug = cwd_slug("/home/user/repos/app");
+        // Skip class 1: session dir lacking metadata.json — skipped, not Broken.
+        let no_meta = home
+            .join("projects")
+            .join(&slug)
+            .join("sessions")
+            .join("s-nometa");
+        std::fs::create_dir_all(&no_meta).unwrap();
+        std::fs::write(
+            no_meta.join("events.jsonl"),
+            "{\"event\":\"session:start\"}\n",
+        )
+        .unwrap();
+        // Skip class 2: projects/ entry lacking a `sessions/` subdir.
+        std::fs::create_dir_all(home.join("projects").join("{project}")).unwrap();
+        // One qualifying session — the strict dir-name == cwd_slug(working_dir)
+        // check still runs and passes.
+        let ok = home
+            .join("projects")
+            .join(&slug)
+            .join("sessions")
+            .join("s-ok");
+        std::fs::create_dir_all(&ok).unwrap();
+        std::fs::write(
+            ok.join("metadata.json"),
+            r#"{"session_id":"s-ok","working_dir":"/home/user/repos/app","created":"2026-03-01T00:00:00.000Z","turn_count":1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            verify_amplifier_layout_contract(&home),
+            CanaryOutcome::Pass {
+                sessions_checked: 1
+            }
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
