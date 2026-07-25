@@ -9,7 +9,7 @@
 //! pinned by `test/integration/real/amplifier-stub-adoption-contract.test.ts`
 //! and re-checked at broker start by [`verify_amplifier_layout_contract`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// amplifier's cwd→project-slug algorithm (amplifier_app_cli
 /// `project_utils.py:22-30`), byte-exact:
@@ -67,9 +67,259 @@ pub fn resolve_amplifier_home() -> Option<PathBuf> {
     }
 }
 
+/// The outcome of [`ensure_session`]: where the session dir is, whether
+/// THIS call created it (`created` gates the exit-hook GC — the broker only
+/// ever deletes litter it wrote itself), and — for FOUND sessions — slug
+/// provenance (validated fix F4/V6): whether the dir lives under a project
+/// slug DIFFERENT from slug(canonical cwd), plus that session's own
+/// metadata `working_dir`. On a divergent find the caller MUST override the
+/// spawn cwd with `working_dir_of_existing` (if it exists and is a dir) or
+/// reject the create — `amplifier resume` only searches the spawn cwd's
+/// slug, so spawning at the requested cwd would silently find nothing.
+#[derive(Debug, Clone)]
+pub struct EnsuredSession {
+    pub session_dir: PathBuf,
+    pub created: bool,
+    pub found_under_divergent_slug: bool,
+    pub working_dir_of_existing: Option<String>,
+}
+
+/// Make `amplifier resume <session_id>` guaranteed-resumable from `cwd`
+/// BEFORE spawn. If the session dir already exists under ANY project slug
+/// (a real session, or a stub from a previous run), it is found and left
+/// untouched — with slug provenance reported (see [`EnsuredSession`]) so
+/// the caller can spawn at the session's own `working_dir` when the found
+/// slug differs from slug(cwd). Otherwise a stub is written under the slug
+/// of the CANONICAL cwd (HARD INVARIANT: amplifier only searches the
+/// current cwd's slug — the caller must spawn the PTY with this same cwd).
+///
+/// Stub shape (validated against the real CLI; see the Tier-1 contract
+/// test): `metadata.json` with `session_id`, `created` (ISO-8601 UTC),
+/// `working_dir` (canonical cwd), custom `freshell_terminal_id` (survives
+/// amplifier's saves — durable linkage bonus; Freshell's own registry stays
+/// primary), NO `bundle`; plus empty `transcript.jsonl` and empty
+/// `events.jsonl` (the latter so the activity hub's create-time resolver
+/// attach finds a file — see the module design note).
+pub fn ensure_session(
+    amplifier_home: &Path,
+    session_id: &str,
+    cwd: &str,
+    terminal_id: &str,
+) -> std::io::Result<EnsuredSession> {
+    // Path-safety gate (defense in depth): the id is joined into
+    // filesystem paths (`projects/<slug>/sessions/<session_id>`) that this
+    // function creates and writes, and that the exit-hook GC later
+    // `remove_dir_all`s. Reject anything that is not a plain single path
+    // segment BEFORE touching disk — an id containing `/`, `\`, or a bare
+    // `.`/`..` would escape the amplifier home (client-supplied via WS
+    // sessionRef, the REST body, or poisoned persisted state). Enforcing
+    // it HERE covers every caller and the GC's delete path (the GC only
+    // ever deletes dirs this function returned with `created: true`).
+    // Legal-but-implausible segments (e.g. whitespace ids) still pass:
+    // they produce at worst a harmless stub dir inside the home, and the
+    // pane_content plausibility gate already keeps them out of sessionRef.
+    if session_id.is_empty()
+        || session_id == "."
+        || session_id == ".."
+        || session_id.contains(['/', '\\', '\0'])
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("amplifier session id {session_id:?} is not a valid single path segment"),
+        ));
+    }
+    let resolved = canonical_cwd(cwd);
+    let expected_slug = cwd_slug(&resolved.to_string_lossy());
+    let projects = amplifier_home.join("projects");
+    if let Ok(entries) = std::fs::read_dir(&projects) {
+        for entry in entries.flatten() {
+            let candidate = entry.path().join("sessions").join(session_id);
+            if candidate.is_dir() {
+                let found_slug = entry.file_name().to_string_lossy().to_string();
+                let divergent = found_slug != expected_slug;
+                // On a divergent find, surface the session's own recorded
+                // working_dir so the caller can spawn there (F4).
+                let working_dir_of_existing = if divergent {
+                    std::fs::read_to_string(candidate.join("metadata.json"))
+                        .ok()
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                        .and_then(|meta| {
+                            meta.get("working_dir")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string)
+                        })
+                } else {
+                    None
+                };
+                return Ok(EnsuredSession {
+                    session_dir: candidate,
+                    created: false,
+                    found_under_divergent_slug: divergent,
+                    working_dir_of_existing,
+                });
+            }
+        }
+    }
+
+    let dir = projects
+        .join(expected_slug)
+        .join("sessions")
+        .join(session_id);
+    std::fs::create_dir_all(&dir)?;
+    let metadata = serde_json::json!({
+        "session_id": session_id,
+        "created": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "working_dir": resolved.to_string_lossy(),
+        "freshell_terminal_id": terminal_id,
+    });
+    std::fs::write(
+        dir.join("metadata.json"),
+        serde_json::to_string_pretty(&metadata)?,
+    )?;
+    std::fs::write(dir.join("transcript.jsonl"), "")?;
+    std::fs::write(dir.join("events.jsonl"), "")?;
+    Ok(EnsuredSession {
+        session_dir: dir,
+        created: true,
+        // Fresh stubs carry no divergence provenance (asserted by the
+        // fresh-stub test above).
+        found_under_divergent_slug: false,
+        working_dir_of_existing: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unique_temp_home(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "freshell-amp-stub-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn ensure_session_writes_the_designed_stub_shape() {
+        let home = unique_temp_home("ensure-fresh");
+        let cwd = unique_temp_home("ensure-fresh-cwd");
+        let ensured = ensure_session(
+            &home,
+            "11111111-2222-3333-4444-555555555555",
+            cwd.to_str().unwrap(),
+            "term-1",
+        )
+        .unwrap();
+        assert!(ensured.created);
+        // Fresh stubs carry no divergence provenance.
+        assert!(!ensured.found_under_divergent_slug);
+        assert!(ensured.working_dir_of_existing.is_none());
+
+        let canonical = std::fs::canonicalize(&cwd).unwrap();
+        let expected_dir = home
+            .join("projects")
+            .join(cwd_slug(canonical.to_str().unwrap()))
+            .join("sessions")
+            .join("11111111-2222-3333-4444-555555555555");
+        assert_eq!(ensured.session_dir, expected_dir);
+
+        let meta: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(expected_dir.join("metadata.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(meta["session_id"], "11111111-2222-3333-4444-555555555555");
+        assert_eq!(meta["working_dir"], canonical.to_str().unwrap());
+        assert_eq!(meta["freshell_terminal_id"], "term-1");
+        // ISO-8601 with tz — must parse through the crate's own parser.
+        assert!(crate::time::parse_timestamp_ms(&meta["created"]).is_some());
+        // Omit `bundle` so the user's default bundle resolves.
+        assert!(meta.get("bundle").is_none());
+        // No turn_count on a fresh stub (the GC "unused" signature).
+        assert!(meta.get("turn_count").is_none());
+
+        // Empty transcript + empty events (see the module design note).
+        assert_eq!(
+            std::fs::metadata(expected_dir.join("transcript.jsonl"))
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            std::fs::metadata(expected_dir.join("events.jsonl"))
+                .unwrap()
+                .len(),
+            0
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn ensure_session_finds_an_existing_dir_under_any_slug_and_does_not_touch_it() {
+        let home = unique_temp_home("ensure-existing");
+        let cwd = unique_temp_home("ensure-existing-cwd");
+        // Pre-existing session under a DIFFERENT project slug than cwd's.
+        let existing = home
+            .join("projects")
+            .join("-some-other-project")
+            .join("sessions")
+            .join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+        std::fs::create_dir_all(&existing).unwrap();
+        std::fs::write(existing.join("metadata.json"), r#"{"session_id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","working_dir":"/x","created":"2026-03-01T00:00:00.000Z","turn_count":3}"#).unwrap();
+
+        let ensured = ensure_session(
+            &home,
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            cwd.to_str().unwrap(),
+            "term-2",
+        )
+        .unwrap();
+        assert!(
+            !ensured.created,
+            "existing sessions are found, never re-stubbed"
+        );
+        assert_eq!(ensured.session_dir, existing);
+        // Provenance (validated fix F4): found under a slug DIFFERENT from
+        // slug(cwd) — the caller must spawn at the session's own
+        // working_dir (or reject), never at the requested cwd.
+        assert!(ensured.found_under_divergent_slug);
+        assert_eq!(ensured.working_dir_of_existing.as_deref(), Some("/x"));
+        // Untouched: still has turn_count, no freshell_terminal_id injected.
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(existing.join("metadata.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta["turn_count"], 3);
+        assert!(meta.get("freshell_terminal_id").is_none());
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn ensure_session_rejects_ids_that_are_not_a_single_path_segment() {
+        // Security gate: the id is client-controlled (WS sessionRef / REST
+        // body / persisted snapshots) and is joined into paths that get
+        // created, written, and later GC-deleted — separators or dot-dot
+        // must never reach the filesystem.
+        let home = unique_temp_home("ensure-badid");
+        let cwd = unique_temp_home("ensure-badid-cwd");
+        for bad in ["", ".", "..", "../../../etc/passwd", "a/b", "a\\b", "x\0y"] {
+            let err = ensure_session(&home, bad, cwd.to_str().unwrap(), "term-3")
+                .expect_err("non-single-segment ids must be rejected");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "id {bad:?}");
+        }
+        // Rejected BEFORE touching disk — not even projects/ appears.
+        assert!(!home.join("projects").exists());
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&cwd).ok();
+    }
 
     #[test]
     fn cwd_slug_matches_amplifiers_algorithm_exactly() {

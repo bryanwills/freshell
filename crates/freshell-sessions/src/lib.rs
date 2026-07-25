@@ -15,8 +15,8 @@
 //!    test in `tests/late_root_watcher_liveness.rs`.
 
 pub mod amplifier;
-pub mod amplifier_stub;
 pub mod amplifier_locator;
+pub mod amplifier_stub;
 pub mod directory_index;
 pub mod indexer;
 pub mod meta;
