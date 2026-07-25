@@ -292,6 +292,40 @@ pub struct IdentityProbeRow {
     pub cwd: Option<String>,
 }
 
+/// Same-id double-resume guard (launcher-assigned amplifier identity plan
+/// §11): does any RUNNING terminal of `mode` already carry `session_id` as
+/// its resume id? Amplifier has no upstream concurrency guard — two live
+/// PTYs resuming one session id would interleave writes into one session
+/// dir. Shared here so both the WS create path (`freshell-ws`) and the REST
+/// create path (`freshell-freshagent`) apply the identical predicate.
+/// NOTE: this is the friendly PRE-CHECK only — the race-free enforcement
+/// lives inside [`TerminalRegistry::create`] (validated fix F5).
+pub fn has_live_resume(rows: &[IdentityProbeRow], mode: &str, session_id: &str) -> bool {
+    rows.iter().any(|row| {
+        row.mode == mode
+            && row.status == TerminalRunStatus::Running
+            && row.resume_session_id.as_deref() == Some(session_id)
+    })
+}
+
+/// [`has_live_resume`] EXCLUDING one terminal id — the exit-hook stub-GC
+/// guard (validated fix F5/V7's GC-vs-second-resume race): "is another live
+/// terminal (not me) currently resuming this session id?" Used by both
+/// exit hooks (Tasks 11, 12) before deleting a never-used stub.
+pub fn has_other_live_resume(
+    rows: &[IdentityProbeRow],
+    mode: &str,
+    session_id: &str,
+    excluding_terminal_id: &str,
+) -> bool {
+    rows.iter().any(|row| {
+        row.terminal_id != excluding_terminal_id
+            && row.mode == mode
+            && row.status == TerminalRunStatus::Running
+            && row.resume_session_id.as_deref() == Some(session_id)
+    })
+}
+
 /// One terminal's row for the REST terminal directory (`registry.list()` as consumed
 /// by `terminal-view/service.ts#listTerminalDirectory`): the raw registry record the
 /// `/api/terminals` router projects into the wire `TerminalDirectoryItem` (override
@@ -688,6 +722,42 @@ impl TerminalRegistry {
         ring_max_bytes: Option<i64>,
         on_exit: Option<crate::pty::ExitHook>,
     ) -> io::Result<()> {
+        // Duplicate-live-resume enforcement (amplifier identity plan §11,
+        // validated fix F5/V7): the callers' `has_live_resume` pre-check is
+        // check-then-act and can race across WS/REST tasks — this registry's
+        // own §5.4 doc (keyed_create_inflight) names the exact TOCTOU. Claim
+        // a resume-scoped reservation BEFORE the spawn and re-check live
+        // rows under it; the row itself is inserted before the reservation
+        // is released, so no observable gap remains. Scoped to amplifier:
+        // other modes keep their existing create semantics.
+        let resume_guard_key = if mode == "amplifier" {
+            resume_session_id.map(|sid| format!("resume:{mode}:{sid}"))
+        } else {
+            None
+        };
+        if let Some(key) = &resume_guard_key {
+            let claimed = self.begin_keyed_create(key);
+            let duplicate_live = self.identity_probe_rows().iter().any(|row| {
+                row.mode == mode
+                    && row.status == TerminalRunStatus::Running
+                    && row.resume_session_id.as_deref() == resume_session_id
+            });
+            if !claimed || duplicate_live {
+                if claimed {
+                    self.end_keyed_create(key);
+                }
+                // Distinguishable error contract consumed by Tasks 10/12:
+                // ErrorKind::AlreadyExists ⇒ "session already open" reject.
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "duplicate live resume: {mode} session {} is already open in a live terminal",
+                        resume_session_id.unwrap_or_default()
+                    ),
+                ));
+            }
+        }
+
         let now = now_ms();
         let shared = Arc::new(Mutex::new(TerminalShared {
             terminal_id: terminal_id.clone(),
@@ -745,7 +815,7 @@ impl TerminalRegistry {
             ingest(&sink_shared, msg)
         });
 
-        let pty = PtyTerminal::spawn_with_sink(
+        let pty = match PtyTerminal::spawn_with_sink(
             spec,
             env,
             terminal_id.clone(),
@@ -753,7 +823,15 @@ impl TerminalRegistry {
             ring_max_bytes,
             Some(sink),
             on_exit,
-        )?;
+        ) {
+            Ok(pty) => pty,
+            Err(err) => {
+                if let Some(key) = &resume_guard_key {
+                    self.end_keyed_create(key);
+                }
+                return Err(err);
+            }
+        };
 
         // DIAG-01: terminal lifecycle event -- captured BEFORE `pty` is moved
         // into the registry, from the just-spawned PTY (so `pid` reflects
@@ -770,6 +848,10 @@ impl TerminalRegistry {
         );
         inner.revision += 1;
         drop(inner);
+
+        if let Some(key) = &resume_guard_key {
+            self.end_keyed_create(key);
+        }
 
         // DIAG-01 + 2026-07-22 incident fix: log the REAL mode and whether a
         // resume id was applied. This line used to hardcode `mode = "shell"`,
@@ -1977,6 +2059,128 @@ mod tests {
         );
 
         reg.kill("T-diag-created-codex");
+    }
+
+    #[test]
+    fn has_live_resume_matches_only_running_terminals_of_the_same_mode_and_id() {
+        let rows = vec![
+            IdentityProbeRow {
+                terminal_id: "t1".into(),
+                mode: "amplifier".into(),
+                status: TerminalRunStatus::Running,
+                created_at: 0,
+                resume_session_id: Some("sess-x".into()),
+                cwd: None,
+            },
+            IdentityProbeRow {
+                terminal_id: "t2".into(),
+                mode: "amplifier".into(),
+                status: TerminalRunStatus::Exited,
+                created_at: 0,
+                resume_session_id: Some("sess-y".into()),
+                cwd: None,
+            },
+            IdentityProbeRow {
+                terminal_id: "t3".into(),
+                mode: "codex".into(),
+                status: TerminalRunStatus::Running,
+                created_at: 0,
+                resume_session_id: Some("sess-z".into()),
+                cwd: None,
+            },
+        ];
+        assert!(has_live_resume(&rows, "amplifier", "sess-x"));
+        assert!(
+            !has_live_resume(&rows, "amplifier", "sess-y"),
+            "exited terminals don't block"
+        );
+        assert!(
+            !has_live_resume(&rows, "amplifier", "sess-z"),
+            "other modes don't block"
+        );
+        assert!(!has_live_resume(&rows, "amplifier", "sess-unknown"));
+
+        // has_other_live_resume: same predicate EXCLUDING one terminal id —
+        // the exit-hook GC's guard (its own row must not count as "another
+        // live terminal holds this id").
+        assert!(
+            !has_other_live_resume(&rows, "amplifier", "sess-x", "t1"),
+            "own row excluded"
+        );
+        assert!(has_other_live_resume(
+            &rows,
+            "amplifier",
+            "sess-x",
+            "t-other"
+        ));
+    }
+
+    /// Validated fix F5 (V7): the callers' `has_live_resume` pre-check is
+    /// check-then-act and can race across WS/REST tokio tasks — only the
+    /// registry's own reservation makes the duplicate-live-resume rejection
+    /// race-free. Two concurrent creates for one amplifier resume id →
+    /// exactly one succeeds; the loser fails with the distinguishable
+    /// `io::ErrorKind::AlreadyExists`.
+    #[test]
+    fn create_rejects_concurrent_duplicate_live_resume_atomically() {
+        let reg = TerminalRegistry::new();
+        let spec = SpawnSpec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "sleep 30".into()],
+            env_overrides: std::collections::BTreeMap::new(),
+            cwd: Some("/tmp".into()),
+            cols: 80,
+            rows: 24,
+        };
+        let env = std::collections::BTreeMap::new();
+        let results: Vec<std::io::Result<()>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = ["T-dup-a", "T-dup-b"]
+                .into_iter()
+                .map(|tid| {
+                    let (reg, spec, env) = (&reg, &spec, &env);
+                    scope.spawn(move || {
+                        reg.create(
+                            spec,
+                            env,
+                            tid.to_string(),
+                            format!("S-{tid}"),
+                            "amplifier",
+                            Some("dup-sess-1"),
+                            None,
+                            None,
+                            None,
+                        )
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let ok = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(
+            ok, 1,
+            "exactly one concurrent same-id resume create may succeed: {results:?}"
+        );
+        let err = results
+            .iter()
+            .find_map(|r| r.as_ref().err())
+            .expect("one loser");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        reg.kill("T-dup-a");
+        reg.kill("T-dup-b");
+        // Once no live row holds the id, resuming it again is allowed.
+        reg.create(
+            &spec,
+            &env,
+            "T-dup-c".to_string(),
+            "S-dup-c".to_string(),
+            "amplifier",
+            Some("dup-sess-1"),
+            None,
+            None,
+            None,
+        )
+        .expect("resume allowed once the previous terminal is gone");
+        reg.kill("T-dup-c");
     }
 
     /// **RED before implementation**: `TerminalRegistry::finish_pty_exit`
