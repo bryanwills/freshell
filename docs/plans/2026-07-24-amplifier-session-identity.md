@@ -57,6 +57,8 @@
 - `crates/freshell-ws/src/amplifier_association.rs` (479 lines incl. 6 tests)
 
 > **Line numbers** in this plan were verified against worktree HEAD `cdb760cc`. They will drift a few lines as earlier tasks land — every edit site also gives a searchable code anchor; trust the anchor over the number.
+>
+> **Base freshness (MANDATORY):** `origin/main` has already moved past `cdb760cc` — PRs #528–#531 landed restore/identity changes directly in this plan's primary edit targets (`crates/freshell-ws/src/terminal.rs` `handle_create`, `crates/freshell-ws/src/invariants.rs`, `crates/freshell-ws/tests/common/mod.rs`). BEFORE starting Task 1, run `git fetch origin && git merge origin/main` in the worktree, resolve any conflicts by re-locating edit sites via their searchable anchors, and re-read the merged versions of those three files around the amplifier/create paths so every task executes against the current base. Task 16 Step 1 repeats the sync immediately before the final verification gates and push.
 
 ---
 
@@ -521,7 +523,7 @@ git commit -m "feat(sessions): amplifier cwd-slug contract + ONE shared home res
 
 **Interfaces:**
 - Consumes: `cwd_slug`, `canonical_cwd` (Task 2).
-- Produces: `pub struct EnsuredSession { pub session_dir: PathBuf, pub created: bool, pub found_under_divergent_slug: bool, pub working_dir_of_existing: Option<String> }` and `pub fn ensure_session(amplifier_home: &Path, session_id: &str, cwd: &str, terminal_id: &str) -> std::io::Result<EnsuredSession>` (Tasks 9, 12). The two provenance fields (validated fix F4/V6) tell callers when a requested resume was FOUND under a project slug different from slug(cwd) — the caller must then spawn at the session's own `working_dir` (or reject), never at the requested cwd.
+- Produces: `pub struct EnsuredSession { pub session_dir: PathBuf, pub created: bool, pub found_under_divergent_slug: bool, pub working_dir_of_existing: Option<String> }` and `pub fn ensure_session(amplifier_home: &Path, session_id: &str, cwd: &str, terminal_id: &str) -> std::io::Result<EnsuredSession>` (Tasks 9, 12). The two provenance fields (validated fix F4/V6) tell callers when a requested resume was FOUND under a project slug different from slug(cwd) — the caller must then spawn at the session's own `working_dir` (or reject), never at the requested cwd. `ensure_session` also gates the client-supplied id to a single safe path segment (no `/`, `\`, bare `.`/`..`, NUL, or empty) BEFORE touching disk, returning `io::ErrorKind::InvalidInput` — enforcement at this choke point covers every caller (WS Task 9, REST Task 12) AND the exit-hook GC's `remove_dir_all` (which only ever deletes dirs this function returned), so traversal-shaped ids can never escape the amplifier home.
 
 **Design note (events.jsonl):** the stub also includes an empty `events.jsonl`. Rationale: the activity hub's create-time events-lane attach rides `resolve_amplifier_events_path` (`crates/freshell-server/src/main.rs:1019-1032` → `crates/freshell-ws/src/activity.rs:281-296`), which fires on `ActivityEvent::Created` for any amplifier terminal with a `resume_session_id` — but only if `events.jsonl` already `is_file()`. Pre-creating the empty file makes the existing, already-tested resolver path attach at create time for BOTH the WS and REST paths with zero new cross-crate plumbing (attach at `Eof` of an empty file ≡ `Start`). This is a file amplifier itself creates and appends to — not reliance on a tolerance — and Task 1's adoption contract test runs against a stub containing it. Home agreement (reconciliation, F1): the resolver's `projects_root` comes from `amplifier_home()` (`main.rs:401`, captured at boot) — retargeted in Task 2 to the SAME `FRESHELL_AMPLIFIER_HOME`-else-`$HOME/.amplifier` resolution the stub writer uses, and pinned by Task 2's env test — so the attach looks in the home the stub was written into under every configuration (Task 15 sets `FRESHELL_AMPLIFIER_HOME` in `construct.env` BEFORE the server boots, so the boot-time capture sees it).
 
@@ -621,6 +623,25 @@ git commit -m "feat(sessions): amplifier cwd-slug contract + ONE shared home res
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&cwd).ok();
     }
+
+    #[test]
+    fn ensure_session_rejects_ids_that_are_not_a_single_path_segment() {
+        // Security gate: the id is client-controlled (WS sessionRef / REST
+        // body / persisted snapshots) and is joined into paths that get
+        // created, written, and later GC-deleted — separators or dot-dot
+        // must never reach the filesystem.
+        let home = unique_temp_home("ensure-badid");
+        let cwd = unique_temp_home("ensure-badid-cwd");
+        for bad in ["", ".", "..", "../../../etc/passwd", "a/b", "a\\b", "x\0y"] {
+            let err = ensure_session(&home, bad, cwd.to_str().unwrap(), "term-3")
+                .expect_err("non-single-segment ids must be rejected");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "id {bad:?}");
+        }
+        // Rejected BEFORE touching disk — not even projects/ appears.
+        assert!(!home.join("projects").exists());
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&cwd).ok();
+    }
 ```
 
 - [ ] **Step 2: Run to verify failure**
@@ -670,6 +691,28 @@ pub fn ensure_session(
     cwd: &str,
     terminal_id: &str,
 ) -> std::io::Result<EnsuredSession> {
+    // Path-safety gate (defense in depth): the id is joined into
+    // filesystem paths (`projects/<slug>/sessions/<session_id>`) that this
+    // function creates and writes, and that the exit-hook GC later
+    // `remove_dir_all`s. Reject anything that is not a plain single path
+    // segment BEFORE touching disk — an id containing `/`, `\`, or a bare
+    // `.`/`..` would escape the amplifier home (client-supplied via WS
+    // sessionRef, the REST body, or poisoned persisted state). Enforcing
+    // it HERE covers every caller and the GC's delete path (the GC only
+    // ever deletes dirs this function returned with `created: true`).
+    // Legal-but-implausible segments (e.g. whitespace ids) still pass:
+    // they produce at worst a harmless stub dir inside the home, and the
+    // pane_content plausibility gate already keeps them out of sessionRef.
+    if session_id.is_empty()
+        || session_id == "."
+        || session_id == ".."
+        || session_id.contains(['/', '\\', '\0'])
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("amplifier session id {session_id:?} is not a valid single path segment"),
+        ));
+    }
     let resolved = canonical_cwd(cwd);
     let expected_slug = cwd_slug(&resolved.to_string_lossy());
     let projects = amplifier_home.join("projects");
@@ -717,14 +760,21 @@ pub fn ensure_session(
     std::fs::write(dir.join("metadata.json"), serde_json::to_string_pretty(&metadata)?)?;
     std::fs::write(dir.join("transcript.jsonl"), "")?;
     std::fs::write(dir.join("events.jsonl"), "")?;
-    Ok(EnsuredSession { session_dir: dir, created: true })
+    Ok(EnsuredSession {
+        session_dir: dir,
+        created: true,
+        // Fresh stubs carry no divergence provenance (asserted by the
+        // fresh-stub test above).
+        found_under_divergent_slug: false,
+        working_dir_of_existing: None,
+    })
 }
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p freshell-sessions amplifier_stub`
-Expected: all PASS (5 tests so far).
+Expected: all PASS (6 tests so far).
 
 - [ ] **Step 5: Commit**
 
@@ -1834,7 +1884,7 @@ and the arm:
     let _ = &amplifier_stub; // consumed by the exit-hook GC (Task 11)
 ```
 
-(`freshell-ws` already depends on `freshell-sessions` and `freshell-platform`; use the fully-qualified `freshell_sessions::` paths shown, and import `resolve_unix_shell_cwd` from `freshell_platform` next to the existing `build_cli_spawn_spec` import. Remove the `let _ = &amplifier_stub;` placeholder line in Task 11 when the GC consumes it. Accepted residual, recorded in Global Constraints: `pty.rs:224-232` can still retry a failed spawn WITHOUT cwd — the validate-immediately-before-spawn window is tiny and the failure is loud in-terminal.)
+(`freshell-ws` already depends on `freshell-sessions` and `freshell-platform`; use the fully-qualified `freshell_sessions::` paths shown, and import `resolve_unix_shell_cwd` from `freshell_platform` next to the existing `build_cli_spawn_spec` import. Ids that are not a single safe path segment — separators, bare `.`/`..`, empty — are rejected INSIDE `ensure_session` (Task 3, `io::ErrorKind::InvalidInput`) and surface here through the existing `Err(detail)` arm as a loud create reject; no extra WS-side validation code is needed. Remove the `let _ = &amplifier_stub;` placeholder line in Task 11 when the GC consumes it. Accepted residual, recorded in Global Constraints: `pty.rs:224-232` can still retry a failed spawn WITHOUT cwd — the validate-immediately-before-spawn window is tiny and the failure is loud in-terminal.)
 
 - [ ] **Step 5: Run the integration test to verify Phase 1 passes**
 
@@ -2353,8 +2403,11 @@ Then add the lookup helper and the new tests:
         std::fs::create_dir_all(&cwd).unwrap();
         let state = state_with_registry().with_cli_commands(/* as above */);
 
-        // terminal:-poisoned ref → 400.
-        let err = spawn_terminal_pane(
+        // terminal:-poisoned ref → 400. NOTE: assert with `is_err()`, NOT
+        // `expect_err(..)` — `TerminalSpawnResult` (terminal_tabs.rs:509)
+        // does not derive Debug, so `expect_err` (which requires
+        // `T: Debug`) would not compile.
+        let poisoned = spawn_terminal_pane(
             &state,
             &serde_json::json!({
                 "mode": "amplifier",
@@ -2364,9 +2417,27 @@ Then add the lookup helper and the new tests:
             "tab-2",
             "pane-2",
         )
-        .await
-        .expect_err("poisoned ref must be rejected");
-        drop(err);
+        .await;
+        assert!(poisoned.is_err(), "poisoned ref must be rejected");
+
+        // Path-traversal id → rejected by ensure_session's single-segment
+        // gate (Task 3; io::ErrorKind::InvalidInput) through this handler's
+        // EXISTING ensure_session error path. The no-disk-write property of
+        // the gate is pinned by Task 3's unit test (the shared OnceLock
+        // home makes a "projects/ absent" assertion racy here); this case
+        // pins the end-to-end reject only.
+        let traversal = spawn_terminal_pane(
+            &state,
+            &serde_json::json!({
+                "mode": "amplifier",
+                "cwd": cwd.to_string_lossy(),
+                "sessionRef": { "provider": "amplifier", "sessionId": "../../escape" },
+            }),
+            "tab-2b",
+            "pane-2b",
+        )
+        .await;
+        assert!(traversal.is_err(), "path-traversal ids must be rejected");
 
         // Double resume of one id → second create rejected.
         let sid = "12121212-3434-5656-7878-909090909090";
@@ -2407,7 +2478,7 @@ Then add the lookup helper and the new tests:
 Run: `cargo test -p freshell-freshagent rest_amplifier`
 Expected: FAIL — no sessionRef in pane_content, no stub, no rejects.
 
-- [ ] **Step 3: Implement** — first change the `let cwd = ...` binding (:610) to `let mut cwd = ...` (the amplifier branch assigns the effective cwd back into it). Then, in `spawn_terminal_pane`, insert directly after `let stream_id = Uuid::new_v4().to_string();` (:628). ORDERING IS LOAD-BEARING (validated, V8/A9.2): the stub — including `events.jsonl` — MUST be written here, BEFORE `registry.create`, because the activity events-lane resolver attaches at create time and requires `events.jsonl` to already exist (and it looks in the SAME home: `amplifier_home()` shares Task 2's `FRESHELL_AMPLIFIER_HOME`-else-`$HOME/.amplifier` resolution, pinned by Task 2's env test):
+- [ ] **Step 3: Implement** — first change the `let cwd = ...` binding (:610) to `let mut cwd = ...` (the amplifier branch assigns the effective cwd back into it). Then, in `spawn_terminal_pane`, insert directly after `let stream_id = Uuid::new_v4().to_string();` (:628). ORDERING IS LOAD-BEARING (validated, V8/A9.2): the stub — including `events.jsonl` — MUST be written here, BEFORE `registry.create`, because the activity events-lane resolver attaches at create time and requires `events.jsonl` to already exist (and it looks in the SAME home: `amplifier_home()` shares Task 2's `FRESHELL_AMPLIFIER_HOME`-else-`$HOME/.amplifier` resolution, pinned by Task 2's env test). Ids that are not a single safe path segment are rejected INSIDE `ensure_session` (Task 3, `io::ErrorKind::InvalidInput`) and surface through this branch's existing `Err(detail)` arm as a loud `fail_json` reject — no extra REST-side validation code; pinned end-to-end by the traversal case in Step 1's poisoned test:
 
 ```rust
     // Launcher-assigned amplifier identity, REST half (plan §2): the SAME
@@ -2910,27 +2981,39 @@ git commit -m "test(e2e): amplifier restore-across-restart on launcher-assigned 
 
 **Interfaces:** none.
 
-- [ ] **Step 1: Full Rust workspace**
+- [ ] **Step 1: Sync with origin/main and re-verify anchors (MANDATORY — never verify or push from a stale base)**
+
+```bash
+git fetch origin
+git merge origin/main
+```
+
+The plan was authored against `cdb760cc`, which `origin/main` has since overtaken (PRs #528–#531 landed restore/identity changes in this plan's primary edit targets: `crates/freshell-ws/src/terminal.rs` gained ~110 lines in `handle_create` — including the exact region Tasks 9/10 edit — `crates/freshell-ws/src/invariants.rs` gained the P0.4 `error_claude_restore_unresolved` invariant + tests adjacent to Task 13's const rename, and `crates/freshell-ws/tests/common/mod.rs` gained ~16 lines at Task 8's target). Expect real merge conflicts in those files; resolve them by re-locating every edit site via its searchable anchor (never the line number) and preserving BOTH this branch's amplifier-identity changes and main's restore/identity changes. Even if the merge is textually clean, semantic conflicts may not textualize — after merging, re-run the two drift-sensitive suites before the full gates:
+
+Run: `cargo test -p freshell-ws && cargo test -p freshell-freshagent`
+Expected: green. Do not proceed to Steps 2–6 until this passes on the merged base — the final gates below must certify the CURRENT main, not the authoring-time base.
+
+- [ ] **Step 2: Full Rust workspace**
 
 Run: `cargo test --workspace`
 Expected: green.
 
-- [ ] **Step 2: Coordinated JS/TS suite**
+- [ ] **Step 3: Coordinated JS/TS suite**
 
 Run: `FRESHELL_TEST_SUMMARY="amplifier-session-identity full gate" npm test`
 Expected: green (the real-provider contract tests self-skip; wait for the shared coordinator gate if held).
 
-- [ ] **Step 3: E2E**
+- [ ] **Step 4: E2E**
 
 Run: `npm run test:e2e -- --project=rust-chromium`
 Expected: green.
 
-- [ ] **Step 4: Log check for stragglers**
+- [ ] **Step 5: Log check for stragglers**
 
 Run: `grep -rn "AMPLIFIER_LOCATOR_SWEEP_INTERVAL" crates/ ; grep -rn "amplifier_locator" crates/ --include=*.rs | grep -v opencode_locator.rs | grep -v opencode_association.rs`
 Expected: zero hits for both (`opencode_locator.rs` AND `opencode_association.rs` keep inert doc-prose mentions containing the `amplifier_locator` substring — e.g. `spawn_amplifier_locator_sweep` in opencode_association.rs:78/:201 — both are do-not-touch files and the only intentional survivors, excluded above; same survivor accounting as Task 13 Step 4).
 
-- [ ] **Step 5: Push the branch — and STOP (no PR without explicit user approval)**
+- [ ] **Step 6: Push the branch — and STOP (no PR without explicit user approval)**
 
 ```bash
 git push -u origin feat/amplifier-session-identity
@@ -2947,4 +3030,4 @@ git push -u origin feat/amplifier-session-identity
 
 **2. Placeholder scan:** two intentional adaptation points remain and are explicitly bounded, not open-ended: Task 12 Step 1's `with_cli_commands(/* ... */)` (used by all three new `rest_amplifier_*` tests) points at the exact in-file helper (the deleted tests at :2241/:2281) to copy verbatim, and Task 15 keeps named existing helpers unchanged. Every other code step is complete.
 
-**3. Type consistency:** `cwd_slug(&str) -> String`, `canonical_cwd(&str) -> PathBuf`, `resolve_amplifier_home() -> Option<PathBuf>` (FRESHELL_AMPLIFIER_HOME else $HOME/.amplifier), `ensure_session(&Path, &str, &str, &str) -> io::Result<EnsuredSession>`, `EnsuredSession { session_dir: PathBuf, created: bool, found_under_divergent_slug: bool, working_dir_of_existing: Option<String> }`, `stub_is_unused(&Path) -> bool`, `gc_stub_if_unused(&Path) -> bool`, `verify_amplifier_layout_contract(&Path) -> CanaryOutcome`, `has_live_resume(&[IdentityProbeRow], &str, &str) -> bool`, `has_other_live_resume(&[IdentityProbeRow], &str, &str, &str) -> bool`, `resolve_unix_shell_cwd(Option<&str>, &dyn Env, bool) -> Option<String>` (pre-existing, freshell-platform spawn.rs:256), `TerminalRegistry::create(...) -> io::Result<()>` (signature unchanged; duplicate live resume ⇒ `io::ErrorKind::AlreadyExists`, matched by kind in Tasks 10/12), `spawn_identity_invariant_sweep(WsState, Duration)` — used with these exact signatures in Tasks 7-14. Error paths uniformly use `send_create_error(..., ErrorCode::PtySpawnFailed, ...)` (WS) and `fail_json(StatusCode, String)` (REST), matching each handler's native reject convention; the WS/REST amplifier branches require `mut` rebindings of `resolved_cwd` (Task 9) and `cwd` (Task 12), stated in those tasks' steps.
+**3. Type consistency:** `cwd_slug(&str) -> String`, `canonical_cwd(&str) -> PathBuf`, `resolve_amplifier_home() -> Option<PathBuf>` (FRESHELL_AMPLIFIER_HOME else $HOME/.amplifier), `ensure_session(&Path, &str, &str, &str) -> io::Result<EnsuredSession>`, `EnsuredSession { session_dir: PathBuf, created: bool, found_under_divergent_slug: bool, working_dir_of_existing: Option<String> }`, `stub_is_unused(&Path) -> bool`, `gc_stub_if_unused(&Path) -> bool`, `verify_amplifier_layout_contract(&Path) -> CanaryOutcome`, `has_live_resume(&[IdentityProbeRow], &str, &str) -> bool`, `has_other_live_resume(&[IdentityProbeRow], &str, &str, &str) -> bool`, `resolve_unix_shell_cwd(Option<&str>, &dyn Env, bool) -> Option<String>` (pre-existing, freshell-platform spawn.rs:256), `TerminalRegistry::create(...) -> io::Result<()>` (signature unchanged; duplicate live resume ⇒ `io::ErrorKind::AlreadyExists`, matched by kind in Tasks 10/12), `spawn_identity_invariant_sweep(WsState, Duration)` — used with these exact signatures in Tasks 7-14. Error paths uniformly use `send_create_error(..., ErrorCode::PtySpawnFailed, ...)` (WS) and `fail_json(StatusCode, String)` (REST), matching each handler's native reject convention; the WS/REST amplifier branches require `mut` rebindings of `resolved_cwd` (Task 9) and `cwd` (Task 12), stated in those tasks' steps. Client-supplied session ids are gated to a single safe path segment inside `ensure_session` itself (`io::ErrorKind::InvalidInput`, Task 3) — the choke point below both handlers and the GC — and both handlers surface that error through the same native reject paths (unit-pinned in Task 3, end-to-end-pinned by Task 12's traversal case).
