@@ -741,6 +741,24 @@ fn g_a3_amplifier_env_var_override() {
     assert_eq!(launch.command, "/custom/amplifier");
 }
 
+/// G-A4 — the amplifier pre-create branch (launcher-assigned session
+/// identity plan §1) MUST keep `LaunchIntent::Resume`: the manifest has
+/// `resumeArgs` only, so `Start` with a preallocated id is a hard
+/// `StartIntentUnsupported` error. `amplifier resume <uuid>` of the
+/// pre-created stub IS the fresh-session launch (G-A2 pins that argv).
+#[test]
+fn g_a4_amplifier_start_intent_with_preallocated_id_errors() {
+    let mut all_specs = specs();
+    all_specs.push(amplifier_spec());
+    let mut inputs = amplifier_inputs(Some("11111111-2222-3333-4444-555555555555"));
+    inputs.launch_intent = LaunchIntent::Start;
+    let err = resolve_coding_cli_command(&all_specs, &inputs, &env_of(&[])).unwrap_err();
+    assert_eq!(
+        err.message(),
+        "Fresh Amplifier launch requires createSessionArgs support."
+    );
+}
+
 /// The amplifier extension manifest (`extensions/amplifier/freshell.json`) is
 /// the single source of truth for its launch behavior — this crate never
 /// hardcodes a `CliCommandSpec` for it; `freshell-server`'s
