@@ -29,11 +29,15 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 # correlation refusal (`amplifier-session-locator.ts:727-733`'s `log.warn`
 # equivalent) -- same version already used by `freshell-ws`.
 tracing = "0.1"
+# `amplifier_stub`: launcher-minted session ids (`amplifier resume <uuidv4>`).
+# Promoted from [dev-dependencies] (SESSION-07 temp-file names in `search.rs`
+# tests still use it) -- same version/feature set as `freshell-server`.
+uuid = { version = "1", features = ["v4"] }
+# `amplifier_stub`: `created_at`/`updated_at` timestamps in the pre-created
+# metadata.json stubs. Same spec as `freshell-server`'s.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
 # The opencode SQLite parity test builds fixture databases with a writable connection
 # before the parser opens them read-only (same bundled engine, unified by cargo).
 rusqlite = { version = "0.31", features = ["bundled"] }
-# SESSION-07: unique temp-file names for `search.rs`'s file-content search
-# tests (same version/feature set as every other crate's `uuid` dependency).
-uuid = { version = "1", features = ["v4"] }
