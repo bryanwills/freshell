@@ -1077,6 +1077,49 @@ async fn handle_create(
         }
     }
 
+    // Amplifier identity hardening (plan §10/§11) — evaluated on the FINAL
+    // derived resume id, so both `sessionRef` and legacy `resumeSessionId`
+    // carriers are covered.
+    if mode == "amplifier" {
+        if resume_session_id
+            .as_deref()
+            .is_some_and(|s| s.starts_with("terminal:"))
+        {
+            // Defense-in-depth against the old correlation bug's poisoned
+            // persisted tab state: `terminal:<id>` is Freshell's own
+            // synthetic sidebar placeholder, never a resumable amplifier
+            // session — a resume of it hangs forever.
+            let poisoned = resume_session_id.clone().unwrap_or_default();
+            return send_create_error(
+                ws_tx,
+                ErrorCode::PtySpawnFailed,
+                format!(
+                    "Invalid amplifier sessionRef '{poisoned}': synthetic terminal placeholder ids are not resumable sessions."
+                ),
+                &create.request_id,
+            )
+            .await;
+        }
+        if let Some(requested) = resume_session_id.as_deref() {
+            // Same-id double-resume guard: amplifier has no upstream
+            // concurrency guard — never spawn two live PTYs resuming one
+            // session id. (Preallocated fresh UUIDs never collide.)
+            if freshell_terminal::registry::has_live_resume(
+                &state.registry.identity_probe_rows(),
+                "amplifier",
+                requested,
+            ) {
+                return send_create_error(
+                    ws_tx,
+                    ErrorCode::PtySpawnFailed,
+                    format!("Amplifier session {requested} is already open in a live terminal."),
+                    &create.request_id,
+                )
+                .await;
+            }
+        }
+    }
+
     // Provider settings `codingCli.providers[mode]` (`ws:2317-2319`), with the
     // codex strip (`ws:2464-2465` — model/sandbox/permissionMode route to the
     // app-server plan instead). Boot-snapshot settings (same documented caveat
@@ -1462,6 +1505,29 @@ async fn handle_create(
                 .await;
         }
         cleanup_mcp_config(&RealMcpRuntime, &terminal_id, &mode, mcp_cwd.as_deref());
+        // Task 7's race-free duplicate-live-resume enforcement inside
+        // registry.create (F5/V7): the pre-check above is a friendly fast
+        // path only — concurrent WS/REST creates can both pass it. Map the
+        // registry's distinguishable error to the SAME user-facing reject.
+        // ORDER IS LOAD-BEARING: this early-return must precede Task 11's
+        // stub GC in this failure branch. `ensure_session` itself is not
+        // serialized, so two truly concurrent creates of one id can BOTH
+        // observe "no dir yet" and race the mkdir — the LOSER here can hold
+        // `created == true` while the WINNER's live terminal is already
+        // using the dir; GC'ing it here would delete the winner's session
+        // out from under it.
+        if err.kind() == std::io::ErrorKind::AlreadyExists {
+            return send_create_error(
+                ws_tx,
+                ErrorCode::PtySpawnFailed,
+                format!(
+                    "Amplifier session {} is already open in a live terminal.",
+                    resume_session_id.as_deref().unwrap_or_default()
+                ),
+                &create.request_id,
+            )
+            .await;
+        }
         let label = mode_label(&mode, cli.as_ref());
         let env_var = state
             .cli_commands

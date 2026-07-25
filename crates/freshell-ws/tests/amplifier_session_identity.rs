@@ -188,6 +188,61 @@ async fn amplifier_creates_carry_launcher_assigned_identity() {
     assert_eq!(row.resume_session_id.as_deref(), Some(session_id.as_str()));
 
     registry.kill(&terminal_id);
+
+    // ── Phase 2 (plan §10): `terminal:`-prefixed sessionRef is the old
+    // correlation bug's poisoned persisted state — reject instead of
+    // spawning a doomed `amplifier resume terminal:<hex>`.
+    let rejected = create_amplifier_terminal(
+        &mut ws,
+        "req-amp-poisoned",
+        json!({
+            "cwd": cwd.to_string_lossy(),
+            "sessionRef": { "provider": "amplifier", "sessionId": "terminal:deadbeef" },
+        }),
+    )
+    .await;
+    assert_eq!(rejected["type"], json!("error"), "{rejected}");
+    assert!(
+        rejected["message"].as_str().unwrap_or_default().contains("terminal:"),
+        "reject names the synthetic id: {rejected}"
+    );
+
+    // ── Phase 3 (plan §11): same-id double-resume guard. First resume-create
+    // of X succeeds (ensure-stub writes the dir); a second concurrent one is
+    // rejected while the first is live.
+    let resumed_id = "99999999-8888-7777-6666-555555555555";
+    let capture2 = std::env::temp_dir().join(format!(
+        "freshell-amp-argv-resume-{}.txt",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&capture2);
+    std::env::set_var("AMPLIFIER_ARGV_CAPTURE_PATH", &capture2);
+    let first = create_amplifier_terminal(
+        &mut ws,
+        "req-amp-resume-1",
+        json!({
+            "cwd": cwd.to_string_lossy(),
+            "sessionRef": { "provider": "amplifier", "sessionId": resumed_id },
+        }),
+    )
+    .await;
+    assert_eq!(first["type"], json!("terminal.created"), "{first}");
+    let first_tid = first["terminalId"].as_str().unwrap().to_string();
+    // ensure-stub created the dir for the requested id.
+    assert!(session_dir_for(&home, resumed_id).is_some());
+    let dup = create_amplifier_terminal(
+        &mut ws,
+        "req-amp-resume-2",
+        json!({
+            "cwd": cwd.to_string_lossy(),
+            "sessionRef": { "provider": "amplifier", "sessionId": resumed_id },
+        }),
+    )
+    .await;
+    assert_eq!(dup["type"], json!("error"), "double-resume must be rejected: {dup}");
+    assert!(dup["message"].as_str().unwrap_or_default().contains(resumed_id));
+    registry.kill(&first_tid);
+
     std::env::remove_var("AMPLIFIER_ARGV_CAPTURE_PATH");
     std::env::remove_var("AMPLIFIER_CMD");
 }
