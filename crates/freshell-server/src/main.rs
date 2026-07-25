@@ -314,42 +314,27 @@ async fn main() -> ExitCode {
     // exists) -- see `freshell_ws::WsState::sessions_revision`'s doc comment
     // for the full parity rationale. Both producers now share this ONE
     // sequence (fix-forward: they previously used two independent counters).
-    // Restore-across-restart fix (`docs/plans/2026-07-18-amplifier-restore-spec.md`):
-    // the amplifier session locator, resolved against the SAME real-home root
-    // `AmplifierSource` above uses (`session_directory::provider_home()`), so
-    // an amplifier terminal's cwd is compared against the SAME
-    // `AMPLIFIER_HOME`/`<home>/.amplifier` the CLI itself writes into. `None`
-    // when the provider home can't be resolved (mirrors `session_index`'s own
-    // `Option` convention) -- every `amplifier_association` entry point
-    // no-ops in that case.
-    let amplifier_locator = session_directory::provider_home().map(|h| {
-        Arc::new(freshell_sessions::amplifier_locator::AmplifierLocator::new(
-            freshell_sessions::amplifier::amplifier_home(&h),
-        ))
-    });
     // OpenCode terminal-pane restore fix
     // (`docs/plans/2026-07-18-opencode-terminal-restore-spec.md`): sibling
     // locator, resolved against the SAME `default_opencode_data_home()` root
     // the `OpencodeSource` (History sidebar) uses above, so an opencode
     // terminal's cwd is compared against the SAME `opencode.db` the CLI
-    // itself writes into. Unconditionally `Some` (unlike `amplifier_locator`,
-    // which depends on `session_directory::provider_home()`): opencode's data
-    // home resolves independent of the isolated `FRESHELL_HOME` config root.
+    // itself writes into. Unconditionally `Some`: opencode's data home
+    // resolves independent of the isolated `FRESHELL_HOME` config root.
     let opencode_locator = Some(Arc::new(
         freshell_sessions::opencode_locator::OpencodeLocator::new(
             freshell_sessions::parse::default_opencode_data_home(),
         ),
     ));
     // Slice 3a (docs/plans/2026-07-18-agent-api-mcp-parity-spec.md): wire the
-    // SAME locators + coding-CLI command specs `ws_state` (below) gets into
-    // `fresh_agent_state` too, so `POST /api/tabs` terminal-mode creates (a)
-    // accept every mode the WS `terminal.create` path does and (b) arm a
-    // fresh amplifier/opencode pane in the IDENTICAL locator instance the
+    // SAME opencode locator + coding-CLI command specs `ws_state` (below)
+    // gets into `fresh_agent_state` too, so `POST /api/tabs` terminal-mode
+    // creates (a) accept every mode the WS `terminal.create` path does and
+    // (b) arm a fresh opencode pane in the IDENTICAL locator instance the
     // periodic sweep (spawned below, against `ws_state`) already polls --
     // one shared instance, no second sweep loop.
     let fresh_agent_state = fresh_agent_state
         .with_cli_commands(Arc::clone(&cli_commands))
-        .with_amplifier_locator(amplifier_locator.clone())
         .with_opencode_locator(opencode_locator.clone());
     // Batch B: `session_directory` no longer re-walks + re-parses every
     // transcript on every request -- it reads a cached, TTL-refreshed
@@ -390,10 +375,11 @@ async fn main() -> ExitCode {
     // TERM-15/TERM-16: the terminal-mode CLI activity hub. Consumes the
     // registry tap (installed right below), broadcasts *.activity.updated /
     // terminal.turn.complete / terminal.idle on the shared bus, and answers
-    // the *.activity.list requests. The resolver maps a RESUMED amplifier
-    // terminal's session id to its events.jsonl (one bounded projects walk at
-    // create time — fresh sessions instead get their path from the locator's
-    // association, see `amplifier_association`).
+    // the *.activity.list requests. The resolver maps an amplifier terminal's
+    // session id to its events.jsonl (one bounded projects walk at create
+    // time). With pre-created session stubs, EVERY amplifier create carries a
+    // resume id and an on-disk events.jsonl — fresh and resumed creates alike
+    // resolve here at create time (no locator hand-off).
     let activity_hub = {
         let resolver: Option<freshell_ws::activity::AmplifierEventsPathResolver> =
             session_directory::provider_home().map(|h| {
@@ -409,7 +395,6 @@ async fn main() -> ExitCode {
     let ws_state = WsState {
         activity: Some(activity_hub.clone()),
         identity: terminal_identity.clone(),
-        amplifier_locator: amplifier_locator.clone(),
         opencode_locator: opencode_locator.clone(),
         // Reconciliation handshake disk-truth probe (design §5.1): backed by
         // the SAME shared session index the History surfaces read; the
@@ -523,26 +508,21 @@ async fn main() -> ExitCode {
         // router merge below.
         spawn_sessions_sweep(Arc::clone(index), ws_state.clone(), SESSIONS_SWEEP_INTERVAL);
     }
-    // Restore-across-restart fix: the amplifier locator's polling cycle (its
-    // Enter↔session-dir correlation is entirely poll-driven -- see
-    // `freshell_sessions::amplifier_locator`'s module doc for why this
-    // substitutes for a live filesystem watcher). Independent of
-    // `session_index`/the History feature -- restore must work even when the
-    // History sidebar itself is unavailable.
-    if amplifier_locator.is_some() {
-        freshell_ws::amplifier_association::spawn_amplifier_locator_sweep(
-            ws_state.clone(),
-            AMPLIFIER_LOCATOR_SWEEP_INTERVAL,
-        );
-    }
+    // The identity invariant alarm (terminal_identity_unresolved) previously
+    // rode the amplifier locator sweep; amplifier identity is now assigned
+    // at create time, so the alarm runs on its own timer — unconditionally,
+    // covering every session-provider mode.
+    freshell_ws::invariants::spawn_identity_invariant_sweep(
+        ws_state.clone(),
+        LOCATOR_SWEEP_INTERVAL,
+    );
     // OpenCode terminal-pane restore fix: the opencode locator's polling
     // cycle (its Enter/spawn<->session-row correlation is entirely
     // poll-driven -- see `freshell_sessions::opencode_locator`'s module doc).
-    // Reuses the SAME cadence as the amplifier sweep above.
     if opencode_locator.is_some() {
         freshell_ws::opencode_association::spawn_opencode_locator_sweep(
             ws_state.clone(),
-            AMPLIFIER_LOCATOR_SWEEP_INTERVAL,
+            LOCATOR_SWEEP_INTERVAL,
         );
     }
     // DIAG-05: the diag router's `sessionsProjects` reads the SAME session
@@ -1103,13 +1083,13 @@ fn resolve_client_dir() -> PathBuf {
 /// coalescing window).
 const SESSIONS_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2000);
 
-/// Restore-across-restart fix: the amplifier locator's poll cadence. Well
-/// under `AMPLIFIER_DIR_APPEAR_WINDOW_MS` (2000ms) so a session dir that
-/// appears anywhere in the correlation window is observed (and its
-/// `events.jsonl` probed/confirmed) well before that window closes --
-/// `freshell_sessions::amplifier_locator`'s module doc has the full
-/// poll-vs-watcher rationale.
-const AMPLIFIER_LOCATOR_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
+/// Restore-across-restart fix: the shared sweep cadence for the opencode
+/// locator sweep and the identity invariant sweep. 150ms keeps the opencode
+/// Enter<->session-row correlation observed well inside its window (see
+/// `freshell_sessions::opencode_locator`'s module doc for the
+/// poll-vs-watcher rationale) and gives the identity alarm a prompt,
+/// negligible-cost tick.
+const LOCATOR_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// SESSION-09 (live sidebar updates): the signature a sessions-sweep tick
 /// compares against the previous tick's signature to decide whether a

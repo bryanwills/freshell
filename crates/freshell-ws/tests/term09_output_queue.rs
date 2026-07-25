@@ -79,7 +79,6 @@ async fn spawn_server(term09: Term09Config) -> String {
         ws_max_payload_bytes: 64 * 1024 * 1024,
         term09,
         config_fallback: None,
-        amplifier_locator: None,
         opencode_locator: None,
         activity: None,
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),

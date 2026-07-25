@@ -31,13 +31,12 @@ use freshell_terminal::registry::IdentityProbeRow;
 use crate::identity::TerminalIdentityRegistry;
 
 /// How long after terminal creation an unresolved identity becomes
-/// alarm-worthy. The amplifier locator's dir-appear correlation window is
-/// [`freshell_sessions::amplifier_locator::AMPLIFIER_DIR_APPEAR_WINDOW_MS`]
-/// (2s) after a submit; five windows of slack keeps the alarm quiet through
-/// any normal association latency while still firing within seconds of a
-/// genuinely-lost identity.
-pub(crate) const IDENTITY_RESOLUTION_GRACE_MS: i64 =
-    5 * freshell_sessions::amplifier_locator::AMPLIFIER_DIR_APPEAR_WINDOW_MS;
+/// alarm-worthy. Amplifier identity is now launcher-assigned at create time
+/// (pre-create + resume), so any RUNNING non-shell terminal without a
+/// resolvable identity after a generous 10s is a genuine bug, not
+/// association latency. (Historically 5 × the deleted amplifier locator's
+/// 2s dir-appear correlation window — same value, now a literal.)
+pub(crate) const IDENTITY_RESOLUTION_GRACE_MS: i64 = 10_000;
 
 /// One sweep pass: WARN (once per terminal, tracked in `warned`) for every
 /// RUNNING non-shell terminal older than [`IDENTITY_RESOLUTION_GRACE_MS`]
@@ -94,6 +93,26 @@ pub(crate) fn error_claude_restore_unresolved(request_id: &str) {
          sessionRef/resumeSessionId and no server-resolvable identity; rejected with \
          RESTORE_UNAVAILABLE instead of spawning an unidentifiable claude session"
     );
+}
+
+/// STATE-SYNC FIX 1 increment 2b, re-homed: the identity invariant alarm
+/// previously rode the (deleted) amplifier locator sweep — it now runs on
+/// its own timer, spawned unconditionally from `freshell-server::main`, so
+/// it also observes modes that never had a locator (gemini/kimi).
+pub fn spawn_identity_invariant_sweep(state: crate::WsState, interval: std::time::Duration) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        let mut identity_warned = std::collections::HashSet::new();
+        loop {
+            ticker.tick().await;
+            warn_unresolved_terminal_identities(
+                &state.registry.identity_probe_rows(),
+                &state.identity,
+                &mut identity_warned,
+                crate::terminal::now_ms(),
+            );
+        }
+    });
 }
 
 #[cfg(test)]

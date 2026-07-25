@@ -140,8 +140,11 @@ impl ActivityHub {
         })
     }
 
-    /// Attach an amplifier events lane for a freshly-ASSOCIATED terminal
-    /// (called by [`crate::amplifier_association`] once the locator resolves).
+    /// Attach an amplifier events lane for a terminal whose session identity
+    /// arrived after tracking began. With launcher-assigned identity, the
+    /// create-time resolver (`freshell-server`'s events-path resolver) is the
+    /// production path for EVERY amplifier create; this entry point remains
+    /// for its test coverage of the attach/replay mechanics.
     /// `Start` replays the young file from byte 0 — the recorded
     /// `prompt:submit` is what confirms the tracker's provisional busy.
     pub fn attach_amplifier_association(

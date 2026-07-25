@@ -86,7 +86,6 @@ async fn spawn_server(ws_max_payload_bytes: usize) -> String {
         ws_max_payload_bytes,
         term09: freshell_ws::backpressure::Term09Config::default(),
         config_fallback: None,
-        amplifier_locator: None,
         opencode_locator: None,
         activity: None,
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),

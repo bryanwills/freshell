@@ -80,8 +80,8 @@ async fn send(ws_tx: &mut WsSink, msg: &ServerMessage) -> bool {
 }
 
 /// `Date.now()` — epoch milliseconds (`terminal.created.createdAt`). Also
-/// reused by `crate::amplifier_association` for the locator's `now_ms`
-/// clock -- one wall-clock source for the whole crate.
+/// reused by the identity invariant sweep and the opencode association seam
+/// for their `now_ms` clocks -- one wall-clock source for the whole crate.
 pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -489,15 +489,6 @@ async fn handle_client_text(
             state
                 .registry
                 .input(&input.terminal_id, input.data.as_bytes());
-            // Restore-across-restart fix: an armed amplifier terminal's first
-            // Enter/submit opens the locator's Enter↔session-dir correlation
-            // window. No-ops for every other terminal/mode (never armed) and
-            // for non-submit-shaped input.
-            crate::amplifier_association::note_possible_submit(
-                state,
-                &input.terminal_id,
-                &input.data,
-            );
             // Restore-across-restart fix (opencode): sibling seam for an
             // armed opencode terminal's first Enter/submit. No-ops for every
             // other terminal/mode and for non-submit-shaped input.
@@ -1464,11 +1455,6 @@ async fn handle_create(
         // -> `terminalMetadata.retire(terminalId)` (`server/index.ts:526-534`), so a
         // rename cascade still resolves after this terminal's process has exited.
         let identity = state.identity.clone();
-        // Restore-across-restart fix: disarm the amplifier locator too, so an
-        // exited (never-submitted, or already-associated) terminal's armed
-        // entry is never left dangling (mirrors `handleExit`,
-        // `amplifier-session-locator.ts:220-223`).
-        let amplifier_locator = state.amplifier_locator.clone();
         // Restore-across-restart fix (opencode): sibling disarm, so an exited
         // (never-submitted, or already-associated) opencode terminal's armed
         // entry is never left dangling.
@@ -1519,9 +1505,6 @@ async fn handle_create(
                         "amplifier_stub_gc: removed never-used pre-created session"
                     );
                 }
-            }
-            if let Some(locator) = &amplifier_locator {
-                locator.disarm(&tid);
             }
             if let Some(locator) = &opencode_locator {
                 locator.disarm(&tid);
@@ -1632,16 +1615,6 @@ async fn handle_create(
         None,
         Some(mode.clone()),
         resume_session_id.clone(),
-    );
-
-    // Restore-across-restart fix: arm the amplifier locator for a FRESH
-    // (non-resuming) amplifier pane. No-ops for every other mode/resume case.
-    crate::amplifier_association::maybe_arm(
-        state,
-        &terminal_id,
-        &mode,
-        resolved_cwd.as_deref(),
-        resume_session_id.as_deref(),
     );
 
     // Restore-across-restart fix (opencode): arm the opencode locator for a
@@ -2937,7 +2910,6 @@ mod terminals_changed_tests {
             ws_max_payload_bytes: 16 * 1024 * 1024,
             term09: crate::backpressure::Term09Config::default(),
             config_fallback: None,
-            amplifier_locator: None,
             opencode_locator: None,
             activity: None,
             session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
@@ -3141,7 +3113,6 @@ mod terminal_meta_created_tests {
             ws_max_payload_bytes: 16 * 1024 * 1024,
             term09: crate::backpressure::Term09Config::default(),
             config_fallback: None,
-            amplifier_locator: None,
             opencode_locator: None,
             activity: None,
             session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
