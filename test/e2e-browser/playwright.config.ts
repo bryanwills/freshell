@@ -86,6 +86,9 @@ const RUST_ONLY_SPECS = [
   // COMPOUND-RESTART: drives RustServer.restartAbrupt() (SIGKILL + reboot),
   // an owned-fixture capability the default/legacy seam does not implement.
   /compound-restart-rust\.spec\.ts$/,
+  // Restore-resilience contract wall (P0.1 "the ruler") -- imports RustServer
+  // directly for restartAbrupt(); see docs/plans/2026-07-24-restore-contract-wall.md
+  /restore-contract-wall-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -204,6 +207,9 @@ export default defineConfig({
         // browser restarting together. Rust-only: requires the owned
         // RustServer.restartAbrupt() fixture capability.
         /compound-restart-rust\.spec\.ts$/,
+        // Restore-resilience contract wall (P0.1 "the ruler") -- imports RustServer
+        // directly for restartAbrupt(); see docs/plans/2026-07-24-restore-contract-wall.md
+        /restore-contract-wall-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL

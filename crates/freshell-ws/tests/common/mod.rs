@@ -80,6 +80,17 @@ pub fn sleeper_cli_spec(name: &str) -> freshell_platform::CliCommandSpec {
 /// spec registered so resume creates spawn a real (sleeper) PTY. Returns the
 /// ws URL + the shared registry (for cleanup kills).
 pub async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
+    spawn_server_with_specs(vec![
+        sleeper_cli_spec("amplifier"),
+        sleeper_cli_spec("claude"),
+    ])
+    .await
+}
+
+#[allow(dead_code)] // not every test binary uses the injectable variant
+pub async fn spawn_server_with_specs(
+    cli_commands: Vec<freshell_platform::CliCommandSpec>,
+) -> (String, freshell_terminal::TerminalRegistry) {
     let auth_token = Arc::new(AUTH_TOKEN.to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
     let settings =
@@ -110,10 +121,7 @@ pub async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
-        cli_commands: Arc::new(vec![
-            sleeper_cli_spec("amplifier"),
-            sleeper_cli_spec("claude"),
-        ]),
+        cli_commands: Arc::new(cli_commands),
         shutdown: Arc::new(tokio::sync::Notify::new()),
         ping_interval_ms: 30_000,
         hello_timeout_ms: 5_000,

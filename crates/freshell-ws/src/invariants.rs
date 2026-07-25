@@ -78,6 +78,24 @@ pub(crate) fn warn_unresolved_terminal_identities(
     }
 }
 
+/// P0.4 fail-loud (campaign plan §2.2): a `restore:true` claude create carried
+/// no client id AND no server-side identity source could resolve one -- an
+/// invariant-violation ("never happens") state. The create is rejected with
+/// `error{RESTORE_UNAVAILABLE}` instead of silently spawning claude with
+/// neither `--session-id` nor `--resume` (an unidentifiable, permanently
+/// un-resumable session). ERROR, not WARN: unlike the sweep alarms above,
+/// this is a per-request hard failure the user sees. Grep target:
+/// `claude_restore_identity_unresolved`.
+pub(crate) fn error_claude_restore_unresolved(request_id: &str) {
+    tracing::error!(
+        target: "freshell_ws::invariants",
+        request_id = %request_id,
+        "claude_restore_identity_unresolved: restore:true claude create had no \
+         sessionRef/resumeSessionId and no server-resolvable identity; rejected with \
+         RESTORE_UNAVAILABLE instead of spawning an unidentifiable claude session"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,6 +274,35 @@ mod tests {
         warn_unresolved_terminal_identities(&rows, &identity, &mut warned, i64::MAX);
 
         assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn error_claude_restore_unresolved_emits_on_invariants_target() {
+        let (events, _guard) = capture::capture();
+
+        super::error_claude_restore_unresolved("req-lost-42");
+
+        let captured: Vec<capture::CapturedEvent> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.target == "freshell_ws::invariants")
+            .cloned()
+            .collect();
+        assert_eq!(captured.len(), 1, "exactly one emission: {captured:?}");
+        assert!(
+            captured[0]
+                .message
+                .starts_with("claude_restore_identity_unresolved:"),
+            "message must lead with the grep-target invariant name: {}",
+            captured[0].message
+        );
+        assert_eq!(
+            captured[0].fields.get("request_id").map(String::as_str),
+            Some("req-lost-42"),
+            "request_id must be a structured field: {:?}",
+            captured[0]
+        );
     }
 
     #[test]

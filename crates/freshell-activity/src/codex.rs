@@ -25,7 +25,10 @@
 //!    and `unknown` phases, and resume-busy seeding) is not yet ported. On
 //!    the Rust server a codex pane would otherwise NEVER have an activity
 //!    record at all — the exact TERM-15 bug this crate fixes. The PTY-lane
-//!    state machine itself is ported faithfully.
+//!    state machine itself is ported faithfully. (A vestigial `bind_session`
+//!    binder for that lane was deleted as dead code; session identity arrives
+//!    via `track_terminal`'s `session_id` argument, and a future port of the
+//!    lane would introduce its own binder.)
 //! 2. **Zero-polling**: `next_deadline()` + one-shot hub timer instead of the
 //!    5s sweep (`ACTIVITY_SWEEP_MS`), same as [`crate::claude`].
 
@@ -147,19 +150,6 @@ impl CodexActivityTracker {
         let next = state.to_record();
         self.states.insert(terminal_id.to_string(), state);
         changed(None, next)
-    }
-
-    pub fn bind_session(&mut self, terminal_id: &str, session_id: &str) -> Vec<CodexEffect> {
-        let Some(state) = self.states.get_mut(terminal_id) else {
-            return Vec::new();
-        };
-        if state.session_id.as_deref() == Some(session_id) {
-            return Vec::new();
-        }
-        let previous = state.to_record();
-        state.session_id = Some(session_id.to_string());
-        let next = state.to_record();
-        changed(Some(&previous), next)
     }
 
     pub fn note_exit(&mut self, terminal_id: &str) -> Vec<CodexEffect> {

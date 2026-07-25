@@ -55,9 +55,9 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex as TokioMutex;
 
 use freshell_protocol::{
-    ErrorCode, ErrorMsg, FreshAgentCreate, FreshAgentCreateFailed, FreshAgentCreated,
-    FreshAgentEvent, FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled, FreshAgentSend,
-    FreshAgentSendAccepted, ServerMessage, SessionType,
+    ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCreate, FreshAgentCreateFailed,
+    FreshAgentCreated, FreshAgentEvent, FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled,
+    FreshAgentSend, FreshAgentSendAccepted, ServerMessage, SessionType,
 };
 
 use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome};
@@ -377,6 +377,29 @@ impl FreshClaudeState {
         ));
     }
 
+    // ── freshAgent.attach (restart-resilience P0.2, slice 1: stop the swallow) ──────────
+
+    /// Handle a `freshAgent.attach` for claude/kilroy. Decision table (this slice):
+    ///
+    /// | State | Action |
+    /// |---|---|
+    /// | tracked | no-op -- NO frame (wire-shape parity with codex tracked-and-alive) |
+    /// | NOT tracked | `lost_session_frame` (`INVALID_SESSION_ID`) -> the client marks the pane `.lost` and `triggerRecovery` re-creates with `resumeSessionId` |
+    ///
+    /// Unlike codex (`ensure_session_resumable`) and opencode (`resume_durable_session`)
+    /// there is deliberately NO in-place resume here yet: claude has no server-side resume
+    /// path in the Rust port, and the restart-resilience plan (§2.8) slices that as
+    /// follow-on work (record cliSessionId, real attach arm, snapshot adapter). In this
+    /// slice recovery is CLIENT-driven -- the lost frame un-wedges a pane stuck BUSY
+    /// after a server restart instead of the prior silent swallow.
+    pub async fn handle_attach(&self, msg: FreshAgentAttach) {
+        let tracked = self.sessions.lock().await.contains_key(&msg.session_id);
+        if tracked {
+            return;
+        }
+        self.broadcast(&lost_session_frame(&msg.session_id, msg.session_type));
+    }
+
     fn send_error(&self, request_id: &Option<String>, code: &str, message: &str) {
         self.broadcast(&ServerMessage::Error(ErrorMsg {
             code: ErrorCode::InternalError,
@@ -476,6 +499,26 @@ fn session_type_str(session_type: SessionType) -> &'static str {
         SessionType::Kilroy => "kilroy",
         _ => "freshclaude",
     }
+}
+
+/// The `freshAgent.error{code:'INVALID_SESSION_ID'}` shape (`sdk-events.ts:37`) the client
+/// folds into `markSessionLost` (`fresh-agent-ws.ts:326-328`) instead of hanging on a stale
+/// `freshAgent.attach` for a session this server has never heard of. Third copy after
+/// `codex.rs`/`opencode_ws.rs` (both document the duplication) -- but unlike those two this
+/// one cannot hardcode the session type: provider `claude` covers BOTH `freshclaude` and
+/// `kilroy`, so the envelope's sessionType comes from the attach message.
+fn lost_session_frame(session_id: &str, session_type: SessionType) -> ServerMessage {
+    ServerMessage::FreshAgentEvent(FreshAgentEvent {
+        event: json!({
+            "type": "freshAgent.error",
+            "sessionId": session_id,
+            "code": "INVALID_SESSION_ID",
+            "message": format!("claude session {session_id} not found"),
+        }),
+        provider: PROVIDER.to_string(),
+        session_id: session_id.to_string(),
+        session_type: session_type_str(session_type).to_string(),
+    })
 }
 
 // ── Node sidecar spawn ──────────────────────────────────────────────────────────────────
@@ -698,6 +741,101 @@ mod tests {
     fn state() -> FreshClaudeState {
         let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
         FreshClaudeState::new(Arc::new(tx))
+    }
+
+    fn state_with_bus() -> (FreshClaudeState, tokio::sync::broadcast::Receiver<String>) {
+        let (tx, rx) = tokio::sync::broadcast::channel::<String>(64);
+        (FreshClaudeState::new(Arc::new(tx)), rx)
+    }
+
+    fn attach_msg(session_id: &str) -> FreshAgentAttach {
+        FreshAgentAttach {
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: session_id.to_string(),
+            session_type: SessionType::Freshclaude,
+            cwd: None,
+            resume_session_id: None,
+            session_ref: None,
+        }
+    }
+
+    /// Insert a fake tracked session directly into the map, bypassing the sidecar spawn
+    /// (the claude analog of codex.rs's `spawn_sleeper` + `insert_fake_session`). The
+    /// `sleep 30` child stands in for the Node sidecar; `kill_on_drop` reaps it at test end.
+    async fn insert_fake_claude_session(st: &FreshClaudeState, session_id: &str) {
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleeper");
+        let stdin = child.stdin.take().expect("piped stdin");
+        let consumer = tokio::spawn(async {});
+        st.sessions.lock().await.insert(
+            session_id.to_string(),
+            ClaudeSession {
+                stdin,
+                child,
+                ownership_id: format!("test-{session_id}"),
+                consumer,
+            },
+        );
+    }
+
+    /// P0.2 slice 1 (restart-resilience §2.8): an attach for a session this process does
+    /// not track (the always-true case after a server restart) must emit the
+    /// `freshAgent.error{code:'INVALID_SESSION_ID'}` lost-session shape -- NOT be
+    /// swallowed -- so the client marks the pane `.lost` and `triggerRecovery`
+    /// re-creates with `resumeSessionId` (`fresh-agent-ws.ts:325-327`).
+    #[tokio::test]
+    async fn handle_attach_untracked_session_emits_lost_session_frame() {
+        let (st, mut rx) = state_with_bus();
+
+        st.handle_attach(attach_msg("does-not-exist")).await;
+
+        let raw = rx.try_recv().expect("a lost-session frame was broadcast");
+        let frame: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(frame["type"], "freshAgent.event");
+        assert_eq!(frame["sessionId"], "does-not-exist");
+        assert_eq!(frame["provider"], "claude");
+        assert_eq!(frame["sessionType"], "freshclaude");
+        assert_eq!(frame["event"]["type"], "freshAgent.error");
+        assert_eq!(frame["event"]["code"], "INVALID_SESSION_ID");
+    }
+
+    /// Kilroy panes send `provider: "claude"` with `sessionType: "kilroy"` -- the envelope
+    /// must echo the message's session type or the client builds the wrong locator and the
+    /// pane never goes `.lost`.
+    #[tokio::test]
+    async fn handle_attach_untracked_kilroy_session_keeps_kilroy_session_type() {
+        let (st, mut rx) = state_with_bus();
+        let mut msg = attach_msg("kilroy-gone");
+        msg.session_type = SessionType::Kilroy;
+
+        st.handle_attach(msg).await;
+
+        let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(frame["sessionType"], "kilroy");
+        assert_eq!(frame["provider"], "claude");
+        assert_eq!(frame["event"]["code"], "INVALID_SESSION_ID");
+    }
+
+    /// Wire-shape parity with codex's tracked-and-alive row (codex.rs decision table /
+    /// `handle_attach_known_alive_session_emits_no_frame_regardless_of_turn_state`):
+    /// attaching to a session this process DOES track must broadcast nothing -- above all
+    /// it must never declare a live session lost (which would make the client kill and
+    /// re-create a healthy pane).
+    #[tokio::test]
+    async fn handle_attach_tracked_session_broadcasts_nothing() {
+        let (st, mut rx) = state_with_bus();
+        insert_fake_claude_session(&st, "still-alive").await;
+
+        st.handle_attach(attach_msg("still-alive")).await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "tracked attach must not broadcast any frame (wire-shape parity)"
+        );
     }
 
     #[test]

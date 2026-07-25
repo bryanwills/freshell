@@ -8,12 +8,8 @@
 //! shapes `placeholderIdPattern == durableIdPattern`). The on-disk transcript is
 //! `rollout-<ts>-<threadId>.jsonl` under `<CODEX_HOME>/sessions/<date-dirs>/`
 //! (`codex-gptmini.json` provenance).
-//!
-//! The **immutable-candidate** rule from the durability store
-//! (`durability-store.ts`, `coding-cli.md §4c`) is modeled by [`DurabilityCandidate`]: once a
-//! `{ candidateThreadId, rolloutPath }` is set it cannot change.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use uuid::Uuid;
 
@@ -48,20 +44,6 @@ pub fn default_server_instance_id() -> String {
         .unwrap_or_else(|_| format!("srv-{}", std::process::id()))
 }
 
-/// `defaultCodexDurabilityStoreDir()` (`durability-store.ts:24-27`):
-/// `FRESHELL_CODEX_DURABILITY_DIR` or `<home>/.freshell/codex-durability`.
-pub fn default_durability_store_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("FRESHELL_CODEX_DURABILITY_DIR") {
-        return PathBuf::from(dir);
-    }
-    let home = home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.join(".freshell").join("codex-durability")
-}
-
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
-}
-
 /// `extractSessionIdFromFilename(filePath)` (`providers/codex.ts:417-421`): the UUID embedded
 /// in a `rollout-<ts>-<threadId>.jsonl` basename, else the basename (minus `.jsonl`) verbatim.
 pub fn extract_session_id_from_filename(file_path: &str) -> String {
@@ -73,76 +55,6 @@ pub fn extract_session_id_from_filename(file_path: &str) -> String {
     match find_uuid(base) {
         Some(uuid) => uuid,
         None => base.to_string(),
-    }
-}
-
-/// The immutable `{ candidateThreadId, rolloutPath }` a durability record pins for a terminal
-/// (`durability-store.ts:95-102`; `coding-cli.md §4c`). Once set it cannot be reassigned to a
-/// different value — a re-set with the SAME value is idempotent, a DIFFERENT value is an error.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct DurabilityCandidate {
-    candidate_thread_id: Option<String>,
-    rollout_path: Option<String>,
-}
-
-/// Raised when a durability candidate would be mutated after it was pinned
-/// (the reference's immutability guard, `durability-store.ts:95-102`).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CandidateImmutableError {
-    pub field: &'static str,
-    pub existing: String,
-    pub attempted: String,
-}
-
-impl std::fmt::Display for CandidateImmutableError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Codex durability {} is immutable once set (have {:?}, refused {:?}).",
-            self.field, self.existing, self.attempted
-        )
-    }
-}
-
-impl std::error::Error for CandidateImmutableError {}
-
-impl DurabilityCandidate {
-    pub fn candidate_thread_id(&self) -> Option<&str> {
-        self.candidate_thread_id.as_deref()
-    }
-
-    pub fn rollout_path(&self) -> Option<&str> {
-        self.rollout_path.as_deref()
-    }
-
-    /// Pin the `{ candidateThreadId, rolloutPath }`. Idempotent for an identical re-set; an
-    /// attempt to change an already-pinned field yields [`CandidateImmutableError`].
-    pub fn set(
-        &mut self,
-        candidate_thread_id: &str,
-        rollout_path: &str,
-    ) -> Result<(), CandidateImmutableError> {
-        if let Some(existing) = &self.candidate_thread_id {
-            if existing != candidate_thread_id {
-                return Err(CandidateImmutableError {
-                    field: "candidateThreadId",
-                    existing: existing.clone(),
-                    attempted: candidate_thread_id.to_string(),
-                });
-            }
-        }
-        if let Some(existing) = &self.rollout_path {
-            if existing != rollout_path {
-                return Err(CandidateImmutableError {
-                    field: "rolloutPath",
-                    existing: existing.clone(),
-                    attempted: rollout_path.to_string(),
-                });
-            }
-        }
-        self.candidate_thread_id = Some(candidate_thread_id.to_string());
-        self.rollout_path = Some(rollout_path.to_string());
-        Ok(())
     }
 }
 
@@ -244,29 +156,5 @@ mod tests {
             let id = default_server_instance_id();
             assert!(id.starts_with("srv-"), "got {id}");
         }
-    }
-
-    #[test]
-    fn durability_candidate_is_immutable_once_set() {
-        let mut candidate = DurabilityCandidate::default();
-        assert_eq!(candidate.candidate_thread_id(), None);
-        candidate
-            .set("thread-a", "/rollouts/a.jsonl")
-            .expect("first set");
-        assert_eq!(candidate.candidate_thread_id(), Some("thread-a"));
-        assert_eq!(candidate.rollout_path(), Some("/rollouts/a.jsonl"));
-        // Idempotent re-set with the same values is allowed.
-        candidate
-            .set("thread-a", "/rollouts/a.jsonl")
-            .expect("idempotent re-set");
-        // A different thread id is refused.
-        let err = candidate.set("thread-b", "/rollouts/a.jsonl").unwrap_err();
-        assert_eq!(err.field, "candidateThreadId");
-        // A different rollout path is refused.
-        let err = candidate.set("thread-a", "/rollouts/b.jsonl").unwrap_err();
-        assert_eq!(err.field, "rolloutPath");
-        // The original values are intact after the refusals.
-        assert_eq!(candidate.candidate_thread_id(), Some("thread-a"));
-        assert_eq!(candidate.rollout_path(), Some("/rollouts/a.jsonl"));
     }
 }

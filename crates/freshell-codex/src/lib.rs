@@ -60,9 +60,8 @@ pub use app_server::{
     WsTransport, DEFAULT_REQUEST_TIMEOUT_MS,
 };
 pub use durability::{
-    default_durability_store_dir, default_server_instance_id, extract_session_id_from_filename,
-    is_codex_thread_id, mint_ownership_id, ownership_needle, CandidateImmutableError,
-    DurabilityCandidate, CODEX_SIDECAR_OWNERSHIP_ENV,
+    default_server_instance_id, extract_session_id_from_filename, is_codex_thread_id,
+    mint_ownership_id, ownership_needle, CODEX_SIDECAR_OWNERSHIP_ENV,
 };
 pub use events::{
     next_monotonic_turn_complete_at, normalize_codex_thread_status, CodexAdapterEvent, CodexStatus,

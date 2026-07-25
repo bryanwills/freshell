@@ -163,6 +163,31 @@ impl TerminalIdentityRegistry {
                 && entry.session_id.as_deref() == Some(session_id)
         })
     }
+
+    /// Guard 3b's retired-INCLUSIVE session lookup (P0.3, ledger A8): the
+    /// terminal id -- live OR retired -- bound to this exact
+    /// `provider:sessionId`. Unlike [`Self::find_by_session`] (live-only,
+    /// serving the rename cascade), this serves the hijack guard: a session
+    /// identity, once bound, may never be claimed by a DIFFERENT terminal,
+    /// even after its owner exits (dead-pane candidate replay). Breaks no
+    /// legitimate flow: every legit resume binds at create time, so a
+    /// re-announce short-circuits at guard 3a's same-terminal check before
+    /// this cross-terminal check runs.
+    pub(crate) fn find_by_session_including_retired(
+        &self,
+        provider: &str,
+        session_id: &str,
+    ) -> Option<String> {
+        self.inner
+            .read()
+            .expect("identity registry lock poisoned")
+            .values()
+            .find(|entry| {
+                entry.provider.as_deref() == Some(provider)
+                    && entry.session_id.as_deref() == Some(session_id)
+            })
+            .map(|entry| entry.terminal_id.clone())
+    }
 }
 
 #[cfg(test)]
@@ -226,6 +251,21 @@ mod tests {
         // A retired terminal's session is no longer a live match (the reverse
         // cascade only rewrites a terminal title on a CURRENTLY RUNNING terminal).
         assert!(reg.find_by_session("claude", "s2").is_none());
+    }
+
+    #[test]
+    fn find_by_session_including_retired_matches_retired_terminal() {
+        let reg = TerminalIdentityRegistry::new();
+        reg.upsert("exited", Some("codex"), Some("s2"), None, 2);
+        reg.retire("exited");
+
+        // Live-only lookup misses it (rename-cascade semantics)...
+        assert!(reg.find_by_session("codex", "s2").is_none());
+        // ...but the guard-3b lookup still finds the binding.
+        assert_eq!(
+            reg.find_by_session_including_retired("codex", "s2"),
+            Some("exited".to_string())
+        );
     }
 
     #[test]

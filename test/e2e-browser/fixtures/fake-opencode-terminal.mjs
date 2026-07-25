@@ -103,6 +103,20 @@ if (resumeSessionId) {
 } else {
   process.stdout.write('opencode> \r\n')
 
+  // Opt-in determinism gate for the restore-contract wall
+  // (SIGKILL-inside-locator-window): when FAKE_OPENCODE_TERMINAL_ROW_GATE_PATH
+  // is set, poll ~50ms for the gate file before writing the session row
+  // (mirrors FAKE_OPENCODE_SESSION_EVENT_GATE_PATH in fake-opencode.cjs:636-652,
+  // which gates SSE emission only and cannot gate this row write). The wall
+  // test sets the env and never creates the file pre-kill, so the identity
+  // deterministically never lands before the SIGKILL.
+  const rowGatePath = process.env.FAKE_OPENCODE_TERMINAL_ROW_GATE_PATH
+
+  function commitSessionRow(sessionId, cwd) {
+    writeSessionRow(sessionId, cwd)
+    process.stdout.write(`opencode: session ${sessionId} started\r\n`)
+  }
+
   let sessionCreated = false
   process.stdin.setEncoding('utf8')
   process.stdin.on('data', () => {
@@ -116,9 +130,16 @@ if (resumeSessionId) {
 
     const cwd = process.cwd()
     const sessionId = `ses_e2e_${Date.now()}_${process.pid}`
-    writeSessionRow(sessionId, cwd)
-
-    process.stdout.write(`opencode: session ${sessionId} started\r\n`)
+    if (!rowGatePath) {
+      commitSessionRow(sessionId, cwd)
+      return
+    }
+    const interval = setInterval(() => {
+      if (!fs.existsSync(rowGatePath)) return
+      clearInterval(interval)
+      commitSessionRow(sessionId, cwd)
+    }, 50)
+    interval.unref?.()
   })
   process.stdin.resume()
 }
