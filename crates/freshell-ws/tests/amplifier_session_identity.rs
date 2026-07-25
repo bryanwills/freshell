@@ -31,10 +31,8 @@ fn amplifier_cli_spec() -> freshell_platform::CliCommandSpec {
 }
 
 fn write_fake_amplifier() -> std::path::PathBuf {
-    let script_path = std::env::temp_dir().join(format!(
-        "freshell-fake-amplifier-{}.sh",
-        std::process::id()
-    ));
+    let script_path =
+        std::env::temp_dir().join(format!("freshell-fake-amplifier-{}.sh", std::process::id()));
     let script = "#!/bin/sh\n\
         printf '%s\\n' \"$@\" > \"$AMPLIFIER_ARGV_CAPTURE_PATH.tmp\"\n\
         mv \"$AMPLIFIER_ARGV_CAPTURE_PATH.tmp\" \"$AMPLIFIER_ARGV_CAPTURE_PATH\"\n\
@@ -56,7 +54,10 @@ fn wait_for_captured_argv(path: &std::path::Path) -> Vec<String> {
         if let Ok(raw) = std::fs::read_to_string(path) {
             return raw.lines().map(str::to_string).collect();
         }
-        assert!(std::time::Instant::now() < deadline, "argv capture never appeared: {path:?}");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "argv capture never appeared: {path:?}"
+        );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
@@ -85,7 +86,8 @@ async fn create_amplifier_terminal(
     for _ in 0..40 {
         let frame = next_frame_of_type_or_error(ws).await;
         let matches_req = frame["requestId"] == json!(request_id);
-        let is_terminal = frame["type"] == json!("terminal.created") || frame["type"] == json!("error");
+        let is_terminal =
+            frame["type"] == json!("terminal.created") || frame["type"] == json!("error");
         if matches_req && is_terminal {
             return frame;
         }
@@ -150,8 +152,9 @@ async fn amplifier_creates_carry_launcher_assigned_identity() {
     .await;
     assert_eq!(created["type"], json!("terminal.created"), "{created}");
     let terminal_id = created["terminalId"].as_str().unwrap().to_string();
-    let session_ref = session_ref_of(&created)
-        .unwrap_or_else(|| panic!("fresh amplifier terminal.created must carry sessionRef: {created}"));
+    let session_ref = session_ref_of(&created).unwrap_or_else(|| {
+        panic!("fresh amplifier terminal.created must carry sessionRef: {created}")
+    });
     assert_eq!(session_ref["provider"], json!("amplifier"));
     let session_id = session_ref["sessionId"].as_str().unwrap().to_string();
     // Server-minted UUID shape (the client sent nothing).
@@ -163,7 +166,14 @@ async fn amplifier_creates_carry_launcher_assigned_identity() {
         freshell_sessions::amplifier_stub::cwd_slug(&canonical_cwd.to_string_lossy());
     let dir = session_dir_for(&home, &session_id).expect("stub dir on disk");
     assert_eq!(
-        dir.parent().unwrap().parent().unwrap().file_name().unwrap().to_str().unwrap(),
+        dir.parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap(),
         expected_slug,
         "HARD INVARIANT: stub slug must be the spawn cwd's slug"
     );
@@ -172,12 +182,21 @@ async fn amplifier_creates_carry_launcher_assigned_identity() {
     assert_eq!(meta["session_id"], json!(session_id));
     assert_eq!(meta["working_dir"], json!(canonical_cwd.to_string_lossy()));
     assert_eq!(meta["freshell_terminal_id"], json!(terminal_id));
-    assert_eq!(std::fs::metadata(dir.join("transcript.jsonl")).unwrap().len(), 0);
+    assert_eq!(
+        std::fs::metadata(dir.join("transcript.jsonl"))
+            .unwrap()
+            .len(),
+        0
+    );
     assert!(dir.join("events.jsonl").is_file());
 
     // Spawned argv is `resume <uuid>` (manifest resumeArgs template).
     let argv = wait_for_captured_argv(&capture);
-    assert_eq!(argv, vec!["resume".to_string(), session_id.clone()], "argv: {argv:?}");
+    assert_eq!(
+        argv,
+        vec!["resume".to_string(), session_id.clone()],
+        "argv: {argv:?}"
+    );
 
     // Registry meta records the resume id (restore-across-restart identity).
     let row = registry
@@ -203,7 +222,10 @@ async fn amplifier_creates_carry_launcher_assigned_identity() {
     .await;
     assert_eq!(rejected["type"], json!("error"), "{rejected}");
     assert!(
-        rejected["message"].as_str().unwrap_or_default().contains("terminal:"),
+        rejected["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("terminal:"),
         "reject names the synthetic id: {rejected}"
     );
 
@@ -239,8 +261,15 @@ async fn amplifier_creates_carry_launcher_assigned_identity() {
         }),
     )
     .await;
-    assert_eq!(dup["type"], json!("error"), "double-resume must be rejected: {dup}");
-    assert!(dup["message"].as_str().unwrap_or_default().contains(resumed_id));
+    assert_eq!(
+        dup["type"],
+        json!("error"),
+        "double-resume must be rejected: {dup}"
+    );
+    assert!(dup["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains(resumed_id));
     registry.kill(&first_tid);
 
     // ── Phase 4 (plan §8): stub GC. Phase 3's `first` terminal was a
@@ -258,10 +287,8 @@ async fn amplifier_creates_carry_launcher_assigned_identity() {
 
     // ── Phase 5 (plan §8 tolerance + used-session survival): a USED session
     // survives exit. Create fresh, stamp the "used" signature, kill.
-    let capture3 = std::env::temp_dir().join(format!(
-        "freshell-amp-argv-used-{}.txt",
-        std::process::id()
-    ));
+    let capture3 =
+        std::env::temp_dir().join(format!("freshell-amp-argv-used-{}.txt", std::process::id()));
     let _ = std::fs::remove_file(&capture3);
     std::env::set_var("AMPLIFIER_ARGV_CAPTURE_PATH", &capture3);
     let used = create_amplifier_terminal(
@@ -272,7 +299,10 @@ async fn amplifier_creates_carry_launcher_assigned_identity() {
     .await;
     assert_eq!(used["type"], json!("terminal.created"));
     let used_tid = used["terminalId"].as_str().unwrap().to_string();
-    let used_sid = session_ref_of(&used).unwrap()["sessionId"].as_str().unwrap().to_string();
+    let used_sid = session_ref_of(&used).unwrap()["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let used_dir = session_dir_for(&home, &used_sid).expect("used stub dir");
     // Simulate amplifier's first-turn save (the real-CLI contract test pins
     // that a real turn writes turn_count).
@@ -292,10 +322,8 @@ async fn amplifier_creates_carry_launcher_assigned_identity() {
     // ── Phase 6 (ensure-after-GC): resuming the Phase-3 id (whose stub was
     // GC'd in Phase 4) re-stubs it under the same id — restore keeps working
     // for never-used panes across restarts.
-    let capture4 = std::env::temp_dir().join(format!(
-        "freshell-amp-argv-regc-{}.txt",
-        std::process::id()
-    ));
+    let capture4 =
+        std::env::temp_dir().join(format!("freshell-amp-argv-regc-{}.txt", std::process::id()));
     let _ = std::fs::remove_file(&capture4);
     std::env::set_var("AMPLIFIER_ARGV_CAPTURE_PATH", &capture4);
     let restored = create_amplifier_terminal(
@@ -308,7 +336,10 @@ async fn amplifier_creates_carry_launcher_assigned_identity() {
     )
     .await;
     assert_eq!(restored["type"], json!("terminal.created"), "{restored}");
-    assert!(session_dir_for(&home, resumed_id).is_some(), "re-stubbed after GC");
+    assert!(
+        session_dir_for(&home, resumed_id).is_some(),
+        "re-stubbed after GC"
+    );
     let argv4 = wait_for_captured_argv(&capture4);
     assert_eq!(argv4, vec!["resume".to_string(), resumed_id.to_string()]);
     registry.kill(restored["terminalId"].as_str().unwrap());
@@ -318,7 +349,10 @@ async fn amplifier_creates_carry_launcher_assigned_identity() {
     // failure must keep the legacy "Could not start" wording (pinned e2e by
     // term28-path-shadow-rust.spec.ts); only a genuine user-requested
     // restore (sessionRef) reads as "Could not restore".
-    std::env::set_var("AMPLIFIER_CMD", "totally-missing-amplifier-cli-identity-test");
+    std::env::set_var(
+        "AMPLIFIER_CMD",
+        "totally-missing-amplifier-cli-identity-test",
+    );
     let fresh_fail = create_amplifier_terminal(
         &mut ws,
         "req-amp-fresh-spawn-fail",

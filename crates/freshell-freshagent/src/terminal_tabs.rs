@@ -645,7 +645,12 @@ pub(crate) async fn spawn_terminal_pane(
             ));
         }
         let is_restore = body.get("restore").and_then(Value::as_bool) == Some(true);
-        if resume_session_id.as_deref().filter(|s| !s.is_empty()).is_none() && !is_restore {
+        if resume_session_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .is_none()
+            && !is_restore
+        {
             resume_session_id = Some(Uuid::new_v4().to_string());
             // Launcher-minted fresh identity: the spawn is `amplifier resume
             // <uuid>` but the USER asked for a fresh pane — a spawn failure
@@ -694,7 +699,10 @@ pub(crate) async fn spawn_terminal_pane(
                 ));
             }
             match freshell_sessions::amplifier_stub::resolve_amplifier_home()
-                .ok_or_else(|| "amplifier home unresolvable (no FRESHELL_AMPLIFIER_HOME and no HOME)".to_string())
+                .ok_or_else(|| {
+                    "amplifier home unresolvable (no FRESHELL_AMPLIFIER_HOME and no HOME)"
+                        .to_string()
+                })
                 .and_then(|amp_home| {
                     freshell_sessions::amplifier_stub::ensure_session(
                         &amp_home,

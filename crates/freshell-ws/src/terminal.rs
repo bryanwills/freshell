@@ -1316,7 +1316,10 @@ async fn handle_create(
                 .await;
             }
             let ensured = freshell_sessions::amplifier_stub::resolve_amplifier_home()
-                .ok_or_else(|| "amplifier home unresolvable (no FRESHELL_AMPLIFIER_HOME and no HOME)".to_string())
+                .ok_or_else(|| {
+                    "amplifier home unresolvable (no FRESHELL_AMPLIFIER_HOME and no HOME)"
+                        .to_string()
+                })
                 .and_then(|amp_home| {
                     freshell_sessions::amplifier_stub::ensure_session(
                         &amp_home,
