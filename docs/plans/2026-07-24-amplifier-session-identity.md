@@ -1339,7 +1339,7 @@ Once Task 9 lands, EVERY amplifier-mode create writes into the amplifier home. W
 
 **Interfaces:**
 - Consumes: nothing new.
-- Produces: `pub fn isolate_amplifier_home() -> &'static std::path::Path` (called by `spawn_server()` and by Task 9's new test); the `sleeper_cli_spec` amplifier registration now has manifest-true `resume_args`.
+- Produces: `pub fn isolate_amplifier_home() -> &'static std::path::Path` (called by `spawn_server()` and by Task 9's new test); `pub async fn spawn_server_with_specs(specs: Vec<freshell_platform::CliCommandSpec>) -> (String, freshell_terminal::TerminalRegistry)` (the custom-spec variant Task 9's test needs — the shared sleeper specs keep `env_var: None`, so an env-override-driven fake CLI is unreachable through plain `spawn_server()`); the `sleeper_cli_spec` amplifier registration now has manifest-true `resume_args`.
 
 - [ ] **Step 1: Add the helper** (near the top of `common/mod.rs`, after `AUTH_TOKEN`):
 
@@ -1390,12 +1390,41 @@ pub async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
         }),
 ```
 
-- [ ] **Step 4: Run the existing WS suite to verify no regressions**
+- [ ] **Step 4: Add a custom-spec server variant** — the shared `spawn_server()` hardcodes its spec list (`common/mod.rs:113-116`) and the sleeper specs deliberately keep `env_var: None` (an ambient `AMPLIFIER_CMD`/`CODEX_CMD` in a developer's shell must never leak into unrelated shared-harness tests). Task 9's integration test needs a spec whose `env_var` IS honored — through the sleeper spec, setting `AMPLIFIER_CMD` is inert (`resolve_coding_cli_command` only reads env through `spec.env_var`) and the fake recording CLI would never spawn. Extract rather than fork: move the body of `spawn_server()` into
+
+```rust
+/// Same real-axum server, caller-chosen CLI specs — for spec-sensitive tests
+/// (e.g. an `env_var: Some("AMPLIFIER_CMD")` amplifier spec; the shared
+/// sleeper specs keep `env_var: None` on purpose so ambient dev-shell env
+/// never leaks into unrelated tests). `spawn_server()` delegates here.
+pub async fn spawn_server_with_specs(
+    specs: Vec<freshell_platform::CliCommandSpec>,
+) -> (String, freshell_terminal::TerminalRegistry) {
+    isolate_amplifier_home();
+    // ... the existing spawn_server body, verbatim, with the hardcoded
+    // `cli_commands: Arc::new(vec![...])` (common/mod.rs:113-116) replaced
+    // by `cli_commands: Arc::new(specs),` ...
+}
+```
+
+and shrink `spawn_server()` to a delegating wrapper (public signature and behavior unchanged — no existing caller moves; this also subsumes Step 2's placement, since `isolate_amplifier_home()` now rides the shared body and covers every server, default or custom-spec):
+
+```rust
+pub async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
+    spawn_server_with_specs(vec![
+        sleeper_cli_spec("amplifier"),
+        sleeper_cli_spec("claude"),
+    ])
+    .await
+}
+```
+
+- [ ] **Step 5: Run the existing WS suite to verify no regressions**
 
 Run: `cargo test -p freshell-ws`
-Expected: all PASS (behavior-neutral until Task 9; the resume-args shape change only affects argv content no shared test asserts).
+Expected: all PASS (behavior-neutral until Task 9; the resume-args shape change only affects argv content no shared test asserts, and the extract-refactor changes no caller-visible behavior).
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add crates/freshell-ws/tests/common/mod.rs
@@ -1414,7 +1443,7 @@ git commit -m "test(ws): isolated FRESHELL_AMPLIFIER_HOME harness + manifest-tru
 - Consumes: `freshell_sessions::amplifier_stub::{resolve_amplifier_home, ensure_session, EnsuredSession}` (Tasks 2-3); `freshell_platform::spawn::resolve_unix_shell_cwd` (spawn.rs:256 — the SAME launch-cwd transformation `build_cli_spawn_spec` applies internally; import alongside `build_cli_spawn_spec`'s existing `use`). In-scope locals at the edit sites: `mode: String`, `create: TerminalCreate` (fields `request_id`, `restore: Option<bool>`, `resume_session_id: Option<String>`, `session_ref: Option<SessionLocator>`), `resolved_cwd: Option<String>` (terminal.rs:963-967 — this task changes the binding to `let mut resolved_cwd = ...` so the amplifier branch can assign the effective cwd back), `terminal_id: String` (in scope by the mcp_injection block at :1115), `launch_intent`/`resume_session_id` mut bindings (:973-974), `send_create_error` (:1626), `is_wsl` and `RealEnv` (both already used by the spawn-spec construction at :1197-1205).
 - Produces: `terminal.created.session_ref = {amplifier, <uuid>}` for fresh amplifier creates (via the untouched existing plumbing: `set_meta` :1331, identity upsert :1377-1397, created frame :1399-1410); a stub on disk before spawn; `amplifier_stub: Option<EnsuredSession>` local consumed by Task 11's GC.
 
-- [ ] **Step 1: Write the failing integration test** — create `crates/freshell-ws/tests/amplifier_session_identity.rs`. Private-harness style (one `multi_thread` test fn, because `AMPLIFIER_CMD` env is process-global — the pattern of `codex_session_ref_resume.rs`), but reusing the shared harness for server/WS plumbing:
+- [ ] **Step 1: Write the failing integration test** — create `crates/freshell-ws/tests/amplifier_session_identity.rs`. Private-harness style (one `multi_thread` test fn, because `AMPLIFIER_CMD` env is process-global — the pattern of `codex_session_ref_resume.rs`), reusing the shared harness for server/WS plumbing via Task 8's `spawn_server_with_specs`, and registering its OWN amplifier spec with `env_var: Some("AMPLIFIER_CMD")` — through the shared sleeper spec (`env_var: None`) the `AMPLIFIER_CMD` override would be inert and the fake CLI unreachable:
 
 ```rust
 //! Launcher-assigned amplifier session identity — wire + disk + argv proof.
@@ -1431,6 +1460,23 @@ use common::*;
 use futures_util::SinkExt;
 use serde_json::json;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
+
+/// The shipped amplifier CLI spec shape (extensions/amplifier/freshell.json):
+/// `resume_args: ["resume", "{{sessionId}}"]` and an HONORED `AMPLIFIER_CMD`
+/// override. The shared harness's sleeper spec keeps `env_var: None` (so
+/// ambient dev-shell env never leaks into other tests), which would leave the
+/// recording fake below unreachable — this test registers its own spec via
+/// `spawn_server_with_specs` (the `codex_session_ref_resume.rs` discipline).
+fn amplifier_cli_spec() -> freshell_platform::CliCommandSpec {
+    freshell_platform::CliCommandSpec {
+        name: "amplifier".to_string(),
+        label: "Amplifier CLI".to_string(),
+        env_var: Some("AMPLIFIER_CMD".to_string()),
+        default_cmd: "amplifier".to_string(),
+        resume_args: Some(vec!["resume".to_string(), "{{sessionId}}".to_string()]),
+        ..Default::default()
+    }
+}
 
 fn write_fake_amplifier() -> std::path::PathBuf {
     let script_path = std::env::temp_dir().join(format!(
@@ -1530,7 +1576,7 @@ async fn amplifier_creates_carry_launcher_assigned_identity() {
     let fake = write_fake_amplifier();
     std::env::set_var("AMPLIFIER_CMD", &fake);
 
-    let (ws_url, registry) = spawn_server().await;
+    let (ws_url, registry) = spawn_server_with_specs(vec![amplifier_cli_spec()]).await;
     let (mut ws, _inventory) = connect_and_capture_inventory(&ws_url).await;
 
     // ── Phase 1: FRESH create → server-minted identity, stub on disk, resume argv.
@@ -1884,15 +1930,20 @@ Expected: FAIL — Phase 2 gets a `terminal.created` (or a hung doomed create) i
     }
 ```
 
-Additionally, map Task 7's atomic in-registry enforcement (validated fix F5): in the pre-existing `registry.create` failure branch (anchor: `if let Err(err) = state.registry.create(` at ~:1262-1284), BEFORE the generic spawn-failure reject, add:
+Additionally, map Task 7's atomic in-registry enforcement (validated fix F5): in the pre-existing `registry.create` failure branch (anchor: `if let Err(err) = state.registry.create(` at ~:1262-1284), immediately AFTER the existing `cleanup_mcp_config(...)` call (the loser's MCP side-effects still need cleaning) and BEFORE the generic spawn-failure reject — and, once Task 11 lands, BEFORE Task 11(c)'s stub GC line — add:
 
 ```rust
         // Task 7's race-free duplicate-live-resume enforcement inside
         // registry.create (F5/V7): the pre-check above is a friendly fast
         // path only — concurrent WS/REST creates can both pass it. Map the
         // registry's distinguishable error to the SAME user-facing reject.
-        // (The loser never created the stub: ensure_session FOUND the
-        // winner's dir with `created == false`, so no GC is needed here.)
+        // ORDER IS LOAD-BEARING: this early-return must precede Task 11's
+        // stub GC in this failure branch. `ensure_session` itself is not
+        // serialized, so two truly concurrent creates of one id can BOTH
+        // observe "no dir yet" and race the mkdir — the LOSER here can hold
+        // `created == true` while the WINNER's live terminal is already
+        // using the dir; GC'ing it here would delete the winner's session
+        // out from under it.
         if err.kind() == std::io::ErrorKind::AlreadyExists {
             return send_create_error(
                 ws_tx,
@@ -2041,6 +2092,16 @@ Expected: FAIL at Phase 4 (dir never deleted — no GC exists yet). Phases 5-6 s
                 // terminal's own exit hook is not responsible either
                 // (`created == false` for it), which is correct: the dir is
                 // in use.
+                // ACCEPTED RESIDUAL (recorded in Self-Review 1b(c)): this
+                // guard reads registry rows, so a concurrent re-resume that
+                // has already passed `ensure_session` (found our stub) but
+                // has NOT yet inserted its registry row is invisible here —
+                // its dir can be GC'd in that sub-second window and its
+                // `amplifier resume <id>` then fails LOUDLY in-terminal;
+                // reopening the pane re-stubs the same id (ensure-after-GC,
+                // Phase 6). Closing it fully needs a cross-handler
+                // reservation keyed on resume id — out of proportion to a
+                // loud, one-click-recoverable, sub-second race.
                 if freshell_terminal::registry::has_other_live_resume(
                     &registry_for_amplifier_gc.identity_probe_rows(),
                     "amplifier",
@@ -2062,7 +2123,7 @@ Expected: FAIL at Phase 4 (dir never deleted — no GC exists yet). Phases 5-6 s
             }
 ```
 
-(c) In the `registry.create` FAILURE branch (anchor: `cleanup_mcp_config(&RealMcpRuntime, &terminal_id, ...)` inside the `if let Err(err) = state.registry.create(...)` block at ~:1284), add right after that cleanup call:
+(c) In the `registry.create` FAILURE branch (anchor: `cleanup_mcp_config(&RealMcpRuntime, &terminal_id, ...)` inside the `if let Err(err) = state.registry.create(...)` block at ~:1284), add AFTER Task 10's `AlreadyExists` early-return — NEVER before it (ordering is load-bearing, see Task 10 Step 3: on `AlreadyExists` the dir belongs to the winning live terminal, and under true `ensure_session` concurrency the loser can hold `created == true`; GC'ing on that path would delete the winner's session out from under it). Reaching this line therefore means no duplicate live resume exists:
 
 ```rust
         // A stub written for a spawn that never happened is pure litter.
@@ -2447,8 +2508,12 @@ Also, in the `registry.create` failure branch of this fn (:866-877 region — fi
 
 ```rust
         // Task 7's race-free in-registry enforcement: map to the same reject
-        // as the friendly pre-check. (The loser never created the stub —
-        // ensure_session FOUND the winner's dir — so no GC is needed here.)
+        // as the friendly pre-check. ORDER IS LOAD-BEARING: this early-return
+        // must precede the stub GC below — `ensure_session` is not
+        // serialized, so under true concurrency the LOSER here can hold
+        // `created == true` while the WINNER's live terminal is already
+        // using the dir; GC on this path would delete the winner's session
+        // (same rationale as the WS twin, Task 10 Step 3).
         if err.kind() == std::io::ErrorKind::AlreadyExists {
             return Err(fail_json(
                 StatusCode::CONFLICT,
@@ -2580,8 +2645,8 @@ Expected: green. Deleted with their files: the 15 unit tests inside `amplifier_l
 
 - [ ] **Step 4: Grep-gate**
 
-Run: `grep -rn "amplifier_locator\|amplifier_association" crates/ --include=*.rs | grep -v opencode_locator.rs`
-Expected: zero hits (opencode_locator.rs's inert prose mentions are the only survivors, excluded above).
+Run: `grep -rn "amplifier_locator\|amplifier_association" crates/ --include=*.rs | grep -v opencode_locator.rs | grep -v opencode_association.rs | grep -v attach_amplifier_association`
+Expected: zero hits. The three excluded survivor classes are intentional keeps, not misses: (a) `opencode_locator.rs` prose mentions of the deleted sibling (out-of-scope file, untouched); (b) `opencode_association.rs` doc-prose mentions at :2,18,35,78,85,162,201 (the file is do-not-touch except the one compile-forced line at :274, which Step 2.5 deletes); (c) `attach_amplifier_association` — the fn (activity.rs:147) and its test-only caller (:1063) are deliberately kept per Step 2.11, and the fn NAME itself matches the pattern even after its doc comment is reworded.
 
 - [ ] **Step 5: Commit**
 
@@ -2707,7 +2772,12 @@ if (argv[0] === 'resume') {
 
 ```ts
     // ── Positive pane: identity is launcher-assigned AT CREATE — no submit needed.
-    const { paneId: positivePaneId, terminalId } = await openAmplifierPaneAndGetLeaf(page, harness, tabId!)
+    // openAmplifierPaneAndGetLeaf returns the NEW pane-layout LEAF node
+    // (`{ id, type: 'leaf', content: { mode, terminalId, ... } }` — spec.ts:124-147),
+    // NOT a `{paneId, terminalId}` tuple — read its fields, don't destructure.
+    const positivePane = await openAmplifierPaneAndGetLeaf(page, harness, tabId!)
+    const positivePaneId: string = positivePane.id
+    const terminalId: string = positivePane.content.terminalId
     const sessionId: string = await expect.poll(async () => {
       const leaf = await findLeafById(tabId!, positivePaneId)
       return leaf?.content?.sessionRef?.sessionId ?? null
@@ -2737,7 +2807,8 @@ if (argv[0] === 'resume') {
 
     // ── Negative pane: never typed in. It ALSO gets create-time identity
     // (the old "no identity until submit" behavior is gone by design).
-    const { paneId: negativePaneId } = await openAmplifierPaneAndGetLeaf(page, harness, tabId!)
+    const negativePane = await openAmplifierPaneAndGetLeaf(page, harness, tabId!)
+    const negativePaneId: string = negativePane.id
     const negativeSessionId: string = await expect.poll(async () => {
       const leaf = await findLeafById(tabId!, negativePaneId)
       return leaf?.content?.sessionRef?.sessionId ?? null
@@ -2810,8 +2881,8 @@ Expected: green.
 
 - [ ] **Step 4: Log check for stragglers**
 
-Run: `grep -rn "AMPLIFIER_LOCATOR_SWEEP_INTERVAL" crates/ ; grep -rn "amplifier_locator" crates/ --include=*.rs | grep -v opencode_locator.rs`
-Expected: zero hits for both.
+Run: `grep -rn "AMPLIFIER_LOCATOR_SWEEP_INTERVAL" crates/ ; grep -rn "amplifier_locator" crates/ --include=*.rs | grep -v opencode_locator.rs | grep -v opencode_association.rs`
+Expected: zero hits for both (`opencode_locator.rs` AND `opencode_association.rs` keep inert doc-prose mentions containing the `amplifier_locator` substring — e.g. `spawn_amplifier_locator_sweep` in opencode_association.rs:78/:201 — both are do-not-touch files and the only intentional survivors, excluded above; same survivor accounting as Task 13 Step 4).
 
 - [ ] **Step 5: Push the branch — and STOP (no PR without explicit user approval)**
 
@@ -2826,7 +2897,7 @@ git push -u origin feat/amplifier-session-identity
 **1. Spec coverage** (spec §Design 1-11 → tasks):
 - §1 WS insertion point, keep `Resume` intent → Tasks 6, 9. §2 REST shares pre-create → Task 12. §3 stub writer + slug in freshell-sessions → Tasks 2-3 (new `amplifier_stub` module rather than `amplifier.rs` itself, because that module's contract is "never mutates provider data" — documented in the module doc). §4 stub shape → Task 3 (adds an empty `events.jsonl` beyond the spec's enumerated shape — rationale and real-CLI validation documented in Task 3's design note and covered by Task 1's adoption test; validated V8/A9.2: the stub is written BEFORE `registry.create` so the events-lane resolver finds it — made explicit in Tasks 9 and 12). §5 cwd invariant → Tasks 3, 9, 12 (validated fix F4: ONE existence-validated effective spawn cwd — post launch-cwd conversion on WS — feeds both stub slug and spawn spec; divergent-slug resumes spawn at the session's own `working_dir` or reject; hard-asserted in Task 9 Phase 1 and Task 12's cwd/no-cwd tests; accepted `pty.rs:224-232` residual recorded in Global Constraints). §6 identity broadcast zero-client-changes → existing plumbing, proven by Task 9 (terminal.created.sessionRef) and Task 12 (pane_content); events-lane attach at create rides the existing resolver (Task 3 note, comment updates in Task 13 step 2.6). §7 deletion incl. const rename, invariants alarm kept with inlined grace → Task 13. §8 GC → Tasks 4, 11, 12 (validated fix F3: never-used signature additionally requires events.jsonl free of `prompt:submit` — the data-loss guard; validated fix F5: exit-hook GC skips when another live terminal holds the same resume id; + ensure-after-GC so never-used restored panes don't spawn doomed resumes — Task 11 Phase 6, Task 15 negative pane). §9 canary → Tasks 5, 14 (layout-assumption verification variant — spec explicitly allows "or verify layout assumptions"; lightweight, non-blocking; validated F6/V5 skip classes pinned by test). §10 `terminal:` reject → Tasks 10, 12. §11 double-resume guard → Tasks 7, 10, 12 (validated fix F5: friendly pre-check + race-free enforcement inside `registry.create` with the `ErrorKind::AlreadyExists` contract, mapped by both callers). Home-resolution contract (validated F1): Tasks 2, 8, 12, 15 + Global Constraints — `FRESHELL_AMPLIFIER_HOME` else `$HOME/.amplifier`, never `AMPLIFIER_HOME`; Task 1 isolates the real CLI via `HOME=<tmp>` with self-calibrating, exit-semantics-aware assertions (validated fix F2). Test plan tiers 1-5 → Tasks 1, 2-7, 8-12, 15, 13(step 3 accounting). Out-of-scope respected: zero Node-server edits; opencode files untouched except the compile-forced one-line test field (called out in Global Constraints).
 
-**1b. No silent deferrals:** the production outcome — fresh amplifier terminal has a real resumable identity before first keystroke and restores across restart — is proven at three levels with no stub standing in for behavior: real CLI adoption + slug (Task 1, opt-in but runnable, with self-calibrating rejection-signature + exit-semantics assertions per validated fix F2), real broker + fake CLI argv/disk/wire (Tasks 9-12), full user flow through the browser (Task 15). The fake CLI in WS/e2e tests substitutes only the *amplifier binary*, whose real behavior is separately pinned by Task 1 against the same stub bytes. Validation-stage fixes added tests rather than deferring: Task 4 (prompt:submit veto), Task 5 (census skip classes), Task 7 (concurrent duplicate-resume atomicity + `has_other_live_resume`), Task 12 (no-cwd effective-cwd test + row.cwd assertion). No TODOs, no deferred requirements. Two consciously-accepted, recorded gaps: (a) broker crash before terminal exit can leak a never-used stub (no exit hook runs); the spec's GC requirement is "on terminal close/exit", which is implemented, and ensure-after-GC makes leaks harmless to restore; (b) `pty.rs:224-232`'s cwd-less spawn retry can still inherit the broker's cwd in the tiny validate→spawn window — loud in-terminal failure, shared-infra change out of scope (Global Constraints).
+**1b. No silent deferrals:** the production outcome — fresh amplifier terminal has a real resumable identity before first keystroke and restores across restart — is proven at three levels with no stub standing in for behavior: real CLI adoption + slug (Task 1, opt-in but runnable, with self-calibrating rejection-signature + exit-semantics assertions per validated fix F2), real broker + fake CLI argv/disk/wire (Tasks 9-12), full user flow through the browser (Task 15). The fake CLI in WS/e2e tests substitutes only the *amplifier binary*, whose real behavior is separately pinned by Task 1 against the same stub bytes. Validation-stage fixes added tests rather than deferring: Task 4 (prompt:submit veto), Task 5 (census skip classes), Task 7 (concurrent duplicate-resume atomicity + `has_other_live_resume`), Task 12 (no-cwd effective-cwd test + row.cwd assertion). No TODOs, no deferred requirements. Three consciously-accepted, recorded gaps: (a) broker crash before terminal exit can leak a never-used stub (no exit hook runs); the spec's GC requirement is "on terminal close/exit", which is implemented, and ensure-after-GC makes leaks harmless to restore; (b) `pty.rs:224-232`'s cwd-less spawn retry can still inherit the broker's cwd in the tiny validate→spawn window — loud in-terminal failure, shared-infra change out of scope (Global Constraints); (c) the exit-hook GC's `has_other_live_resume` guard reads registry rows, so a concurrent re-resume of the same id that has passed `ensure_session` but not yet inserted its registry row is invisible to it — that create's dir can be GC'd in the sub-second window and its `amplifier resume <id>` then fails loudly in-terminal; reopening the pane re-stubs the same id (ensure-after-GC, Task 11 Phase 6), so recovery is one click. Closing it fully needs a cross-handler reservation keyed on resume id — rejected as out of proportion to a loud, recoverable, sub-second race (comment recorded at the Task 11 GC site).
 
 **2. Placeholder scan:** two intentional adaptation points remain and are explicitly bounded, not open-ended: Task 12 Step 1's `with_cli_commands(/* ... */)` (used by all three new `rest_amplifier_*` tests) points at the exact in-file helper (the deleted tests at :2241/:2281) to copy verbatim, and Task 15 keeps named existing helpers unchanged. Every other code step is complete.
 
