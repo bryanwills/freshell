@@ -57,6 +57,12 @@ function amplifierHome() {
 if (argv[0] === 'resume') {
   const sessionId = argv[1] ?? ''
   process.stdout.write(`amplifier: resumed session ${sessionId}\r\n`)
+  // Exit cleanly on EOF (Ctrl-D), like the real interactive CLI -- specs use
+  // this to release the pane's live PTY (the broker enforces a same-id
+  // double-resume guard, so a session can only be re-resumed once the
+  // terminal holding it has exited). Freshell tab/pane close is "detach,
+  // don't kill", so EOF is the deterministic way to end the process.
+  process.stdin.on('end', () => process.exit(0))
   // Mirror the real CLI's first-turn save: find the (broker pre-created)
   // session dir under any project slug, stamp turn_count into metadata.json
   // and append one transcript line -- the exact "used" signature the

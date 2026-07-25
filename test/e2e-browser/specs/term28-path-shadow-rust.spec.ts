@@ -195,13 +195,16 @@ test.describe('TERM-28: bare-command $PATH resolution (Rust only)', () => {
         const terminalId: string = leaf.content.terminalId
         expect(terminalId).toBeTruthy()
 
-        // The REAL $PATH fixture ran (its fresh-launch prompt), proving the
-        // cwd-resident `amplifier/` directory was never even considered --
-        // never treated as a spawn target, and never fell through to a
-        // shell/error state pretending to be it.
+        // The REAL $PATH fixture ran, proving the cwd-resident `amplifier/`
+        // directory was never even considered -- never treated as a spawn
+        // target, and never fell through to a shell/error state pretending
+        // to be it. Under the launcher-assigned identity contract a FRESH
+        // amplifier pane is spawned as `amplifier resume <uuid>`, so the
+        // fixture's greppable marker is its resume banner, not the old
+        // fresh-launch `amplifier> ` prompt.
         await expect.poll(async () => {
           const buffer = await harness.getTerminalBuffer(terminalId)
-          return typeof buffer === 'string' && buffer.includes('amplifier> ')
+          return typeof buffer === 'string' && buffer.includes('amplifier: resumed session ')
         }, { timeout: 15_000 }).toBe(true)
 
         // The pane must never show the raw portable-pty abort text this bug
@@ -329,6 +332,12 @@ test.describe('TERM-28: bare-command $PATH resolution (Rust only)', () => {
           // The legacy-compatible, reference-exact `wrap_terminal_spawn_error`
           // ENOENT message (`crates/freshell-ws/src/terminal.rs`, mirroring
           // `server/terminal-registry.ts:465-472`'s `wrapTerminalSpawnError`).
+          // Even though a fresh amplifier pane now spawns `amplifier resume
+          // <uuid>` (launcher-assigned identity), the server discriminates a
+          // launcher-MINTED fresh identity from a user-requested restore --
+          // a fresh create's spawn failure keeps the "Could not start"
+          // wording (`amplifier_minted_fresh_identity` in
+          // `crates/freshell-ws/src/terminal.rs`).
           expect(response.message).toMatch(
             new RegExp(
               `Could not start Amplifier: "${missingCommandName}" could not be started because the executable or working directory was not found on the server\\. Reinstall it or set AMPLIFIER_CMD to the correct executable\\.`,

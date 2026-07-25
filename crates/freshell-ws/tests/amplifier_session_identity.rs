@@ -313,6 +313,40 @@ async fn amplifier_creates_carry_launcher_assigned_identity() {
     assert_eq!(argv4, vec!["resume".to_string(), resumed_id.to_string()]);
     registry.kill(restored["terminalId"].as_str().unwrap());
 
+    // ── Phase 7: spawn-failure WORDING discrimination. A launcher-minted
+    // FRESH create carries a resume id but is not a restore — its spawn
+    // failure must keep the legacy "Could not start" wording (pinned e2e by
+    // term28-path-shadow-rust.spec.ts); only a genuine user-requested
+    // restore (sessionRef) reads as "Could not restore".
+    std::env::set_var("AMPLIFIER_CMD", "totally-missing-amplifier-cli-identity-test");
+    let fresh_fail = create_amplifier_terminal(
+        &mut ws,
+        "req-amp-fresh-spawn-fail",
+        json!({ "cwd": cwd.to_string_lossy() }),
+    )
+    .await;
+    assert_eq!(fresh_fail["type"], json!("error"), "{fresh_fail}");
+    let fresh_msg = fresh_fail["message"].as_str().unwrap_or_default();
+    assert!(
+        fresh_msg.starts_with("Could not start Amplifier CLI:"),
+        "launcher-minted fresh spawn failure must read as start: {fresh_msg}"
+    );
+    let restore_fail = create_amplifier_terminal(
+        &mut ws,
+        "req-amp-restore-spawn-fail",
+        json!({
+            "cwd": cwd.to_string_lossy(),
+            "sessionRef": { "provider": "amplifier", "sessionId": "44444444-3333-2222-1111-000000000000" },
+        }),
+    )
+    .await;
+    assert_eq!(restore_fail["type"], json!("error"), "{restore_fail}");
+    let restore_msg = restore_fail["message"].as_str().unwrap_or_default();
+    assert!(
+        restore_msg.starts_with("Could not restore Amplifier CLI:"),
+        "genuine restore spawn failure must read as restore: {restore_msg}"
+    );
+
     std::env::remove_var("AMPLIFIER_ARGV_CAPTURE_PATH");
     std::env::remove_var("AMPLIFIER_CMD");
 }

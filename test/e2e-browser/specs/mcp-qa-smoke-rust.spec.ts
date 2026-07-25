@@ -150,6 +150,13 @@ test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
       //    `amplifier-restore-rust.spec.ts` (which proves resume across a
       //    browser-driven server RESTART); this proves resume works when an
       //    external MCP agent asks for it directly on a brand-new pane.
+      //
+      //    Launcher-assigned identity contract: the broker mints a UUID at
+      //    terminal create, pre-creates the session stub, and spawns
+      //    `amplifier resume <uuid>` -- for FRESH creates too. So the fresh
+      //    pane's identity is the resume banner's UUID (not a fixture-
+      //    invented `fake-amp-*` id), and the fixture stamps the stub's
+      //    "used" signature on first submit (`amplifier: turn recorded`).
       // -----------------------------------------------------------------
       const amplifierFresh = await mcp.callFreshellAction('new-tab', { mode: 'amplifier', cwd: sharedRoot })
       expect(amplifierFresh.status).toBe('ok')
@@ -157,39 +164,57 @@ test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
       preRestartTabIds.push(amplifierFresh.data.tabId)
 
       const amplifierFreshWait = await mcp.callFreshellAction('wait-for', {
-        target: amplifierFreshPaneId, pattern: 'amplifier> ', timeout: 20,
+        target: amplifierFreshPaneId, pattern: 'amplifier: resumed session ', timeout: 20,
       })
       expect(amplifierFreshWait.data.matched).toBe(true)
 
-      await mcp.callFreshellAction('send-keys', { target: amplifierFreshPaneId, keys: 'hello amplifier\r', literal: true })
-      const amplifierSessionWait = await mcp.callFreshellAction('wait-for', {
-        target: amplifierFreshPaneId, pattern: 'amplifier: session', timeout: 20,
-      })
-      expect(amplifierSessionWait.data.matched).toBe(true)
-
       const amplifierFreshCapture: string = await mcp.callFreshellAction('capture-pane', { target: amplifierFreshPaneId, S: -200 })
-      const amplifierSessionMatch = amplifierFreshCapture.match(/amplifier: session (fake-amp-\S+) started/)
+      const amplifierSessionMatch = amplifierFreshCapture.match(/amplifier: resumed session (\S+)/)
       expect(amplifierSessionMatch).toBeTruthy()
       const amplifierSessionId = amplifierSessionMatch![1]
+      // The launcher-assigned id is a server-minted UUID.
+      expect(amplifierSessionId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
 
-      const amplifierResume = await mcp.callFreshellAction('new-tab', {
-        mode: 'amplifier', cwd: sharedRoot, resume: amplifierSessionId,
+      await mcp.callFreshellAction('send-keys', { target: amplifierFreshPaneId, keys: 'hello amplifier\r', literal: true })
+      const amplifierTurnWait = await mcp.callFreshellAction('wait-for', {
+        target: amplifierFreshPaneId, pattern: 'amplifier: turn recorded', timeout: 20,
       })
-      expect(amplifierResume.status).toBe('ok')
+      expect(amplifierTurnWait.data.matched).toBe(true)
+
+      // The same-id double-resume guard (one live PTY per amplifier session
+      // id) rejects resuming a session that is still open in a live
+      // terminal -- and Freshell tab/pane close is "detach, don't kill"
+      // (`pane_ops.rs` top doc), so exit the fresh pane's CLI itself with
+      // Ctrl-D (EOF; the fixture exits cleanly). The session was USED
+      // above, so its stub survives the exit (never-used stubs are GC'd).
+      // The PTY exit is observed asynchronously by the registry, so poll
+      // the resume create until the guard clears.
+      await mcp.callFreshellAction('send-keys', { target: amplifierFreshPaneId, keys: 'C-d' })
+
+      let amplifierResume: any = null
+      await expect.poll(async () => {
+        const attempt = await mcp.callFreshellAction('new-tab', {
+          mode: 'amplifier', cwd: sharedRoot, resume: amplifierSessionId,
+        }).catch(() => null)
+        if (attempt?.status === 'ok') amplifierResume = attempt
+        return attempt?.status ?? 'error'
+      }, { timeout: 20_000 }).toBe('ok')
       const amplifierResumePaneId: string = amplifierResume.data.paneId
       preRestartTabIds.push(amplifierResume.data.tabId)
 
       const amplifierResumeWait = await mcp.callFreshellAction('wait-for', {
-        target: amplifierResumePaneId, pattern: 'amplifier: resumed session', timeout: 20,
+        target: amplifierResumePaneId, pattern: `amplifier: resumed session ${amplifierSessionId}`, timeout: 20,
       })
       expect(amplifierResumeWait.data.matched).toBe(true)
       const amplifierResumeCapture: string = await mcp.callFreshellAction('capture-pane', { target: amplifierResumePaneId, S: -200 })
       expect(amplifierResumeCapture).toContain(`amplifier: resumed session ${amplifierSessionId}`)
 
       // Independent, non-DOM/non-buffer proof: the fixture's own argv log.
+      // BOTH spawns (the fresh create and the explicit MCP resume) were
+      // `resume <uuid>` invocations of the SAME launcher-assigned id.
       const amplifierArgvLines = await readArgvLines(amplifierArgLog)
       const amplifierResumeInvocations = amplifierArgvLines.filter((e) => e.argv[0] === 'resume' && e.argv[1] === amplifierSessionId)
-      expect(amplifierResumeInvocations.length).toBeGreaterThan(0)
+      expect(amplifierResumeInvocations.length).toBeGreaterThanOrEqual(2)
 
       // -----------------------------------------------------------------
       // 3. OPENCODE -- fresh launch + submit only (per this suite's scope;

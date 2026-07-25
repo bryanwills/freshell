@@ -977,6 +977,13 @@ async fn handle_create(
     // ALWAYS gets a server-preallocated `--session-id` (`ws:2048-2064`).
     let mut launch_intent = LaunchIntent::Resume;
     let mut resume_session_id: Option<String> = None;
+    // Launcher-minted fresh amplifier identity (plan §1): a FRESH amplifier
+    // pane carries a server-minted resume id, but a spawn failure on it is a
+    // failure to START a fresh pane, not to restore a prior session — keep
+    // `wrap_terminal_spawn_error`'s legacy "Could not start" wording for it
+    // (pinned by term28-path-shadow-rust.spec.ts). Genuine user-requested
+    // restores (restore:true / sessionRef / resumeSessionId) keep "restore".
+    let mut amplifier_minted_fresh_identity = false;
     if mode != "shell" {
         let requested_ref = create.session_ref.as_ref().filter(|r| r.provider == mode);
         let should_preallocate_fresh_claude = mode == "claude"
@@ -1011,6 +1018,7 @@ async fn handle_create(
             launch_intent = LaunchIntent::Start;
         } else if should_preallocate_fresh_amplifier {
             resume_session_id = Some(Uuid::new_v4().to_string());
+            amplifier_minted_fresh_identity = true;
         } else {
             // `requestedSessionRef.provider === mode ? sessionRef.sessionId :
             // m.resumeSessionId` (`ws:2040-2047`). This INCLUDES codex: legacy
@@ -1575,7 +1583,11 @@ async fn handle_create(
             &label,
             &spec.program,
             env_var.as_deref(),
-            resume_session_id.is_some(),
+            // A launcher-minted fresh amplifier identity is NOT a restore:
+            // the user asked for a fresh pane, so its spawn failure reads
+            // as "Could not start", the same wording the pre-identity
+            // contract produced (term28-path-shadow-rust.spec.ts).
+            resume_session_id.is_some() && !amplifier_minted_fresh_identity,
         );
         return send_create_error(
             ws_tx,

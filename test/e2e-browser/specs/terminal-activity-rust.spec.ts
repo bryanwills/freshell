@@ -33,8 +33,11 @@ import { openPanePicker } from '../helpers/pane-picker.js'
  * 2. codex (PTY lane): submit → `codex.activity.updated` `pending` upsert
  *    (rendered blue by the frozen client — decision 5A) → BEL → idle + one
  *    completion + one `terminal.idle`.
- * 3. amplifier (events.jsonl lane): the fake CLI writes schema-carrying
- *    lifecycle records; the association attaches the inotify tailer; a
+ * 3. amplifier (events.jsonl lane): the broker mints the session id at
+ *    terminal create, pre-creates the session stub, spawns `amplifier
+ *    resume <uuid>`, and the create-time events-lane resolver attaches the
+ *    inotify tailer to the stub's events.jsonl; the fake CLI adopts that
+ *    stub and appends schema-carrying lifecycle records; a
  *    `prompt:complete` record broadcasts idle + `terminal.turn.complete`
  *    (provider `amplifier`) + `terminal.idle`.
  */
@@ -391,9 +394,9 @@ test.describe('Terminal-mode CLI activity (Rust only)', () => {
     const server = await createE2eServerHandle(process.env, {
       kind: e2eServerKind,
       construct: {
-        // 15s fake turn: long enough that the locator association (sweep-
-        // driven, a few seconds) lands and the events lane confirms busy
-        // while the turn is provably still running.
+        // 15s fake turn: long enough that the events lane (the create-time
+        // resolver's tailer on the pre-created stub) confirms busy while the
+        // turn is provably still running.
         env: { AMPLIFIER_CMD: fakeAmplifier, FAKE_AMPLIFIER_TURN_MS: '15000' },
         setupHome: async (homeDir) => {
           const freshellDir = path.join(homeDir, '.freshell')
@@ -415,10 +418,29 @@ test.describe('Terminal-mode CLI activity (Rust only)', () => {
       expect(tabId).toBeTruthy()
 
       const terminalId = await openCliPaneAndGetTerminalId(page, harness, tabId!, /Amplifier/i, 'amplifier')
+      // Launcher-assigned identity: a FRESH amplifier pane is spawned as
+      // `amplifier resume <uuid>`; the fixture's readiness marker is its
+      // resume banner.
       await expect.poll(async () => {
         const buffer = await harness.getTerminalBuffer(terminalId)
-        return typeof buffer === 'string' && buffer.includes('amplifier>')
+        return typeof buffer === 'string' && buffer.includes('amplifier: resumed session ')
       }, { timeout: 15_000 }).toBe(true)
+      // The launcher-assigned session id lands in the pane's
+      // `content.sessionRef` at create time (same source of truth
+      // `amplifier-restore-rust.spec.ts` pins). The rendered xterm buffer
+      // line-wraps at the split pane's width, so it cannot carry the full
+      // UUID reliably -- the layout is the id's authoritative carrier.
+      const launcherSessionId: string = await expect.poll(async () => {
+        const layout = await harness.getPaneLayout(tabId!)
+        const leaf = collectLeaves(layout).find((l: any) => l?.content?.terminalId === terminalId)
+        return leaf?.content?.sessionRef?.sessionId ?? null
+      }, { timeout: 15_000 }).not.toBeNull().then(async () => {
+        const layout = await harness.getPaneLayout(tabId!)
+        const leaf = collectLeaves(layout).find((l: any) => l?.content?.terminalId === terminalId)
+        return leaf!.content!.sessionRef!.sessionId as string
+      })
+      // Server-minted UUID (never the old fixture-invented `fake-amp-*` id).
+      expect(launcherSessionId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
 
       await typePromptIntoLastPane(page, 'hello amplifier')
 
@@ -431,9 +453,10 @@ test.describe('Terminal-mode CLI activity (Rust only)', () => {
       )
       await expect(tabBlueIcons(page, tabId!)).not.toHaveCount(0, { timeout: 10_000 })
 
-      // …then the events lane finishes the turn: the locator associates the
-      // session (sweep-driven, a few seconds), the tailer attaches, and the
-      // fixture's prompt:complete record produces idle + the completion.
+      // …then the events lane finishes the turn: the create-time resolver's
+      // tailer already watches the pre-created stub's events.jsonl, and the
+      // fixture's prompt:complete record (appended to THAT stub) produces
+      // idle + the completion.
       const complete = await capture.waitFor(
         (f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalId,
         45_000,
@@ -441,7 +464,9 @@ test.describe('Terminal-mode CLI activity (Rust only)', () => {
       )
       expect(complete.provider).toBe('amplifier')
       expect(complete.completionSeq).toBe(1)
-      expect(String(complete.sessionId ?? '')).toMatch(/^fake-amp-/)
+      // The completion carries the LAUNCHER-ASSIGNED session id (the same
+      // UUID the pane was spawned to resume).
+      expect(String(complete.sessionId ?? '')).toBe(launcherSessionId)
 
       await expect(tabBlueIcons(page, tabId!)).toHaveCount(0, { timeout: 10_000 })
 

@@ -619,6 +619,9 @@ pub(crate) async fn spawn_terminal_pane(
     }
 
     let (mut resume_session_id, accepted_session_ref) = derive_resume_identity(body, &mode)?;
+    // Whether `resume_session_id` is a server-minted FRESH amplifier identity
+    // (not a user-requested restore) — spawn-failure wording discriminator.
+    let mut amplifier_minted_fresh_identity = false;
 
     let terminal_id = Uuid::new_v4().to_string();
     let stream_id = Uuid::new_v4().to_string();
@@ -644,6 +647,12 @@ pub(crate) async fn spawn_terminal_pane(
         let is_restore = body.get("restore").and_then(Value::as_bool) == Some(true);
         if resume_session_id.as_deref().filter(|s| !s.is_empty()).is_none() && !is_restore {
             resume_session_id = Some(Uuid::new_v4().to_string());
+            // Launcher-minted fresh identity: the spawn is `amplifier resume
+            // <uuid>` but the USER asked for a fresh pane — a spawn failure
+            // must read as "Could not start", not "Could not restore"
+            // (mirrors `crates/freshell-ws/src/terminal.rs`'s
+            // `amplifier_minted_fresh_identity`).
+            amplifier_minted_fresh_identity = true;
         }
         if let Some(session_id) = resume_session_id.as_deref() {
             if freshell_terminal::registry::has_live_resume(
@@ -1050,7 +1059,10 @@ pub(crate) async fn spawn_terminal_pane(
             &label,
             &spec.program,
             env_var.as_deref(),
-            resume_session_id.is_some(),
+            // A launcher-minted fresh amplifier identity is NOT a restore:
+            // fresh-pane spawn failures keep the legacy "Could not start"
+            // wording (same discrimination as the WS create path).
+            resume_session_id.is_some() && !amplifier_minted_fresh_identity,
         );
         return Err(fail_json(StatusCode::BAD_REQUEST, message));
     }
