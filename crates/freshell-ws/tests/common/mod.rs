@@ -18,6 +18,30 @@ use freshell_ws::WsState;
 
 pub const AUTH_TOKEN: &str = "s3cr3t-token-abcdef";
 
+/// Process-wide isolated FRESHELL_AMPLIFIER_HOME (the broker's own
+/// amplifier-home override — validated F1: the broker never consults the
+/// CLI's cache-only AMPLIFIER_HOME). The amplifier pre-create path
+/// (launcher-assigned identity plan) writes stub session dirs at terminal
+/// create time — without this, any shared-harness test that creates an
+/// amplifier terminal would litter the developer's real ~/.amplifier.
+/// OnceLock ⇒ a single `set_var` per process with one stable value, safe
+/// under parallel tests (mirrors the CODEX_CMD env discipline in
+/// `codex_session_ref_resume.rs`). Edition-2021 note: `set_var` is a safe
+/// fn today; an edition-2024 bump makes it unsafe — revisit this helper then.
+pub fn isolate_amplifier_home() -> &'static std::path::Path {
+    use std::sync::OnceLock;
+    static HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
+    HOME.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!(
+            "freshell-ws-test-amplifier-home-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create isolated FRESHELL_AMPLIFIER_HOME");
+        std::env::set_var("FRESHELL_AMPLIFIER_HOME", &dir);
+        dir
+    })
+}
+
 pub fn test_settings_value() -> serde_json::Value {
     serde_json::json!({
         "ai": {},
@@ -62,7 +86,14 @@ pub fn sleeper_cli_spec(name: &str) -> freshell_platform::CliCommandSpec {
         default_cmd: script_path.to_string_lossy().to_string(),
         base_args: vec![],
         base_env: std::collections::BTreeMap::new(),
-        resume_args: Some(vec!["--resume".to_string(), "{{sessionId}}".to_string()]),
+        // Manifest-true resume args per provider: amplifier is
+        // `["resume", "{{sessionId}}"]` (extensions/amplifier/freshell.json),
+        // claude-shaped specs keep `["--resume", "{{sessionId}}"]`.
+        resume_args: Some(if name == "amplifier" {
+            vec!["resume".to_string(), "{{sessionId}}".to_string()]
+        } else {
+            vec!["--resume".to_string(), "{{sessionId}}".to_string()]
+        }),
         // Required for the fresh-claude preallocation path: `LaunchIntent::Start`
         // THROWS without `create_session_args` (`cli_launch.rs:436-441`), same
         // shape as the real claude spec (`cli_launch_goldens.rs:50`).
@@ -87,10 +118,14 @@ pub async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
     .await
 }
 
-#[allow(dead_code)] // not every test binary uses the injectable variant
+/// Same real-axum server, caller-chosen CLI specs — for spec-sensitive tests
+/// (e.g. an `env_var: Some("AMPLIFIER_CMD")` amplifier spec; the shared
+/// sleeper specs keep `env_var: None` on purpose so ambient dev-shell env
+/// never leaks into unrelated tests). `spawn_server()` delegates here.
 pub async fn spawn_server_with_specs(
-    cli_commands: Vec<freshell_platform::CliCommandSpec>,
+    specs: Vec<freshell_platform::CliCommandSpec>,
 ) -> (String, freshell_terminal::TerminalRegistry) {
+    isolate_amplifier_home();
     let auth_token = Arc::new(AUTH_TOKEN.to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
     let settings =
@@ -121,7 +156,7 @@ pub async fn spawn_server_with_specs(
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
-        cli_commands: Arc::new(cli_commands),
+        cli_commands: Arc::new(specs),
         shutdown: Arc::new(tokio::sync::Notify::new()),
         ping_interval_ms: 30_000,
         hello_timeout_ms: 5_000,
