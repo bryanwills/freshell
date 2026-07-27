@@ -594,6 +594,16 @@ pub enum AttachResizeStatus {
     Missing,
 }
 
+/// Read-only lookup into a session-identity store (in production: the WS-side
+/// `TerminalIdentityRegistry` in `freshell-ws`). Injected across the crate
+/// boundary so the D7 live-session guard can join BOTH stores from crates that
+/// cannot depend on `freshell-ws` (`freshell-freshagent` -- would be circular).
+/// Implementations must NOT return retired/dead bindings.
+pub trait SessionIdentityLookup: Send + Sync + std::fmt::Debug {
+    /// The terminal_id currently bound to `(provider, session_id)`, if any.
+    fn terminal_for_session(&self, provider: &str, session_id: &str) -> Option<String>;
+}
+
 impl TerminalRegistry {
     pub fn new() -> Self {
         Self {
@@ -2102,6 +2112,37 @@ impl TerminalRegistry {
         self.live_terminal_ids_for_session_ref(locator)
             .into_iter()
             .next()
+    }
+
+    /// D7 live-session guard predicate, shared by the WS `terminal.create`
+    /// path (`freshell-ws/src/terminal.rs`) and the REST spawn pipeline
+    /// (`freshell-freshagent/src/terminal_tabs.rs`): returns the terminal_id
+    /// of a currently-RUNNING terminal that already owns `(mode, session_id)`,
+    /// if any. Two arms, exactly the WS guard's join (see commit d9b71f50):
+    /// 1. identity arm: the injected identity store's owner, probed Running;
+    /// 2. row arm: any directory row with this mode + resume_session_id, Running.
+    /// `identity: None` (e.g. the seam is unwired) narrows to the row arm.
+    pub fn live_session_owner(
+        &self,
+        identity: Option<&dyn SessionIdentityLookup>,
+        mode: &str,
+        session_id: &str,
+    ) -> Option<String> {
+        if let Some(owner_tid) = identity
+            .and_then(|ident| ident.terminal_for_session(mode, session_id))
+            .filter(|tid| {
+                self.probe(tid)
+                    .is_some_and(|r| r.status == TerminalRunStatus::Running)
+            })
+        {
+            return Some(owner_tid);
+        }
+        self.directory().into_iter().find_map(|entry| {
+            (entry.mode == mode
+                && entry.resume_session_id.as_deref() == Some(session_id)
+                && entry.status == TerminalRunStatus::Running)
+                .then_some(entry.terminal_id)
+        })
     }
 
     /// Council rule 9, D8 backstop: >=2 live PTYs carrying one sessionRef is
@@ -4347,5 +4388,107 @@ mod tests {
         headless(&reg, "keyless", None, now_ms());
         reg.finish_pty_exit("keyless", 1);
         assert!(!reg.respawn_exhausted(""));
+    }
+
+    #[derive(Debug)]
+    struct StubIdentity {
+        provider: &'static str,
+        session_id: &'static str,
+        terminal_id: &'static str,
+    }
+
+    impl SessionIdentityLookup for StubIdentity {
+        fn terminal_for_session(&self, provider: &str, session_id: &str) -> Option<String> {
+            (provider == self.provider && session_id == self.session_id)
+                .then(|| self.terminal_id.to_string())
+        }
+    }
+
+    #[test]
+    fn live_session_owner_finds_running_row_by_resume_session_id() {
+        let registry = TerminalRegistry::new();
+        registry.register_headless(HeadlessTerminal {
+            terminal_id: "t-row-owner".into(),
+            stream_id: "s-row-owner".into(),
+            mode: "claude".into(),
+            resume_session_id: Some("sess-live".into()),
+            create_request_id: None,
+            created_at: None,
+        });
+
+        assert_eq!(
+            registry.live_session_owner(None, "claude", "sess-live"),
+            Some("t-row-owner".to_string()),
+            "row arm: Running row with matching mode+resume_session_id is a live owner"
+        );
+        // Wrong mode / unknown session: no owner.
+        assert_eq!(registry.live_session_owner(None, "codex", "sess-live"), None);
+        assert_eq!(registry.live_session_owner(None, "claude", "sess-other"), None);
+
+        registry.kill("t-row-owner");
+    }
+
+    #[test]
+    fn live_session_owner_ignores_exited_rows() {
+        let registry = TerminalRegistry::new();
+        registry.register_headless(HeadlessTerminal {
+            terminal_id: "t-exited".into(),
+            stream_id: "s-exited".into(),
+            mode: "claude".into(),
+            resume_session_id: Some("sess-done".into()),
+            create_request_id: None,
+            created_at: None,
+        });
+        assert!(registry.finish_pty_exit("t-exited", 0));
+
+        assert_eq!(
+            registry.live_session_owner(None, "claude", "sess-done"),
+            None,
+            "an Exited owner must not block resume"
+        );
+    }
+
+    #[test]
+    fn live_session_owner_finds_identity_bound_running_terminal() {
+        // Locator-adopted shape (d9b71f50's case): Running row with NO
+        // resume_session_id; the session binding exists only in the identity store.
+        let registry = TerminalRegistry::new();
+        registry.register_headless(HeadlessTerminal {
+            terminal_id: "t-adopted".into(),
+            stream_id: "s-adopted".into(),
+            mode: "codex".into(),
+            resume_session_id: None,
+            create_request_id: None,
+            created_at: None,
+        });
+        let identity = StubIdentity {
+            provider: "codex",
+            session_id: "sess-adopted",
+            terminal_id: "t-adopted",
+        };
+
+        assert_eq!(
+            registry.live_session_owner(Some(&identity), "codex", "sess-adopted"),
+            Some("t-adopted".to_string()),
+            "identity arm: identity-bound session of a Running terminal is live"
+        );
+
+        registry.kill("t-adopted");
+    }
+
+    #[test]
+    fn live_session_owner_identity_binding_to_dead_terminal_is_not_live() {
+        let registry = TerminalRegistry::new();
+        // No registry row at all for "t-gone" -- identity binding alone must not count.
+        let identity = StubIdentity {
+            provider: "codex",
+            session_id: "sess-gone",
+            terminal_id: "t-gone",
+        };
+        assert_eq!(
+            registry.live_session_owner(Some(&identity), "codex", "sess-gone"),
+            None,
+            "identity arm requires the owner terminal to probe Running"
+        );
     }
 }
