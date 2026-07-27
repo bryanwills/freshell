@@ -890,20 +890,33 @@ export class CodingCliSessionIndexer {
     const mtimeMs = statMtimeMs(stat)
     const size = stat.size
     // Newest activity-sidecar mtime (Amplifier transcript.jsonl / events.jsonl). Statted
-    // once here and reused by both the re-parse gate and the recency fold below. Only
-    // providers that opt in pay the extra stat cost; others leave it undefined.
+    // once here and used only for the recency fold. Only providers that opt in pay the
+    // extra stat cost; others leave it undefined.
     const activityMtimeMs = provider.getActivityMtimeMs
       ? await provider.getActivityMtimeMs(filePath)
       : undefined
 
     const cached = this.fileCache.get(cacheKey)
-    if (
-      cached &&
-      cached.mtimeMs === mtimeMs &&
-      cached.size === size &&
-      cached.activityMtimeMs === activityMtimeMs &&
-      !cached.lightweight
-    ) {
+    if (cached && cached.mtimeMs === mtimeMs && cached.size === size && !cached.lightweight) {
+      // The primary session file is byte-identical, so the cached parse stays valid.
+      // A moved activity-sidecar mtime only means "session had activity" -- sidecars
+      // are never inputs to the parse -- so fold it into recency in place instead of
+      // re-parsing from byte 0. Treating it as cache-invalidating made every session
+      // with a moved sidecar mtime re-parse on every gate re-evaluation (each warm
+      // full rescan, plus any watcher-driven revisit) even though nothing
+      // parse-relevant changed (kata v4rw). The fold mirrors the parse-path fold
+      // below: max-monotonic so a
+      // regressed sidecar mtime never lowers recency, floored because downstream
+      // read models validate lastActivityAt as an integer.
+      if (activityMtimeMs !== undefined && activityMtimeMs !== cached.activityMtimeMs) {
+        cached.activityMtimeMs = activityMtimeMs
+        if (cached.baseSession) {
+          cached.baseSession.lastActivityAt = Math.floor(
+            maxDefined(cached.baseSession.lastActivityAt, activityMtimeMs) ??
+              cached.baseSession.lastActivityAt,
+          )
+        }
+      }
       return
     }
 

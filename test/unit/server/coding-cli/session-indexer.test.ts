@@ -696,7 +696,7 @@ describe('CodingCliSessionIndexer', () => {
       expect(Number.isInteger(session?.lastActivityAt)).toBe(true)
     })
 
-    it('re-parses and advances lastActivityAt when the sidecar grows but metadata.json is byte-identical', async () => {
+    it('advances lastActivityAt from the sidecar mtime WITHOUT re-parsing when metadata.json is byte-identical', async () => {
       const file = path.join(tempDir, 'session-resumed.jsonl')
       await fsp.writeFile(file, JSON.stringify({ cwd: '/project/a', title: 'Deploy' }) + '\n')
 
@@ -721,13 +721,209 @@ describe('CodingCliSessionIndexer', () => {
       expect(indexer.getProjects()[0]?.sessions[0]?.lastActivityAt).toBe(5_000)
       const callsAfterFirstRefresh = parseSessionFile.mock.calls.length
 
-      // metadata.json is left byte-identical (no writes, no utimes) so the mtime+size
-      // gate alone would skip re-parsing. Only the activity sidecar has advanced.
+      // metadata.json stand-in is left byte-identical (no writes, no utimes), so the
+      // mtime+size gate must treat this as a cache hit. Only the activity sidecar
+      // advanced -- that means "session had activity", NOT "content changed", so the
+      // indexer must fold recency WITHOUT re-reading or re-parsing (kata v4rw).
+      activityMtimeMs = 9_000
+      ;(indexer as any).markDirty(file)
+      await indexer.refresh()
+
+      expect(parseSessionFile.mock.calls.length).toBe(callsAfterFirstRefresh)
+      expect(indexer.getProjects()[0]?.sessions[0]?.lastActivityAt).toBe(9_000)
+    })
+
+    it('never re-parses across repeated refreshes while only the sidecar mtime keeps advancing', async () => {
+      const file = path.join(tempDir, 'session-live.jsonl')
+      await fsp.writeFile(file, JSON.stringify({ cwd: '/project/a', title: 'Live' }) + '\n')
+
+      let activityMtimeMs = 5_000
+      const parseSessionFile = vi.fn(async () => ({
+        cwd: '/project/a',
+        sessionId: 'session-live',
+        title: 'Live',
+        createdAt: 500,
+        lastActivityAt: 1_000,
+        messageCount: 1,
+      }))
+      const provider = makeProvider([file], {
+        parseSessionFile,
+        getActivityMtimeMs: async () => activityMtimeMs,
+      })
+
+      const indexer = new CodingCliSessionIndexer([provider])
+      await indexer.refresh()
+      const callsAfterFirstRefresh = parseSessionFile.mock.calls.length
+
+      // A live Amplifier session's events.jsonl mtime keeps advancing between sweeps.
+      // Pre-fix, every gate re-evaluation (e.g. each warm full rescan) re-parsed it
+      // even though nothing parse-relevant changed.
+      for (const mtime of [6_000, 7_500, 12_345]) {
+        activityMtimeMs = mtime
+        ;(indexer as any).markDirty(file)
+        await indexer.refresh()
+        expect(parseSessionFile.mock.calls.length).toBe(callsAfterFirstRefresh)
+        expect(indexer.getProjects()[0]?.sessions[0]?.lastActivityAt).toBe(mtime)
+      }
+    })
+
+    it('still re-parses when the primary session file itself changes', async () => {
+      const file = path.join(tempDir, 'session-edited.jsonl')
+      await fsp.writeFile(file, JSON.stringify({ cwd: '/project/a', title: 'Deploy' }) + '\n')
+
+      let activityMtimeMs = 5_000
+      const parseSessionFile = vi.fn(async () => ({
+        cwd: '/project/a',
+        sessionId: 'session-edited',
+        title: 'Deploy',
+        createdAt: 500,
+        lastActivityAt: 1_000,
+        messageCount: 1,
+      }))
+      const provider = makeProvider([file], {
+        parseSessionFile,
+        getActivityMtimeMs: async () => activityMtimeMs,
+      })
+
+      const indexer = new CodingCliSessionIndexer([provider])
+      await indexer.refresh()
+      const callsAfterFirstRefresh = parseSessionFile.mock.calls.length
+
+      // Real content change: size (and mtime) of the primary file move, so the
+      // mtime+size gate must still force a re-parse. Guards against over-caching.
+      await fsp.writeFile(
+        file,
+        JSON.stringify({ cwd: '/project/a', title: 'Deploy' }) + '\n' + JSON.stringify({ appended: true }) + '\n',
+      )
       activityMtimeMs = 9_000
       ;(indexer as any).markDirty(file)
       await indexer.refresh()
 
       expect(parseSessionFile.mock.calls.length).toBeGreaterThan(callsAfterFirstRefresh)
+      expect(indexer.getProjects()[0]?.sessions[0]?.lastActivityAt).toBe(9_000)
+    })
+
+    it('does not regress lastActivityAt when the sidecar mtime moves backwards on the no-re-parse path', async () => {
+      const file = path.join(tempDir, 'session-regress.jsonl')
+      await fsp.writeFile(file, JSON.stringify({ cwd: '/project/a', title: 'Deploy' }) + '\n')
+
+      let activityMtimeMs = 5_000
+      const parseSessionFile = vi.fn(async () => ({
+        cwd: '/project/a',
+        sessionId: 'session-regress',
+        title: 'Deploy',
+        createdAt: 500,
+        lastActivityAt: 1_000,
+        messageCount: 1,
+      }))
+      const provider = makeProvider([file], {
+        parseSessionFile,
+        getActivityMtimeMs: async () => activityMtimeMs,
+      })
+
+      const indexer = new CodingCliSessionIndexer([provider])
+      await indexer.refresh()
+      expect(indexer.getProjects()[0]?.sessions[0]?.lastActivityAt).toBe(5_000)
+      const callsAfterFirstRefresh = parseSessionFile.mock.calls.length
+
+      // A sidecar being deleted/recreated can present an older mtime; the cheap
+      // fold must stay max-monotonic (mirrors the parse-path test at :645).
+      activityMtimeMs = 3_000
+      ;(indexer as any).markDirty(file)
+      await indexer.refresh()
+
+      expect(parseSessionFile.mock.calls.length).toBe(callsAfterFirstRefresh)
+      expect(indexer.getProjects()[0]?.sessions[0]?.lastActivityAt).toBe(5_000)
+    })
+
+    it('floors fractional sidecar mtimes on the no-re-parse path', async () => {
+      const file = path.join(tempDir, 'session-fractional.jsonl')
+      await fsp.writeFile(file, JSON.stringify({ cwd: '/project/a', title: 'Deploy' }) + '\n')
+
+      let activityMtimeMs: number = 5_000
+      const parseSessionFile = vi.fn(async () => ({
+        cwd: '/project/a',
+        sessionId: 'session-fractional',
+        title: 'Deploy',
+        createdAt: 500,
+        lastActivityAt: 1_000,
+        messageCount: 1,
+      }))
+      const provider = makeProvider([file], {
+        parseSessionFile,
+        getActivityMtimeMs: async () => activityMtimeMs,
+      })
+
+      const indexer = new CodingCliSessionIndexer([provider])
+      await indexer.refresh()
+      const callsAfterFirstRefresh = parseSessionFile.mock.calls.length
+
+      // Downstream read-model schemas validate lastActivityAt as z.number().int()
+      // (mirrors the parse-path flooring test at :671).
+      activityMtimeMs = 9_000.75
+      ;(indexer as any).markDirty(file)
+      await indexer.refresh()
+
+      expect(parseSessionFile.mock.calls.length).toBe(callsAfterFirstRefresh)
+      expect(indexer.getProjects()[0]?.sessions[0]?.lastActivityAt).toBe(9_000)
+    })
+
+    it('keeps skipping the re-parse for cwd-less sessions when only the sidecar mtime advances', async () => {
+      const file = path.join(tempDir, 'session-nocwd.jsonl')
+      await fsp.writeFile(file, JSON.stringify({ title: 'no cwd yet' }) + '\n')
+
+      let activityMtimeMs = 5_000
+      // No cwd => the indexer caches { baseSession: null } (session-indexer.ts:940-948).
+      const parseSessionFile = vi.fn(async () => ({}))
+      const provider = makeProvider([file], {
+        parseSessionFile,
+        getActivityMtimeMs: async () => activityMtimeMs,
+      })
+
+      const indexer = new CodingCliSessionIndexer([provider])
+      await indexer.refresh()
+      const callsAfterFirstRefresh = parseSessionFile.mock.calls.length
+      expect(indexer.getProjects()).toEqual([])
+
+      // The cheap path must tolerate baseSession === null without crashing and
+      // without falling through to a re-parse.
+      activityMtimeMs = 9_000
+      ;(indexer as any).markDirty(file)
+      await indexer.refresh()
+
+      expect(parseSessionFile.mock.calls.length).toBe(callsAfterFirstRefresh)
+      expect(indexer.getProjects()).toEqual([])
+    })
+
+    it('skips the re-parse on a warm full rescan when only the sidecar mtime advanced', async () => {
+      const file = path.join(tempDir, 'session-fullscan.jsonl')
+      await fsp.writeFile(file, JSON.stringify({ cwd: '/project/a', title: 'Deploy' }) + '\n')
+
+      let activityMtimeMs = 5_000
+      const parseSessionFile = vi.fn(async () => ({
+        cwd: '/project/a',
+        sessionId: 'session-fullscan',
+        title: 'Deploy',
+        createdAt: 500,
+        lastActivityAt: 1_000,
+        messageCount: 1,
+      }))
+      const provider = makeProvider([file], {
+        parseSessionFile,
+        getActivityMtimeMs: async () => activityMtimeMs,
+      })
+
+      const indexer = new CodingCliSessionIndexer([provider])
+      await indexer.refresh()
+      const callsAfterFirstRefresh = parseSessionFile.mock.calls.length
+
+      // The periodic full rescan (session-indexer.ts:1431-1442) also routes every
+      // file through updateCacheEntry -- it must take the same cheap path.
+      activityMtimeMs = 9_000
+      ;(indexer as any).needsFullScan = true
+      await indexer.refresh()
+
+      expect(parseSessionFile.mock.calls.length).toBe(callsAfterFirstRefresh)
       expect(indexer.getProjects()[0]?.sessions[0]?.lastActivityAt).toBe(9_000)
     })
   })
