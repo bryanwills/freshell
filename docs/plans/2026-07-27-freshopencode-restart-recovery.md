@@ -1271,6 +1271,7 @@ Gaps G1/G2/G5 (`server/fresh-agent/adapters/opencode/adapter.ts`): `reconcileSta
     - reject (timeout / `OpencodeServeLostError`) → `emitStatus(state, 'idle')` + `state.events.emit('event', { type: 'sdk.error', sessionId: state.placeholderId, message: 'OpenCode turn interrupted: <timeout|sidecar lost>' })`; monitor row `timeout`/`sidecar_lost`. Never leaves the pane busy.
     - always: delete the registry entry on settle; a settled handler checks the entry's `cancelled` flag first and becomes a no-op when disarmed (see next bullet).
   - **Disarm on new send (surfaced by validation, N-V5a):** a cold-armed monitor that is still pending when the user starts a NEW turn would resolve on that later turn's idle and emit its own idle + `sdk.turn.complete` chime concurrently with the send path's own `onceIdle` — a double idle/chime for one turn. The registry dedups monitors against each other, not against send-path waiters. Fix: `materializeOrSend`'s send path calls `disarmIdleRecovery(realId)` (sets `cancelled = true` and deletes the entry) before arming its own `onceIdle`; the monitor's resolve/reject handlers no-op when cancelled. Test consideration below.
+  - **Suppress arming while a send is in flight (fresh-eyes i3 — the REVERSE direction of N-V5a):** the disarm above covers monitor-armed-then-send; the reverse ordering is unguarded. A user send is in flight (the send path parked on its own `onceIdle`; the registry has no entry), then any `freshAgent.attach` for the same session arrives (pane refresh and reveal both send attach — `FreshAgentView.tsx:1063-1065`) → `reconcileStatus` observes busy → `armIdleRecovery` arms a SECOND waiter. When the turn completes, both the send path (`adapter.ts:371-381`) and the monitor emit an idle snapshot + `sdk.turn.complete` — the exact double-fire this plan classifies as a hazard. No existing per-session flag marks "send in flight" (`sendQueue` is not introspectable; `state.status === 'running'` is ambiguous — also set by SSE `:284` and reconcile `:189`), so add one: the adapter factory closure keeps `const sendsInFlight = new Set<string>()` (keyed by real `ses_` id); `materializeOrSend` adds the id at the same point it calls `disarmIdleRecovery(realId)` and removes it in a `finally` once the send's turn settles; `armIdleRecovery` no-ops (recording a `duplicate_suppressed` observability row) when `sendsInFlight.has(realId)`. Test below (attach-mid-send).
   - `bindServeStream` additionally registers a `'lost'` listener (via a new `subscribeLost` manager passthrough or by subscribing on the same emitter — implement as a second `serveManager.subscribe`-style hook; simplest: extend `subscribe(id, listener, onLost?)` in serve-manager with an optional third arg attached to `'lost'`): on lost, if `state.status === 'running'`, `emitStatus(state, 'idle')` + the same `sdk.error` interruption signal. (With Task 7, the same subscription keeps receiving events from the replacement sidecar — no rebind needed.)
 
 - [ ] **Step 1: Write the failing tests**
@@ -1280,16 +1281,26 @@ Add to `opencode-serve-adapter.test.ts`:
 ```ts
 describe('restore reconciliation emits and monitors (zrrj)', () => {
   it('emits a running session snapshot when attach reconciles a busy durable session', async () => {
+    // Non-vacuous ordering (fresh-eyes i3): subscribing AFTER `await attach` guarantees an
+    // empty capture — the running emission happens inside reconcile, DURING attach; and
+    // subscribing BEFORE attach throws (`subscribe` -> `requireState`, adapter.ts:500-505).
+    // The real window: attach registers the state via `remember()` (adapter.ts:494) BEFORE
+    // reconcile awaits `getSessionStatus` (:496 -> :173). So park the status read on a
+    // deferred, start attach, subscribe once the state is registered, THEN release it:
     const manager = makeFakeManager()
-    manager.getSessionStatus.mockResolvedValue({ type: 'busy' })
+    const status = createDeferred<{ type: string } | undefined>()
+    manager.getSessionStatus.mockReturnValue(status.promise)
     const adapter = makeAdapter(manager)
     const events: any[] = []
-    await adapter.attach!({ sessionId: 'ses_live', cwd: '/w' })
+    const attaching = adapter.attach!({ sessionId: 'ses_live', cwd: '/w' })
+    await new Promise((r) => setImmediate(r))   // remember() has run; status read still parked
     adapter.subscribe('ses_live', (ev) => events.push(ev))   // use the adapter's actual subscribe surface
-    // If subscription must precede attach in this adapter, reorder — assert on the emitted event either way:
-    expect(events.some((e) => e.type === 'sdk.session.snapshot' && e.status === 'running')
-      || manager.onceIdle.mock.calls.length > 0).toBe(true)
-    // Primary assertion: a status event was EMITTED (not just state mutated)
+    status.resolve({ type: 'busy' })
+    await attaching
+    // Primary assertion: the running status was EMITTED (not just state mutated).
+    // NO fallback disjunct on monitor arming — an implementation that arms the
+    // monitor but never emits must FAIL here.
+    expect(events.some((e) => e.type === 'sdk.session.snapshot' && e.status === 'running')).toBe(true)
   })
 
   it('arms exactly one idle-recovery monitor per durable session and chimes on resolve', async () => {
@@ -1351,6 +1362,8 @@ it('onceIdle with assumeActive resolves from status-map absence without prior ob
 
 And a **disarm-on-new-send** test in the adapter suite (test consideration for the double-fire hazard): arm a cold monitor via attach-on-busy, then drive a user send whose own `onceIdle` resolves — assert exactly ONE `sdk.session.snapshot` idle emission and ONE `sdk.turn.complete` for that turn (the cancelled monitor must not add a second).
 
+And the **reverse direction** — an **attach-mid-send** test (skeleton: the existing "attach during an in-flight send" test at `opencode-serve-adapter.test.ts:130-159`): start a send whose `onceIdle` is a pending deferred; while it is in flight, `await adapter.attach!(...)` for the SAME session with `getSessionStatus` resolving `{ type: 'busy' }`; assert `manager.onceIdle` was called exactly ONCE (only the send path's waiter — `armIdleRecovery` must no-op while `sendsInFlight` has the id); then resolve the deferred, await the send, and assert exactly ONE `sdk.session.snapshot` idle emission and ONE `sdk.turn.complete` in the captured events.
+
 - [ ] **Step 2: Run to verify they fail**
 
 Run: `npm run test:vitest -- --run test/unit/server/fresh-agent/opencode-serve-adapter.test.ts test/unit/server/fresh-agent/opencode-serve-manager.test.ts`
@@ -1371,6 +1384,10 @@ In `adapter.ts`:
 type IdleRecoveryMonitor = { promise: Promise<void>; cancelled: boolean }
 const idleRecoveryMonitors = new Map<string, IdleRecoveryMonitor>()
 
+/** Real ses_ ids with a user send currently in flight. armIdleRecovery must not arm
+ *  while the send path's own onceIdle owns the turn (attach-mid-send double-fire guard). */
+const sendsInFlight = new Set<string>()
+
 /** Called by materializeOrSend before arming the send path's own onceIdle (double-fire guard). */
 function disarmIdleRecovery(realId: string): void {
   const existing = idleRecoveryMonitors.get(realId)
@@ -1383,7 +1400,8 @@ function disarmIdleRecovery(realId: string): void {
 function armIdleRecovery(state: OpencodeSessionState): void {
   const realId = state.realSessionId
   if (!realId) return
-  if (idleRecoveryMonitors.has(realId)) {
+  if (idleRecoveryMonitors.has(realId) || sendsInFlight.has(realId)) {
+    // second disjunct: attach-mid-send guard — the send path's own onceIdle owns this turn
     recordFreshAgentObservabilityEvent({
       kind: 'fresh_agent_monitor', provider: 'opencode',
       sessionIdHash: hashForLogs(realId),
@@ -1441,7 +1459,7 @@ function armIdleRecovery(state: OpencodeSessionState): void {
 }
 ```
 
-In `materializeOrSend`, call `disarmIdleRecovery(realId)` just before the send path arms its own `onceIdle` (`:363-368` area). (Import `OpencodeServeLostError` from `./serve-manager.js`; `hashForLogs`/`recordFreshAgentObservabilityEvent` from `../../observability.js` — the adapter already imports the latter at `:286-311`.)
+In `materializeOrSend`, call `disarmIdleRecovery(realId)` AND `sendsInFlight.add(realId)` just before the send path arms its own `onceIdle` (`:363-368` area), and remove the flag in a `finally` once the send's turn settles (`sendsInFlight.delete(realId)`) so a later restore/attach can arm a monitor again. (Import `OpencodeServeLostError` from `./serve-manager.js`; `hashForLogs`/`recordFreshAgentObservabilityEvent` from `../../observability.js` — the adapter already imports the latter at `:286-311`.)
 
 3. `bindServeStream` (`:273-299`): pass an `onLost` handler through to the manager. In `serve-manager.ts`, extend `subscribe`:
 
@@ -2430,7 +2448,8 @@ Belt-and-suspenders for the same race (kata requires the browser-side guarantee 
 
 **Interfaces:**
 - Consumes: the existing local-echo reconcile logic inside the old `.then` body (`:1618-1707` — it already computes whether the echo was reconciled); `requestSnapshotRefresh('idle-incomplete')` (Task 3); scheduler debounce=0 for `idle-incomplete`.
-- Produces: `idleIncompleteRetryCountRef = useRef(0)`, max `IDLE_INCOMPLETE_MAX_RETRIES = 5`, retry delay 1000 ms via `window.setTimeout`; counter resets whenever a snapshot reconciles the echo or a new send starts.
+- Produces: `idleIncompleteRetryCountRef = useRef(0)`, exported `IDLE_INCOMPLETE_MAX_RETRIES = 5` (exported so the test asserts the cap against the real constant), retry delay 1000 ms via `window.setTimeout` with the timer id stored in `idleIncompleteRetryTimerRef` (deduped: never arm a second timer while one is pending; cleared on unmount — mirror `scheduleSnapshotRefresh`'s cleanup at `:830-836`); counter resets whenever a snapshot reconciles the echo or a new send starts.
+- **Clear-suppression while the loop is armed (fresh-eyes i3 — load-bearing):** without this, the loop is dead on arrival in production. The existing stale-echo clear (`setLocalEcho(null)` at `:1648`, gated by `snapshotAccepted && shouldClearStaleLocalEcho(...)` at `:1644-1646`) runs in the SAME `applySnapshot` pass: every real fetch returns a NEW object, so `snapshotAccepted = displaySnapshot !== previousSnapshot` (`:1633`) is true and the FIRST idle snapshot clears the echo — after which `echoStillPending` is false forever and at most ONE re-poll ever fires. Fix: the echo IS the loop's marker, so it must survive while the retry budget remains — add `idleIncompleteRetryCountRef.current >= IDLE_INCOMPLETE_MAX_RETRIES` as a conjunct of the stale-clear condition. The echo still clears immediately when it LANDS (`landedEcho` path unchanged), and clears via the stale path once retries are exhausted. **Update the existing stale-clear test** (`FreshAgentView.test.tsx:4275-4370`) to match the new contract: the stale clear now happens after the retry budget is exhausted (or assert it with the retry budget forced to 0), not on the first idle snapshot.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2438,30 +2457,67 @@ Belt-and-suspenders for the same race (kata requires the browser-side guarantee 
 it('keeps re-polling (bounded) when an idle snapshot is missing the just-sent turn', async () => {
   // Arrange: pane with a pending local echo for 'question?' (drive the composer),
   // snapshot responses are idle and DO NOT contain the echo's turn.
-  apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(makeSnapshot({ threadId: 'ses_1', status: 'idle', turns: [] }))
+  //
+  // HARNESS TRAP (fresh-eyes i3): return a FRESH snapshot object per fetch. Acceptance is
+  // by OBJECT IDENTITY (`snapshotAccepted = displaySnapshot !== previousSnapshot`,
+  // FreshAgentView.tsx:1633; mergeSnapshotForDisplay does no content comparison, :158-185).
+  // A shared `mockResolvedValue(...)` instance makes `snapshotAccepted` false, skips the
+  // stale-echo clear for the wrong reason, and lets a broken loop pass vacuously.
+  let rev = 1
+  getFreshAgentThreadSnapshot.mockImplementation(async () => freshopencodeSnapshot('unrelated earlier turn', rev++))
   render(<StoreBackedFreshAgentView ... />)
   await typeAndSend('question?')
   act(() => wsHandler({ type: 'freshAgent.send.accepted', requestId: lastSendRequestId(), sessionId: 'ses_1', sessionType: 'freshopencode', provider: 'opencode' }))
-  const before = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
-  // Assert: more snapshot fetches keep coming (retry loop), then stop at the cap
-  await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBeGreaterThan(before), { timeout: 4_000 })
-})
+  const calls = () => getFreshAgentThreadSnapshot.mock.calls.length
+  const before = calls()
+  // SUSTAINED loop — a single extra fetch must NOT satisfy this test:
+  await waitFor(() => expect(calls()).toBeGreaterThanOrEqual(before + 2), { timeout: 8_000 })
+  // ...and it runs to the cap...
+  await waitFor(() => expect(calls()).toBeGreaterThanOrEqual(before + IDLE_INCOMPLETE_MAX_RETRIES), { timeout: 10_000 })
+  // ...then STOPS (bounded — no unbounded polling):
+  const atCap = calls()
+  await new Promise((r) => setTimeout(r, 1_500))
+  expect(calls()).toBe(atCap)
+}, 25_000)   // real timers (this suite uses none fake); 5 retries x 1 s + settle needs a raised test timeout
 ```
 
-- [ ] **Step 2: Run to verify fail** — after the send-accepted refresh returns an idle snapshot, no further fetches happen today (busy never set → poll gate off).
+(Import `IDLE_INCOMPLETE_MAX_RETRIES` from the component module — export it there. `freshopencodeSnapshot(text, revision)` is the file's existing snapshot helper at `:162-182`; there is no generic `makeSnapshot`. This suite advances real time via `waitFor` — do not introduce fake timers.)
 
-- [ ] **Step 3: Implement** in `applySnapshot`: after the existing echo-reconcile computation, add:
+- [ ] **Step 2: Run to verify fail** — today the FIRST accepted idle snapshot clears the accepted-but-unlanded echo (`:1644-1648`) and no further fetches happen (busy never set → poll gate off), so the sustained-retries assertion (`before + 2`) fails.
+
+- [ ] **Step 3: Implement** in `applySnapshot`:
 
 ```ts
-const echoStillPending = /* the existing 'echo not reconciled by this snapshot' condition */
+// (a) Gate the EXISTING stale-echo clear on retry exhaustion so the echo — the loop's
+//     marker — survives while re-polling (see the Clear-suppression interface note).
+//     At :1644-1646, add the conjunct:
+const staleEcho = snapshotAccepted
+  && idleIncompleteRetryCountRef.current >= IDLE_INCOMPLETE_MAX_RETRIES
+  && shouldClearStaleLocalEcho(displaySnapshot, echo, echoPendingMetadata)
+// (landedEcho handling unchanged — a landed echo still clears immediately.)
+
+// (b) After the existing echo-reconcile computation, in the same pass:
+const echoStillPending = /* the 'accepted but not landed' condition, INDEPENDENT of the
+  retry gate added in (a): echo present && send accepted && !localEchoLanded(...) —
+  i.e. shouldClearStaleLocalEcho's input predicate, NOT the gated staleEcho */
 if (snapshotStatus === 'idle' && echoStillPending
   && idleIncompleteRetryCountRef.current < IDLE_INCOMPLETE_MAX_RETRIES) {
   idleIncompleteRetryCountRef.current += 1
-  window.setTimeout(() => requestSnapshotRefresh('idle-incomplete'), 1_000)
+  if (idleIncompleteRetryTimerRef.current === null) {   // dedupe: one pending timer max
+    idleIncompleteRetryTimerRef.current = window.setTimeout(() => {
+      idleIncompleteRetryTimerRef.current = null
+      requestSnapshotRefresh('idle-incomplete')
+    }, 1_000)
+  }
 } else if (!echoStillPending) {
   idleIncompleteRetryCountRef.current = 0
 }
+
+// (c) Reset idleIncompleteRetryCountRef.current = 0 where a new send starts; clear the
+//     pending timer on unmount (mirror scheduleSnapshotRefresh's cleanup at :830-836).
 ```
+
+Also update the pinned stale-clear test (`FreshAgentView.test.tsx:4275-4370`) per the Clear-suppression interface note — the clear now fires after the retry budget, not on the first idle snapshot.
 
 - [ ] **Step 4: Run to verify pass** — FreshAgentView suite.
 
@@ -2645,12 +2701,26 @@ Kata area 6 requires proof, not assumption. Investigation verdict (to be encoded
 
 ```ts
 describe('terminal output vs freshAgent lifecycle on one socket (zrrj)', () => {
-  it('delivers freshAgent.turn.complete while terminal output has inflated bufferedAmount to 3 MiB', () => {
-    // DESIRED behavior (RED until Task 20): a freshAgent event in the 2-16 MiB window
-    // must still be delivered and must NOT close the socket.
-    const ws = createMockWs({ bufferedAmount: 3 * 1024 * 1024 })
-    // arrange: WsHandler with a freshAgent subscription on this ws (reuse the
-    // subscription-listener arrangement from ws-handler-fresh-agent-lifecycle-parity.test.ts)
+  it('delivers freshAgent.turn.complete while flooding terminal output (broker self-throttles below the kill line)', () => {
+    // DESIRED behavior (RED until Task 20).
+    // ARRANGEMENT TRAP (fresh-eyes i3): do NOT seed a static bufferedAmount >= 2 MiB.
+    // WsHandler.send KEEPS its 4008 close after Task 20 (ws-send.ts:135-159 closes whenever
+    // bufferedAmount > maxBufferedAmount; the broker fix never deflates a static mock value),
+    // so with a fixed 3 MiB the freshAgent frame dies in GREEN too and the test can never
+    // pass. The buffered pressure must be PRODUCED BY THE BROKER — the thing Task 20 gates:
+    const ws = createMockWs()
+    // accumulate-bytes idiom from ws-handler-backpressure.test.ts:1893-1895 — never drains:
+    ws.send.mockImplementation((frame: string) => { ws.bufferedAmount += Buffer.byteLength(frame) })
+    // arrange: WsHandler + broker on this ws with a freshAgent subscription (reuse the
+    // subscription-listener arrangement from ws-handler-fresh-agent-lifecycle-parity.test.ts);
+    // attach a FOREGROUND pane on an EMPTY terminal (no replay cursor — the replay path is
+    // already paced at 576 KiB and would make this vacuous), then flood > 4 MiB of live output.
+    floodTerminalOutput(4 * 1024 * 1024)
+    // RED today: broker sends bypass the buffered gate entirely (safeSendPrepared passes no
+    // options, broker.ts:2107-2109), bufferedAmount inflates past 2 MiB, and the freshAgent
+    // frame below is dropped + the socket closed 4008.
+    // GREEN after Task 20: the broker pauses at 1 MiB, so bufferedAmount stays below the line:
+    expect(ws.bufferedAmount).toBeLessThan(2 * 1024 * 1024)
     fireFreshAgentEvent({ type: 'freshAgent.turn.complete', sessionId: 'ses_1', at: Date.now() })
     const sentTypes = ws.send.mock.calls.map(([f]: [string]) => JSON.parse(f).type)
     expect(sentTypes).toContain('freshAgent.event')
@@ -2681,7 +2751,7 @@ Flesh out the arrange code from the two referenced suites — both already const
 - [ ] **Step 2: Run and record the verdict**
 
 Run: `npm run test:vitest -- --run test/unit/server/ws-handler-fresh-agent-backpressure.test.ts`
-Expected: test 1 FAILS (message dropped + socket closed) — that failure IS the coupling proof. Tests 2–4 PASS (they encode current mechanics). Keep test 1 failing (skip-marked `it.fails(...)` is NOT allowed — instead proceed immediately to Task 20 in the same PR; the suite must be green only after Task 20).
+Expected: test 1 FAILS (the ungated broker inflates `bufferedAmount` past 2 MiB, so the buffered-amount assertion trips and the freshAgent frame is dropped + socket closed 4008) — that failure IS the coupling proof. Tests 2–4 PASS (they encode current mechanics). Keep test 1 failing (skip-marked `it.fails(...)` is NOT allowed — instead proceed immediately to Task 20 in the same PR; the suite must be green only after Task 20).
 
 - [ ] **Step 3: Commit** (tests only, with test 1 temporarily asserting the CURRENT broken behavior inverted — to keep the tree green mid-plan, write test 1 with the desired assertions but wrap the two assertions in `expect(...)` guarded by a `// zrrj Task 20 flips broker gating` comment and commit it together with Task 20 if the repo's per-task green policy requires it. Preferred: implement Task 19+20 as one RED→GREEN cycle, committing the test file in Task 20's commit.)
 
