@@ -207,7 +207,7 @@ git commit -m "test(client): pin freshclaude durable sessionRef persist round-tr
 - Modify: `test/e2e-browser/playwright.config.ts` — add `/freshclaude-identity-persistence-rust\.spec\.ts$/` to `RUST_ONLY_SPECS` (~`:89`) AND to the `rust-chromium` project's `testMatch` (~`:265`)
 
 **Interfaces:**
-- Consumes: `RustServer` (`test/e2e-browser/helpers/rust-server.ts:272` — `.start()`, `.restartAbrupt()` `:344`, `.stop()`, `info.homeDir`); `TestHarness` (`helpers/test-harness.ts` — `getState()`, `getPaneLayout(tabId)`, `getActiveTabId()`, `getSentWsMessages()`, `clearSentWsMessages()`); spec-local helper bodies COPIED (per this suite's per-spec-ownership convention, wall spec file doc `:47-51`) from `restore-contract-wall-rust.spec.ts`: `seedWallConfig` (`:131`), `bootWall` (`:156`), `flushPersistence` (`:118`), `reloadAndReconnect` (`:124`), `waitForWsReady` (`:108`), `findFreshAgentLeaf` (`:233`), `createFreshclaudePane` (`:436` — **returns `Promise<void>`; it does NOT return a tab id**), `sendFreshAgentTurn` (`:371`), plus the fake-sidecar env plumbing the wall's leg G uses (fixture `test/e2e-browser/fixtures/fake-claude-sidecar.mjs`; env keys `FRESHELL_CLAUDE_SIDECAR`, `FAKE_CLAUDE_SIDECAR_LOG`; durable UUID constant `44444444-4444-4444-8444-444444444444`; assistant reply text `'Fixture claude turn'`).
+- Consumes: `RustServer` (`test/e2e-browser/helpers/rust-server.ts:272` — `.start()`, `.restartAbrupt()` `:344`, `.stop()`, `info.homeDir`); `TestHarness` (`helpers/test-harness.ts` — `getState()`, `getPaneLayout(tabId)`, `getActiveTabId()`, `getSentWsMessages()`, `clearSentWsMessages()`); spec-local helper bodies COPIED (per this suite's per-spec-ownership convention, wall spec file doc `:47-51`) from `restore-contract-wall-rust.spec.ts`: `seedWallConfig` (`:131`), `bootWall` (`:156`), `flushPersistence` (`:118`), `reloadAndReconnect` (`:124`), `waitForWsReady` (`:108`), `findFreshAgentLeaf` (`:233`), `createFreshclaudePane` (`:436` — **returns `Promise<void>`; it does NOT return a tab id**), `sendFreshAgentTurn` (`:371`); IMPORTED (not copied): `openPanePicker` from `helpers/pane-picker.ts` (the copied `createFreshclaudePane` body calls it -- wall imports it at `:29`) and `fileURLToPath` from `node:url` (feeds the copied `FAKE_CLAUDE_SIDECAR_SOURCE` constant, wall `:34,:39`); `Page` type comes from `@playwright/test` (fixtures.ts exports only `test`/`expect`); plus the fake-sidecar env plumbing the wall's leg G uses (fixture `test/e2e-browser/fixtures/fake-claude-sidecar.mjs`; env keys `FRESHELL_CLAUDE_SIDECAR`, `FAKE_CLAUDE_SIDECAR_LOG`; durable UUID constant `44444444-4444-4444-8444-444444444444`; assistant reply text `'Fixture claude turn'`).
 - Produces: the e2e evidence Task 5 reports; the stale-identity guard that pins the archaeology safety argument.
 
 - [ ] **Step 1: Write the spec**
@@ -233,9 +233,17 @@ Create `test/e2e-browser/specs/freshclaude-identity-persistence-rust.spec.ts`. S
  */
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import { test, expect, type Page } from '../helpers/fixtures.js'
+import { fileURLToPath } from 'node:url'
+import type { Page } from '@playwright/test'
+import { test, expect } from '../helpers/fixtures.js'
 import { RustServer } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
+import { openPanePicker } from '../helpers/pane-picker.js'
+// NOTE: `Page` comes from '@playwright/test' (fixtures.ts exports only
+// `test`/`expect`, as every donor spec does). `openPanePicker` is IMPORTED,
+// not copied -- the copied `createFreshclaudePane` body calls it (wall :29,
+// :448). `fileURLToPath` feeds the FAKE_CLAUDE_SIDECAR_SOURCE constant below
+// (wall :34, :39).
 
 const DURABLE_CLI_SESSION_ID = '44444444-4444-4444-8444-444444444444'
 
@@ -249,7 +257,12 @@ const durableIdentity = (leaf: any): string =>
 // waitForWsReady (:108), flushPersistence (:118), reloadAndReconnect (:124),
 // seedWallConfig (:131), bootWall (:156), findFreshAgentLeaf (:233),
 // createFreshclaudePane (:436), sendFreshAgentTurn (:371)
-// -- and the leg-G env/setupHome wiring for the fake claude sidecar
+// -- createFreshclaudePane's body calls openPanePicker; that helper is
+//    IMPORTED from '../helpers/pane-picker.js' (see import block above),
+//    exactly as the wall does at :29 -- do NOT copy its body.
+// -- also copy the FAKE_CLAUDE_SIDECAR_SOURCE constant and its
+//    fileURLToPath(import.meta.url)-based derivation (wall :34, :39) plus
+//    the leg-G env/setupHome wiring for the fake claude sidecar
 //    (fixture path + FAKE_CLAUDE_SIDECAR_LOG), including any setupHome
 //    seeding leg G performs.
 
