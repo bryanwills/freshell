@@ -182,8 +182,10 @@ export const amplifierProvider: CodingCliProvider = {
 
   async getActivityMtimeMs(filePath: string): Promise<number | undefined> {
     // Amplifier writes session activity to sibling sidecars next to metadata.json.
-    // metadata.json's own mtime lags real activity (it only changes on name/description
-    // updates), so recency and the re-parse gate must also consider these files.
+    // metadata.json is rewritten at turn boundaries (turn end / incremental tool
+    // saves) but goes quiet mid-turn while events.jsonl keeps ticking, so recency
+    // must also consider these files. This feeds ONLY the lastActivityAt fold -- it
+    // never invalidates the indexer's parse cache (v4rw).
     // We only stat (never read) so the cost stays a couple of syscalls per session.
     const dir = path.dirname(filePath)
     const sidecars = ['transcript.jsonl', 'events.jsonl']

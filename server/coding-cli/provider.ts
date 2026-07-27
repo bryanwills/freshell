@@ -23,9 +23,10 @@ export interface CodingCliProvider {
   /**
    * Newest mtime (ms) among the session's activity sidecar files (e.g. Amplifier's
    * `transcript.jsonl` / `events.jsonl`), or undefined if none exist. Providers whose
-   * recency is fully captured by their primary session file omit this. The indexer uses
-   * it both to fold real file activity into recency and to force a re-parse when a sidecar
-   * grows even though the primary session file is unchanged.
+   * recency is fully captured by their primary session file omit this. The indexer folds
+   * it into the session's lastActivityAt (recency only); it never invalidates the parse
+   * cache -- a moved sidecar mtime means only "session had activity", not "parse inputs
+   * changed", so it must not force a re-parse (kata v4rw).
    */
   getActivityMtimeMs?(filePath: string): Promise<number | undefined>
   /** Absolute path of the live lifecycle event log sibling to the given canonical

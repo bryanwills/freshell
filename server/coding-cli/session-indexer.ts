@@ -420,9 +420,9 @@ type CachedSessionEntry = {
   lightweight?: boolean
   /**
    * Newest mtime (ms) among the session's activity sidecars (see
-   * CodingCliProvider.getActivityMtimeMs). Shared between the re-parse gate and the
-   * recency fold so a grown sidecar forces a re-parse even when the primary file is
-   * byte-identical. Undefined for providers that don't expose sidecar activity.
+   * CodingCliProvider.getActivityMtimeMs). Recency bookkeeping only: on a cache hit it
+   * is folded into baseSession.lastActivityAt in place and never triggers a re-parse
+   * (kata v4rw). Undefined for providers that don't expose sidecar activity.
    */
   activityMtimeMs?: number
 }
