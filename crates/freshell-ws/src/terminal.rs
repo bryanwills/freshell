@@ -1375,23 +1375,11 @@ async fn handle_create(
         .map(|r| r.session_id.as_str())
         .filter(|sid| !sid.is_empty() && resume_session_id.as_deref() == Some(*sid))
     {
-        let identity_owner_live =
-            state
-                .identity
-                .find_by_session(&mode, live_sid)
-                .is_some_and(|owner| {
-                    state
-                        .registry
-                        .probe(&owner.terminal_id)
-                        .is_some_and(|r| r.status == freshell_protocol::TerminalRunStatus::Running)
-                });
-        let registry_row_live = identity_owner_live
-            || state.registry.directory().into_iter().any(|entry| {
-                entry.mode == mode
-                    && entry.resume_session_id.as_deref() == Some(live_sid)
-                    && entry.status == freshell_protocol::TerminalRunStatus::Running
-            });
-        if registry_row_live {
+        if state
+            .registry
+            .live_session_owner(Some(&state.identity), &mode, live_sid)
+            .is_some()
+        {
             tracing::warn!(
                 target: "freshell_ws::terminal",
                 mode = %mode,
