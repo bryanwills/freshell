@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Worktree Audit #2 — Final Report</title>
+<style>
+  :root {
+    --green: #22c55e;
+    --green-bg: #f0fdf4;
+    --yellow: #eab308;
+    --yellow-bg: #fefce8;
+    --red: #ef4444;
+    --red-bg: #fef2f2;
+    --gray: #6b7280;
+    --gray-bg: #f9fafb;
+    --light-gray: #d1d5db;
+    --light-gray-bg: #f3f4f6;
+    --border: #e5e7eb;
+    --text: #1f2937;
+    --text-muted: #6b7280;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+    background: #fff;
+    color: var(--text);
+    line-height: 1.6;
+    padding: 2rem;
+    max-width: 1200px;
+    margin: 0 auto;
+  }
+  h1 { font-size: 1.75rem; margin-bottom: 0.25rem; }
+  h2 { font-size: 1.4rem; margin: 2rem 0 0.75rem; border-bottom: 2px solid var(--border); padding-bottom: 0.3rem; }
+  h3 { font-size: 1.1rem; margin: 1rem 0 0.5rem; }
+  .meta { color: var(--text-muted); font-size: 0.9rem; margin-bottom: 1.5rem; }
+  .meta span { margin-right: 1.5rem; }
+
+  .cards { display: flex; gap: 1rem; flex-wrap: wrap; margin: 1.5rem 0; }
+  .card {
+    border-radius: 10px;
+    padding: 1.25rem 1.5rem;
+    min-width: 150px;
+    text-align: center;
+    border: 2px solid;
+  }
+  .card .count { font-size: 2.5rem; font-weight: 700; line-height: 1.2; }
+  .card .label { font-size: 0.85rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; margin-top: 0.25rem; }
+  .card-green { border-color: var(--green); background: var(--green-bg); color: #166534; }
+  .card-yellow { border-color: var(--yellow); background: var(--yellow-bg); color: #854d0e; }
+  .card-red { border-color: var(--red); background: var(--red-bg); color: #991b1b; }
+  .card-gray { border-color: var(--gray); background: var(--gray-bg); color: #374151; }
+  .card-light-gray { border-color: var(--light-gray); background: var(--light-gray-bg); color: #4b5563; }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0;
+    font-size: 0.9rem;
+  }
+  th, td {
+    text-align: left;
+    padding: 0.6rem 0.75rem;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th {
+    background: #f8fafc;
+    font-weight: 600;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--text-muted);
+  }
+  tr:hover td { background: #fafbfc; }
+
+  .badge {
+    display: inline-block;
+    padding: 0.15rem 0.6rem;
+    border-radius: 9999px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .badge-green { background: var(--green-bg); color: #166534; border: 1px solid var(--green); }
+  .badge-yellow { background: var(--yellow-bg); color: #854d0e; border: 1px solid var(--yellow); }
+  .badge-red { background: var(--red-bg); color: #991b1b; border: 1px solid var(--red); }
+  .badge-gray { background: var(--gray-bg); color: #374151; border: 1px solid var(--gray); }
+  .badge-light-gray { background: var(--light-gray-bg); color: #4b5563; border: 1px solid var(--light-gray); }
+
+  code {
+    font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+    font-size: 0.85em;
+    background: #f1f5f9;
+    padding: 0.1em 0.35em;
+    border-radius: 4px;
+  }
+
+  .worktree-entry {
+    border-left: 4px solid;
+    padding: 0.75rem 1rem;
+    margin: 0.75rem 0;
+    border-radius: 0 6px 6px 0;
+    background: #fafbfc;
+  }
+  .worktree-entry.green { border-color: var(--green); }
+  .worktree-entry.yellow { border-color: var(--yellow); }
+  .worktree-entry.red { border-color: var(--red); }
+  .worktree-entry.gray { border-color: var(--gray); }
+  .worktree-entry.light-gray { border-color: var(--light-gray); }
+
+  .worktree-entry h3 { margin-top: 0; }
+  .worktree-entry .info { font-size: 0.85rem; color: var(--text-muted); margin: 0.5rem 0; }
+  .worktree-entry .info span { margin-right: 1rem; }
+  .worktree-entry .desc { font-size: 0.9rem; margin: 0.5rem 0; }
+  .worktree-entry .link { font-size: 0.85rem; margin-top: 0.5rem; }
+  .worktree-entry .link a { color: #2563eb; text-decoration: none; }
+  .worktree-entry .link a:hover { text-decoration: underline; }
+
+  .collapsible {
+    margin: 1rem 0;
+  }
+  .collapsible summary {
+    cursor: pointer;
+    font-size: 1.1rem;
+    font-weight: 600;
+    padding: 0.5rem 0;
+    list-style: none;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .collapsible summary::-webkit-details-marker { display: none; }
+  .collapsible summary::before {
+    content: '▶';
+    font-size: 0.8rem;
+    transition: transform 0.2s;
+  }
+  .collapsible[open] summary::before { transform: rotate(90deg); }
+  .collapsible summary:hover { color: #2563eb; }
+
+  .bulk-list {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 0.5rem;
+    margin: 1rem 0;
+  }
+  .bulk-item {
+    padding: 0.5rem 0.75rem;
+    border-radius: 6px;
+    background: var(--light-gray-bg);
+    border: 1px solid var(--light-gray);
+    font-size: 0.85rem;
+  }
+  .bulk-item .wt-name { font-weight: 600; }
+  .bulk-item .wt-branch { color: var(--text-muted); font-size: 0.8rem; }
+
+  .summary-table { margin: 1rem 0; }
+  .summary-table td:first-child { font-weight: 600; }
+</style>
+</head>
+<body>
+
+<h1>Worktree Audit #2: Final Aggregation Report</h1>
+<div class="meta">
+  <span><strong>Date:</strong> Jun 23, 2026</span>
+  <span><strong>Scope:</strong> Full sweep — all worktrees</span>
+  <span><strong>Origin/main:</strong> <code>84e049b6</code></span>
+</div>
+
+<h2>Executive Summary</h2>
+
+<div class="cards">
+  <div class="card card-green">
+    <div class="count">3</div>
+    <div class="label">Ready for Landing</div>
+  </div>
+  <div class="card card-red">
+    <div class="count">2</div>
+    <div class="label">Superseded</div>
+  </div>
+  <div class="card card-light-gray">
+    <div class="count">2</div>
+    <div class="label">Skipped</div>
+  </div>
+  <div class="card card-gray">
+    <div class="count">52</div>
+    <div class="label">Already on Main</div>
+  </div>
+  <div class="card card-gray" style="border-color: #374151; background: #f3f4f6;">
+    <div class="count">67</div>
+    <div class="label">Total Worktrees</div>
+  </div>
+</div>
+
+<table class="summary-table">
+  <tr><td>Total worktrees evaluated</td><td>67</td></tr>
+  <tr><td>Ancestor=NO (novel work)</td><td>5</td></tr>
+  <tr><td>Ancestor=YES, dirty</td><td>9</td></tr>
+  <tr><td>Ancestor=YES, clean, 0 ahead (bulk cleanup)</td><td>52</td></tr>
+</table>
+
+<h2>Ready for Landing</h2>
+
+<div class="worktree-entry green">
+  <h3>1. fresh-agent-parity-audit <span class="badge badge-green">ready-landing</span></h3>
+  <div class="info">
+    <span><strong>Branch:</strong> <code>feat/fresh-agent-parity-audit</code></span>
+    <span><strong>Date:</strong> Jun 23</span>
+    <span><strong>Ahead/Behind:</strong> 1 / 0</span>
+    <span><strong>Diff:</strong> 8 files, +168 lines</span>
+  </div>
+  <p class="desc">Closes four parity gaps across the fresh-agent adapter layer: Codex <code>onTurnCompleted</code> snapshot emit, OpenCode idle session absent from status map, <code>OPENCODE_CMD</code> env var support, and runtime manager subscribe materialization race. All 299 tests pass.</p>
+  <div class="link"><a href="deep-dive/08-fresh-agent-audit2.md">Deep-dive report &rarr;</a></div>
+</div>
+
+<div class="worktree-entry green">
+  <h3>2. fresh-agent-turn-complete <span class="badge badge-green">ready-landing</span></h3>
+  <div class="info">
+    <span><strong>Branch:</strong> <code>fix/fresh-agent-server-authoritative-completion</code></span>
+    <span><strong>Date:</strong> Jun 23</span>
+    <span><strong>Ahead/Behind:</strong> 7 / 3</span>
+    <span><strong>Diff:</strong> 23 files, +1289/&minus;63 lines</span>
+  </div>
+  <p class="desc">Moves fresh-agent turn-completion from client-derived to server-authoritative, matching the terminal Claude/Codex pattern. Adds turn-complete-clock, SDK bridge, and client completion thunk. 7 commits, 6 fresheyes review rounds. All 203 tests pass. No merge conflicts.</p>
+  <div class="link"><a href="deep-dive/08-fresh-agent-audit2.md">Deep-dive report &rarr;</a></div>
+</div>
+
+<div class="worktree-entry yellow">
+  <h3>3. freshagent-header-bar <span class="badge badge-yellow">finish-work</span></h3>
+  <div class="info">
+    <span><strong>Branch:</strong> <code>freshagent-header-bar</code></span>
+    <span><strong>Date:</strong> Jun 15</span>
+    <span><strong>Ahead/Behind:</strong> 0 / 0</span>
+    <span><strong>Diff:</strong> 3 files, +100/&minus;33 (uncommitted)</span>
+  </div>
+  <p class="desc">Generalizes header bar to all providers (removes Claude-only guard) and adds <code>FreshAgentToolIcons</code> component showing active tool icons. Consumes existing Redux state. <strong>Needs 1 test assertion</strong> for tool icons behavior before landing.</p>
+  <div class="link"><a href="deep-dive/09-uncommitted-work.md">Deep-dive report &rarr;</a></div>
+</div>
+
+<h2>Throw Away &mdash; Superseded</h2>
+
+<div class="worktree-entry red">
+  <h3>4. fresh-agent-progressive-hydration <span class="badge badge-red">superseded</span></h3>
+  <div class="info">
+    <span><strong>Branch:</strong> <code>feature/fresh-agent-progressive-hydration</code></span>
+    <span><strong>Date:</strong> Jun 21</span>
+    <span><strong>Ahead/Behind:</strong> 6 / 47</span>
+    <span><strong>Diff:</strong> 47 files, +3165/&minus;2477 lines</span>
+  </div>
+  <p class="desc">Merged as PR #468, then fully reverted via PR #470 due to a body-heavy restart regression. A replacement plan (<code>fresh-agent-rehydration-fix</code>) re-lands the same goal with a fundamentally different, safer architecture. Re-landing the original would reintroduce the regression.</p>
+  <div class="link"><a href="deep-dive/08-fresh-agent-audit2.md">Deep-dive report &rarr;</a></div>
+</div>
+
+<div class="worktree-entry red">
+  <h3>5. fix-codex-sidecar-build <span class="badge badge-red">superseded</span></h3>
+  <div class="info">
+    <span><strong>Branch:</strong> <code>fix/codex-sidecar-build</code></span>
+    <span><strong>Date:</strong> May 18</span>
+    <span><strong>Ahead/Behind:</strong> 0 / 0</span>
+    <span><strong>Diff:</strong> 4 modified + 4 new files (uncommitted)</span>
+  </div>
+  <p class="desc">Built a codex sidecar abstraction (<code>durable-rollout-tracker.ts</code> + <code>sidecar.ts</code>), but all modified-file changes are already on main, and main replaced the entire approach with <code>durability-proof.ts</code> and <code>durability-store.ts</code> &mdash; a completely different architecture. Keeping this work would create duplicate, conflicting implementations.</p>
+  <div class="link"><a href="deep-dive/09-uncommitted-work.md">Deep-dive report &rarr;</a></div>
+</div>
+
+<h2>Skipped &mdash; Plan Only / Obsolete</h2>
+
+<div class="worktree-entry light-gray">
+  <h3>6. fresh-agent-rehydration-fix <span class="badge badge-light-gray">skipped-plan</span></h3>
+  <div class="info">
+    <span><strong>Branch:</strong> <code>plan/fresh-agent-rehydration-fix</code></span>
+    <span><strong>Date:</strong> Jun 22</span>
+    <span><strong>Ahead/Behind:</strong> 3 / 33</span>
+    <span><strong>Diff:</strong> docs only (2559-line plan)</span>
+  </div>
+  <p class="desc">A detailed replacement plan for the reverted progressive-hydration work. Metadata-only snapshots, dedicated turns API endpoint, bounded transcript loading. Zero implementation &mdash; plan only. Implementation should proceed from a fresh worktree based on <code>origin/main</code>.</p>
+</div>
+
+<div class="worktree-entry light-gray">
+  <h3>7. dev-stack-main-trial <span class="badge badge-light-gray">skipped-obsolete</span></h3>
+  <div class="info">
+    <span><strong>Branch:</strong> <code>integration/main-to-tested-dev-stack-20260520</code></span>
+    <span><strong>Date:</strong> May 20</span>
+    <span><strong>Ahead/Behind:</strong> 1 / 508</span>
+    <span><strong>Diff:</strong> 282 files, +44769/&minus;8187 lines</span>
+  </div>
+  <p class="desc">Ancient relic &mdash; 508 commits behind main. A historical integration snapshot fully superseded by main's evolution. No novel work remains.</p>
+</div>
+
+<h2>Audited Worktrees &mdash; Summary Table</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>#</th>
+      <th>Worktree</th>
+      <th>Branch</th>
+      <th>Date</th>
+      <th>Verdict</th>
+      <th>Category</th>
+      <th>Analysis</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>1</td>
+      <td><code>fresh-agent-parity-audit</code></td>
+      <td><code>feat/fresh-agent-parity-audit</code></td>
+      <td>Jun 23</td>
+      <td><span class="badge badge-green">ready-landing</span></td>
+      <td>Ready for landing</td>
+      <td>0 behind; 4 parity fixes; 299 tests pass</td>
+    </tr>
+    <tr>
+      <td>2</td>
+      <td><code>fresh-agent-turn-complete</code></td>
+      <td><code>fix/fresh-agent-server-authoritative-completion</code></td>
+      <td>Jun 23</td>
+      <td><span class="badge badge-green">ready-landing</span></td>
+      <td>Ready for landing</td>
+      <td>7 commits; server-authoritative turn completion; 203 tests pass</td>
+    </tr>
+    <tr>
+      <td>3</td>
+      <td><code>freshagent-header-bar</code></td>
+      <td><code>freshagent-header-bar</code></td>
+      <td>Jun 15</td>
+      <td><span class="badge badge-yellow">finish-work</span></td>
+      <td>Ready (needs test)</td>
+      <td>Generalizes header bar + tool icons; needs 1 test assertion</td>
+    </tr>
+    <tr>
+      <td>4</td>
+      <td><code>fresh-agent-progressive-hydration</code></td>
+      <td><code>feature/fresh-agent-progressive-hydration</code></td>
+      <td>Jun 21</td>
+      <td><span class="badge badge-red">superseded</span></td>
+      <td>Throw away</td>
+      <td>Reverted via PR #470; replaced by rehydration-fix plan</td>
+    </tr>
+    <tr>
+      <td>5</td>
+      <td><code>fix-codex-sidecar-build</code></td>
+      <td><code>fix/codex-sidecar-build</code></td>
+      <td>May 18</td>
+      <td><span class="badge badge-red">superseded</span></td>
+      <td>Throw away</td>
+      <td>Superseded by main's durability approach</td>
+    </tr>
+    <tr>
+      <td>6</td>
+      <td><code>fresh-agent-rehydration-fix</code></td>
+      <td><code>plan/fresh-agent-rehydration-fix</code></td>
+      <td>Jun 22</td>
+      <td><span class="badge badge-light-gray">skipped-plan</span></td>
+      <td>Plan only</td>
+      <td>2559-line plan; zero implementation</td>
+    </tr>
+    <tr>
+      <td>7</td>
+      <td><code>dev-stack-main-trial</code></td>
+      <td><code>integration/main-to-tested-dev-stack-20260520</code></td>
+      <td>May 20</td>
+      <td><span class="badge badge-light-gray">skipped-obsolete</span></td>
+      <td>Obsolete</td>
+      <td>508 behind; ancient integration snapshot</td>
+    </tr>
+  </tbody>
+</table>
+
+<details class="collapsible">
+  <summary>Bulk Cleanup &mdash; 52 Worktrees Already on Main (click to expand)</summary>
+  <p style="margin: 0.75rem 0; color: var(--text-muted); font-size: 0.9rem;">
+    All 52 worktrees below are ancestor=YES, clean, and 0 ahead. Their HEAD commits are already on <code>origin/main</code>.
+    They contain no novel work and no uncommitted changes. <strong>Safe to delete via <code>git worktree remove</code>.</strong>
+  </p>
+  <div class="bulk-list">
+    <div class="bulk-item"><div class="wt-name">agent-chat-spec-impl</div><div class="wt-branch">codex/agent-chat-spec-split &middot; May 29</div></div>
+    <div class="bulk-item"><div class="wt-name">allowed-origins-bootstrap-cleanup</div><div class="wt-branch">codex/allowed-origins-bootstrap-cleanup &middot; May 21</div></div>
+    <div class="bulk-item"><div class="wt-name">autokill-15</div><div class="wt-branch">fix/autokill-default-15min &middot; May 29</div></div>
+    <div class="bulk-item"><div class="wt-name">claude-resume-robustness</div><div class="wt-branch">claude-resume-robustness &middot; Jun 11</div></div>
+    <div class="bulk-item"><div class="wt-name">claude-status-notification-robustness</div><div class="wt-branch">claude-status-notification-robustness &middot; May 29</div></div>
+    <div class="bulk-item"><div class="wt-name">codex-cli-upgrade-hang</div><div class="wt-branch">fix/codex-cli-upgrade-hang &middot; Jun 17</div></div>
+    <div class="bulk-item"><div class="wt-name">codex-runtime-flake</div><div class="wt-branch">fix/codex-runtime-startup-flake &middot; May 30</div></div>
+    <div class="bulk-item"><div class="wt-name">deterministic-codex-durability</div><div class="wt-branch">fix/deterministic-codex-durability &middot; Jun 15</div></div>
+    <div class="bulk-item"><div class="wt-name">dev</div><div class="wt-branch">dev &middot; Jun 22</div></div>
+    <div class="bulk-item"><div class="wt-name">feat-new-favicon-landing</div><div class="wt-branch">feat/new-favicon &middot; May 24</div></div>
+    <div class="bulk-item"><div class="wt-name">fix-awaitConfig-timeout</div><div class="wt-branch">fix/awaitConfig-timeout &middot; May 25</div></div>
+    <div class="bulk-item"><div class="wt-name">fix-codex-clean-exit-recovery</div><div class="wt-branch">fix-codex-clean-exit-recovery &middot; May 24</div></div>
+    <div class="bulk-item"><div class="wt-name">fix-codex-update-skip</div><div class="wt-branch">fix-codex-update-skip &middot; Jun 18</div></div>
+    <div class="bulk-item"><div class="wt-name">fix-editor-complete-root</div><div class="wt-branch">fix/editor-complete-root &middot; Jun 11</div></div>
+    <div class="bulk-item"><div class="wt-name">fix-freshopencode-bouncer</div><div class="wt-branch">fix/freshopencode-bouncer &middot; Jun 19</div></div>
+    <div class="bulk-item"><div class="wt-name">fix-launch-planner-shutdown</div><div class="wt-branch">fix-launch-planner-shutdown &middot; Jun 7</div></div>
+    <div class="bulk-item"><div class="wt-name">fix-pr-415-freshopencode</div><div class="wt-branch">fix/pr-415-freshopencode &middot; Jun 12</div></div>
+    <div class="bulk-item"><div class="wt-name">fix-setup-wizard-dismiss</div><div class="wt-branch">fix-setup-wizard-dismiss &middot; May 24</div></div>
+    <div class="bulk-item"><div class="wt-name">fresh-agent-font-size</div><div class="wt-branch">feat/fresh-agent-font-size &middot; Jun 11</div></div>
+    <div class="bulk-item"><div class="wt-name">fresh-agent-import-cleanup</div><div class="wt-branch">codex/fresh-agent-import-cleanup &middot; May 29</div></div>
+    <div class="bulk-item"><div class="wt-name">fresh-agent-mono-style</div><div class="wt-branch">feat/fresh-agent-mono-style &middot; Jun 17</div></div>
+    <div class="bulk-item"><div class="wt-name">fresh-agent-opacity-whitespace</div><div class="wt-branch">codex/fresh-agent-opacity-whitespace &middot; Jun 11</div></div>
+    <div class="bulk-item"><div class="wt-name">fresh-agent-transcript-contract</div><div class="wt-branch">feature/fresh-agent-transcript-contract &middot; Jun 19</div></div>
+    <div class="bulk-item"><div class="wt-name">fresh-client-responsive-display</div><div class="wt-branch">codex/fresh-client-responsive-display &middot; Jun 12</div></div>
+    <div class="bulk-item"><div class="wt-name">fresh-clients-toggle</div><div class="wt-branch">codex/fresh-clients-toggle &middot; May 29</div></div>
+    <div class="bulk-item"><div class="wt-name">fresh-pane</div><div class="wt-branch">feat/fresh-pane-clients &middot; Jun 10</div></div>
+    <div class="bulk-item"><div class="wt-name">freshagent-body-reopen-context</div><div class="wt-branch">fix/freshagent-body-reopen-context &middot; Jun 14</div></div>
+    <div class="bulk-item"><div class="wt-name">freshagent-qa-fixes</div><div class="wt-branch">freshagent-qa-fixes &middot; Jun 13</div></div>
+    <div class="bulk-item"><div class="wt-name">freshagent-style-settings</div><div class="wt-branch">freshagent-style-settings &middot; Jun 12</div></div>
+    <div class="bulk-item"><div class="wt-name">freshagent-ux-restoration</div><div class="wt-branch">freshagent-ux-restoration &middot; May 24</div></div>
+    <div class="bulk-item"><div class="wt-name">freshcodex-improvements</div><div class="wt-branch">freshcodex-improvements &middot; May 24</div></div>
+    <div class="bulk-item"><div class="wt-name">freshopencode-db-history</div><div class="wt-branch">freshopencode-db-history &middot; Jun 12</div></div>
+    <div class="bulk-item"><div class="wt-name">freshopencode-parity</div><div class="wt-branch">freshopencode-parity &middot; May 24</div></div>
+    <div class="bulk-item"><div class="wt-name">kata-freshopencode-materialization-race</div><div class="wt-branch">kata/freshopencode-materialization-race &middot; Jun 21</div></div>
+    <div class="bulk-item"><div class="wt-name">main-test-server-2</div><div class="wt-branch">fix/freshclaude-main-server-validation &middot; Jun 11</div></div>
+    <div class="bulk-item"><div class="wt-name">materialization-subscription-leak-plan</div><div class="wt-branch">docs/materialization-subscription-leak-plan &middot; Jun 14</div></div>
+    <div class="bulk-item"><div class="wt-name">new-settings-ui</div><div class="wt-branch">new-settings-ui &middot; Jun 21</div></div>
+    <div class="bulk-item"><div class="wt-name">opencode-browser-refresh-restore</div><div class="wt-branch">opencode-browser-refresh-restore &middot; Jun 1</div></div>
+    <div class="bulk-item"><div class="wt-name">opencode-refresh-tab-survival</div><div class="wt-branch">fix/opencode-refresh-tab-survival &middot; Jun 1</div></div>
+    <div class="bulk-item"><div class="wt-name">opencode-replay-gap-lease</div><div class="wt-branch">fix/opencode-replay-gap-lease &middot; Jun 15</div></div>
+    <div class="bulk-item"><div class="wt-name">pane-settings-input-ux</div><div class="wt-branch">codex/pane-settings-input-ux &middot; Jun 11</div></div>
+    <div class="bulk-item"><div class="wt-name">plan-codex-stale-resume-recovery</div><div class="wt-branch">plan/codex-stale-resume-recovery &middot; Jun 10</div></div>
+    <div class="bulk-item"><div class="wt-name">plan-terminal-catchup-architecture</div><div class="wt-branch">plan-terminal-catchup-architecture &middot; Jun 8</div></div>
+    <div class="bulk-item"><div class="wt-name">plan-windows-wsl-paths</div><div class="wt-branch">plan-windows-wsl-paths &middot; Jun 7</div></div>
+    <div class="bulk-item"><div class="wt-name">reopen-session-flavor-plan</div><div class="wt-branch">plan/reopen-session-flavor &middot; Jun 13</div></div>
+    <div class="bulk-item"><div class="wt-name">replay-logging-summaries</div><div class="wt-branch">fix/replay-logging-summaries &middot; Jun 15</div></div>
+    <div class="bulk-item"><div class="wt-name">repro-c3-sidecar-missing</div><div class="wt-branch">(detached HEAD) &middot; May 18</div></div>
+    <div class="bulk-item"><div class="wt-name">rollback-fresh-agent-progressive-hydration</div><div class="wt-branch">rollback-fresh-agent-progressive-hydration &middot; Jun 21</div></div>
+    <div class="bulk-item"><div class="wt-name">settings-show-switches-plan</div><div class="wt-branch">plan/settings-show-switches &middot; Jun 22</div></div>
+    <div class="bulk-item"><div class="wt-name">stdout-stderr-errors-only</div><div class="wt-branch">codex/stdout-stderr-errors-only &middot; May 24</div></div>
+    <div class="bulk-item"><div class="wt-name">terminal-catchup-stream-safety</div><div class="wt-branch">terminal-catchup-stream-safety &middot; Jun 10</div></div>
+    <div class="bulk-item"><div class="wt-name">zrrj-freshopencode-recovery</div><div class="wt-branch">fix/zrrj-freshopencode-recovery &middot; Jun 22</div></div>
+  </div>
+</details>
+
+<h2>Deep-Dive Reports</h2>
+<ul>
+  <li><a href="deep-dive/08-fresh-agent-audit2.md">08 &mdash; Fresh-Agent Audit 2</a> (parity-audit, turn-complete, progressive-hydration)</li>
+  <li><a href="deep-dive/09-uncommitted-work.md">09 &mdash; Uncommitted Work</a> (freshagent-header-bar, fix-codex-sidecar-build)</li>
+  <li><a href="baseline-criteria-2.md">Baseline Criteria</a></li>
+  <li><a href="first-pass-table-2.md">First-Pass Table</a></li>
+</ul>
+
+</body>
+</html>

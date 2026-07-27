@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Freshell Worktree Audit — Final Report</title>
+<style>
+  :root {
+    --bg: #f8f9fa;
+    --card-bg: #fff;
+    --border: #dee2e6;
+    --text: #212529;
+    --text-muted: #6c757d;
+    --ready: #198754;
+    --ready-bg: #d1e7dd;
+    --finish: #ffc107;
+    --finish-bg: #fff3cd;
+    --finish-text: #664d03;
+    --in-main: #6c757d;
+    --in-main-bg: #e2e3e5;
+    --skipped: #adb5bd;
+    --skipped-bg: #f0f0f0;
+    --accent: #0d6efd;
+    --accent-hover: #0b5ed7;
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.6; padding: 2rem 1rem;
+  }
+  .container { max-width: 1200px; margin: 0 auto; }
+  h1 { font-size: 1.8rem; margin-bottom: 0.25rem; }
+  .subtitle { color: var(--text-muted); margin-bottom: 1.5rem; font-size: 0.95rem; }
+  h2 { font-size: 1.3rem; margin: 1.5rem 0 0.75rem; padding-bottom: 0.25rem; border-bottom: 2px solid var(--border); }
+  h3 { font-size: 1.05rem; margin: 1rem 0 0.5rem; }
+  .summary-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 0.75rem; margin-bottom: 1.5rem; }
+  .summary-card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; text-align: center; }
+  .summary-card .num { font-size: 2rem; font-weight: 700; line-height: 1.2; }
+  .summary-card .label { font-size: 0.8rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
+  .summary-card.ready .num { color: var(--ready); }
+  .summary-card.finish .num { color: var(--finish-text); }
+  .summary-card.main .num { color: var(--in-main); }
+
+  .legend { display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 1.5rem; font-size: 0.85rem; }
+  .legend-item { display: flex; align-items: center; gap: 0.4rem; }
+  .legend-swatch { display: inline-block; width: 14px; height: 14px; border-radius: 3px; border: 1px solid rgba(0,0,0,0.1); }
+
+  .section-card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 1.25rem; margin-bottom: 1rem; }
+  .section-card h3 { margin-top: 0; }
+  .section-card.ready { border-left: 4px solid var(--ready); }
+  .section-card.finish { border-left: 4px solid var(--finish); }
+  .section-card.main { border-left: 4px solid var(--in-main); }
+  .section-card.skipped { border-left: 4px solid var(--skipped); }
+  .worktree-meta { display: grid; grid-template-columns: auto 1fr; gap: 0.2rem 0.75rem; font-size: 0.85rem; margin: 0.5rem 0; }
+  .worktree-meta dt { color: var(--text-muted); font-weight: 500; }
+  .worktree-meta dd { }
+  .badge { display: inline-block; font-size: 0.72rem; font-weight: 600; padding: 0.15rem 0.5rem; border-radius: 4px; text-transform: uppercase; letter-spacing: 0.3px; }
+  .badge.ready { background: var(--ready-bg); color: var(--ready); }
+  .badge.finish { background: var(--finish-bg); color: var(--finish-text); }
+  .badge.main { background: var(--in-main-bg); color: var(--in-main); }
+  .badge.skipped { background: var(--skipped-bg); color: #495057; }
+
+  .table-controls { margin-bottom: 0.75rem; display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; }
+  .table-controls input, .table-controls select { padding: 0.35rem 0.6rem; border: 1px solid var(--border); border-radius: 4px; font-size: 0.85rem; }
+  .table-controls input { flex: 1; min-width: 180px; }
+
+  table { width: 100%; border-collapse: collapse; background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; font-size: 0.875rem; }
+  th { background: #e9ecef; text-align: left; padding: 0.6rem 0.75rem; font-weight: 600; cursor: pointer; user-select: none; position: relative; white-space: nowrap; }
+  th:hover { background: #dee2e6; }
+  th .sort-arrow { margin-left: 0.3rem; opacity: 0.3; }
+  th.sorted .sort-arrow { opacity: 1; }
+  td { padding: 0.5rem 0.75rem; border-top: 1px solid var(--border); vertical-align: top; }
+  tr:hover td { background: #f8f9fa; }
+  .col-num { width: 35px; text-align: center; color: var(--text-muted); font-size: 0.8rem; }
+  .col-verdict { width: 100px; }
+  .col-date { width: 85px; white-space: nowrap; }
+  .col-worktree { min-width: 200px; }
+  .col-branch { min-width: 180px; font-family: "SF Mono", "Monaco", "Cascadia Code", "Consolas", monospace; font-size: 0.8rem; word-break: break-all; }
+  td a { color: var(--accent); text-decoration: none; }
+  td a:hover { text-decoration: underline; }
+
+  .skipped-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 0.75rem; }
+  .skipped-item { background: var(--card-bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.75rem; font-size: 0.85rem; }
+  .skipped-item .name { font-weight: 600; }
+  .skipped-item .date { color: var(--text-muted); font-size: 0.8rem; }
+  .skipped-item .type { font-size: 0.75rem; display: inline-block; background: var(--skipped-bg); padding: 0.1rem 0.4rem; border-radius: 3px; margin-left: 0.3rem; }
+
+  @media (max-width: 768px) {
+    body { padding: 1rem 0.5rem; }
+    table, thead, tbody, th, td, tr { display: block; }
+    thead { display: none; }
+    td { padding: 0.4rem 0.5rem; border: none; }
+    td::before { content: attr(data-label); font-weight: 600; display: inline-block; width: 80px; font-size: 0.75rem; color: var(--text-muted); }
+    tr { border: 1px solid var(--border); border-radius: 6px; margin-bottom: 0.5rem; padding: 0.4rem; }
+    .col-num::before { display: none; }
+    .col-num { color: var(--text-muted); }
+    .summary-cards { grid-template-columns: repeat(2, 1fr); }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>Freshell Worktree Audit &mdash; Final Report</h1>
+<p class="subtitle">Generated: 2026-06-21 &nbsp;|&nbsp; Scope: May 24 &ndash; Jun 21, 2026 &nbsp;|&nbsp; <code>origin/main</code> SHA <code>80319767</code></p>
+
+<!-- Summary Cards -->
+<div class="summary-cards">
+  <div class="summary-card">
+    <div class="num">32</div>
+    <div class="label">Total Audited</div>
+  </div>
+  <div class="summary-card ready">
+    <div class="num">4</div>
+    <div class="label">Ready to Land</div>
+  </div>
+  <div class="summary-card finish">
+    <div class="num">2</div>
+    <div class="label">Finish Work</div>
+  </div>
+  <div class="summary-card main">
+    <div class="num">19</div>
+    <div class="label">Already in Main</div>
+  </div>
+  <div class="summary-card" style="color: var(--skipped);">
+    <div class="num" style="color: var(--skipped);">7</div>
+    <div class="label">Skipped</div>
+  </div>
+</div>
+
+<div class="legend">
+  <span class="legend-item"><span class="legend-swatch" style="background:var(--ready-bg);border-color:var(--ready)"></span> Ready for Landing</span>
+  <span class="legend-item"><span class="legend-swatch" style="background:var(--finish-bg);border-color:var(--finish)"></span> Finish Work</span>
+  <span class="legend-item"><span class="legend-swatch" style="background:var(--in-main-bg);border-color:var(--in-main)"></span> Already in Main</span>
+  <span class="legend-item"><span class="legend-swatch" style="background:var(--skipped-bg);border-color:var(--skipped)"></span> Skipped</span>
+</div>
+
+<!-- Ready for Landing -->
+<h2>&#x2705; Ready for Landing</h2>
+
+<div class="section-card ready">
+  <h3><a href="deep-dive/01-opencode-freshcodex.md#worktree-3-rollback-opencode-sidecars-branch-rollbackopencode-sidecars">rollback-opencode-sidecars</a></h3>
+  <span class="badge ready">Ready</span>
+  <dl class="worktree-meta">
+    <dt>Branch</dt><dd><code>rollback/opencode-sidecars</code></dd>
+    <dt>Date</dt><dd>Jun 21</dd>
+    <dt>SHA</dt><dd><code>58714d76</code></dd>
+    <dt>Ahead/Behind</dt><dd>7 ahead, 0 behind</dd>
+  </dl>
+  <p>Reverts multi-cwd-sidecar approach (PR #450) for a single shared <code>opencode serve</code> process with directory-query routing. Removes ~130 lines of multi-sidecar complexity. 205/205 unit tests pass; typecheck clean. Architecturally: no more <code>sessionCwdById</code>/<code>cwdByKey</code> maps, just a single <code>running</code>/<code>startPromise</code>.</p>
+</div>
+
+<div class="section-card ready">
+  <h3><a href="deep-dive/03-fresh-agent-ui.md#worktree-8-fresh-agent-thinking-muted-color-jun-18">fresh-agent-thinking-muted-color</a></h3>
+  <span class="badge ready">Ready</span>
+  <dl class="worktree-meta">
+    <dt>Branch</dt><dd><code>fix/fresh-agent-thinking-muted-color</code></dd>
+    <dt>Date</dt><dd>Jun 18</dd>
+    <dt>SHA</dt><dd><code>a122fba1</code></dd>
+    <dt>Ahead/Behind</dt><dd>1 ahead, 29 behind</dd>
+  </dl>
+  <p>Fixes thinking text rendering in serif style (was using answer color instead of muted color). Adds CSS <code>--tw-prose-*</code> overrides + e2e test. Not on main &mdash; verified the bug is still present. <code>git merge origin/main</code> completes without conflicts.</p>
+</div>
+
+<div class="section-card ready">
+  <h3><a href="deep-dive/02-opencode-think-playback.md#1-opencode-think-normalization-fixopencode-think-normalization">opencode-think-normalization</a></h3>
+  <span class="badge ready">Ready</span>
+  <dl class="worktree-meta">
+    <dt>Branch</dt><dd><code>fix/opencode-think-normalization</code></dd>
+    <dt>Date</dt><dd>Jun 17</dd>
+    <dt>SHA</dt><dd><code>53a34024</code></dd>
+    <dt>Ahead/Behind</dt><dd>1 ahead, 40 behind</dd>
+  </dl>
+  <p>Preserves &lt;think&gt; tag content as <code>thinking</code> transcript items instead of stripping it. Introduces <code>NormalizedTextSegment</code> type. Handles balanced, malformed, unterminated, and dangling think tags. 18 tests pass (vs 14 on main).</p>
+</div>
+
+<div class="section-card ready">
+  <h3><a href="deep-dive/02-opencode-think-playback.md#2-opencode-refresh-restore-white-page-fixopencode-refresh-restore-white-page">opencode-refresh-restore-white-page</a></h3>
+  <span class="badge ready">Ready</span>
+  <dl class="worktree-meta">
+    <dt>Branch</dt><dd><code>fix/opencode-refresh-restore-white-page</code></dd>
+    <dt>Date</dt><dd>Jun 17</dd>
+    <dt>SHA</dt><dd><code>b87f63c2</code></dd>
+    <dt>Ahead/Behind</dt><dd>9 ahead, 40 behind</dd>
+  </dl>
+  <p>Fixes white page on hidden OpenCode tab restore after browser refresh. Removes <code>!hiddenRef.current</code> guard and adds <code>shouldWaitForProviderBehavior</code> to prevent attach race. 126 tests pass; verified bug still on main. E2e test validates real terminal buffer content.</p>
+</div>
+
+<!-- Finish Work -->
+<h2>&#x23F3; Finish Work (needs rebase/integration)</h2>
+
+<div class="section-card finish">
+  <h3><a href="deep-dive/03-fresh-agent-ui.md#worktree-18-freshagent-tool-attribution-jun-13">freshagent-tool-attribution</a></h3>
+  <span class="badge finish">Finish</span>
+  <dl class="worktree-meta">
+    <dt>Branch</dt><dd><code>freshagent-tool-attribution</code></dd>
+    <dt>Date</dt><dd>Jun 13</dd>
+    <dt>SHA</dt><dd><code>cce6d98e</code></dd>
+    <dt>Ahead/Behind</dt><dd>2 ahead, 149 behind</dd>
+  </dl>
+  <p>Filters Claude skill payload user turns and fixes tool-result attribution. Nothing on main yet. Conflicts with transcript contract PR #452. Needs rebase to reconcile <code>normalizeClaudeTurn</code> return type change with contract PR behavior. 6 test cases, well-tested.</p>
+  <p><strong>To land:</strong> rebase &rarr; verify problem still manifests &rarr; reconcile normalizeClaudeTurn signature &rarr; verify tests.</p>
+</div>
+
+<div class="section-card finish">
+  <h3><a href="deep-dive/05-settings-electron-codex.md#worktree-20-new-settings-ui-new-settings-ui">new-settings-ui</a></h3>
+  <span class="badge finish">Finish</span>
+  <dl class="worktree-meta">
+    <dt>Branch</dt><dd><code>new-settings-ui</code></dd>
+    <dt>Date</dt><dd>Jun 12</dd>
+    <dt>SHA</dt><dd><code>9696bc0f</code></dd>
+    <dt>Ahead/Behind</dt><dd>2 ahead, <strong>185 behind</strong></dd>
+  </dl>
+  <p>Major settings UI refactor replacing flat section list with tabbed navigation (Appearance, Coding Agents, Panes, Workspace, Naming, Network, Advanced). 42 files, +3416/−905. 73 tests pass. Based on PR #414; 185 commits behind origin/main.</p>
+  <p><strong>To land:</strong> rebase onto origin/main &rarr; resolve conflicts &rarr; verify all tests &rarr; reconcile with settings changes landed during gap &rarr; update docs/index.html.</p>
+</div>
+
+<!-- Already in Main -->
+<h2>&#x1F5D1; Already in Main (throw away)</h2>
+<p style="color:var(--text-muted);font-size:0.9rem;margin-bottom:0.75rem;">19 worktrees whose code is fully present on <code>origin/main</code>. Worktrees and branches should be deleted.</p>
+
+<div class="section-card main">
+  <h3><a href="deep-dive/01-opencode-freshcodex.md#worktree-1-repro-freshopencode-playwright-branch-debugfreshopencode-playwright-repro-dev">repro-freshopencode-playwright</a> <span style="font-weight:400;font-size:0.85rem;color:var(--text-muted)">&mdash; Jun 19</span></h3>
+  <p>PR #454 merged with identical tree. <code>git diff 80319767 2c5432c6 --stat</code> produces zero output. Branch: <code>debug/freshopencode-playwright-repro-dev</code>.</p>
+</div>
+
+<div class="section-card main">
+  <h3><a href="deep-dive/01-opencode-freshcodex.md#worktree-2-debug-freshcodex-cwd-branch-debug-freshcodex-cwd">debug-freshcodex-cwd</a> <span style="font-weight:400;font-size:0.85rem;color:var(--text-muted)">&mdash; Jun 19</span></h3>
+  <p>PR #450 squash-merged as <code>45efc524</code>. Identical tree hash <code>4ebcc3ac</code>. <code>git diff 13cff1f3 45efc524</code> = zero output. Branch: <code>debug-freshcodex-cwd</code>.</p>
+</div>
+
+<div class="section-card main">
+  <h3><a href="deep-dive/03-fresh-agent-ui.md#worktree-4-fix-mobile-longpress-menu-jun-19">fix-mobile-longpress-menu</a> <span style="font-weight:400;font-size:0.85rem;color:var(--text-muted)">&mdash; Jun 19</span></h3>
+  <p>PR #451 (<code>9383c2fb</code>). Byte-identical diff. <code>git diff 9383c2fb..75256b25 --stat</code> = zero output. Branch: <code>fix-mobile-longpress-menu</code>.</p>
+</div>
+
+<div class="section-card main">
+  <h3><a href="deep-dive/05-settings-electron-codex.md#worktree-6-port-glm-52-to-dev-portglm-52-to-dev">port-glm-5.2-to-dev</a> <span style="font-weight:400;font-size:0.85rem;color:var(--text-muted)">&mdash; Jun 18</span></h3>
+  <p>PR #447 (<code>6dcb9784</code>). Same model entry <code>opencode-go/glm-5.2</code>. Blob hash matches. Branch: <code>port/glm-5.2-to-dev</code>.</p>
+</div>
+
+<div class="section-card main">
+  <h3>investigate-bouncer <span style="font-weight:400;font-size:0.85rem;color:var(--text-muted)">&mdash; Jun 18</span></h3>
+  <p>Plan document for freshopencode bouncer status fix; already on main. Branch: <code>investigate-bouncer</code>.</p>
+</div>
+
+<div class="section-card main">
+  <h3><a href="deep-dive/05-settings-electron-codex.md#worktree-12-electron-modifier-link-external-electron-modifier-link-external">electron-modifier-link-external</a> <span style="font-weight:400;font-size:0.85rem;color:var(--text-muted)">&mdash; Jun 17</span></h3>
+  <p>PR #444 (<code>1898a0c4</code>). All 8 worktree commits reachable from origin/main. All blob hashes match. Branch: <code>electron-modifier-link-external</code>.</p>
+</div>
+
+<div class="section-card main">
+  <h3><a href="deep-dive/03-fresh-agent-ui.md#worktree-15-fix-freshagent-user-message-quotes-jun-15">fix-freshagent-user-message-quotes</a> <span style="font-weight:400;font-size:0.85rem;color:var(--text-muted)">&mdash; Jun 15</span></h3>
+  <p>Code present verbatim on main. <code>stripOpencodeRunArgumentQuoting()</code> at normalize.ts:95. All 4 tests present on main. Branch: <code>fix/freshagent-user-message-quotes</code>.</p>
+</div>
+
+<div class="section-card main">
+  <h3><a href="deep-dive/02-opencode-think-playback.md#3-opencode-playback-dev-pr-testopencode-playback-coalescing-dev">opencode-playback-dev-pr</a> <span style="font-weight:400;font-size:0.85rem;color:var(--text-muted)">&mdash; Jun 15</span></h3>
+  <p>Main commit <code>c50dd6f8</code>. Squashed version of the playback coalescing fix. Branch: <code>test/opencode-playback-coalescing-dev</code>.</p>
+</div>
+
+<div class="section-card main">
+  <h3><a href="deep-dive/02-opencode-think-playback.md#4-opencode-playback-coalescing-testopencode-playback-coalescing">opencode-playback-coalescing</a> <span style="font-weight:400;font-size:0.85rem;color:var(--text-muted)">&mdash; Jun 15</span></h3>
+  <p>Main commit <code>c50dd6f8</code>. Source branch with granular commits and plan docs. Same fix, already landed. Branch: <code>test/opencode-playback-coalescing</code>.</p>
+</div>
+
+<div class="section-card main">
+  <h3><a href="deep-dive/03-fresh-agent-ui.md#worktree-19-freshagent-serif-full-style-jun-13">freshagent-serif-full-style</a> <span style="font-weight:400;font-size:0.85rem;color:var(--text-muted)">&mdash; Jun 13</span></h3>
+  <p>PR #452 (transcript contract) fixed the auto-collapse regression via a different implementation. Key behaviors all present on main. Branch: <code>freshagent-transcript-no-auto-collapse</code>.</p>
+</div>
+
+<div class="section-card main">
+  <h3><a href="deep-dive/04-terminal-catchup.md#23-proof-terminal-catchup-architecture">proof-terminal-catchup-architecture</a> <span style="font-weight:400;font-size:0.85rem;color:var(--text-muted)">&mdash; Jun 8</span></h3>
+  <p>Same research dossier (14 files, +2920) on main as <code>6f74e6f7</code>. Zero diff in shared files. Branch: <code>proof-terminal-catchup-architecture</code>.</p>
+</div>
+
+<div class="section-card main">
+  <h3><a href="deep-dive/04-terminal-catchup.md#24-fix-terminal-catchup">fix-terminal-catchup</a> <span style="font-weight:400;font-size:0.85rem;color:var(--text-muted)">&mdash; Jun 7</span></h3>
+  <p>PR #396 (<code>463eff2f</code>). Write-queue replay coalescing within 32ms budget. Identical +225/−14. Branch: <code>fix-terminal-catchup</code>.</p>
+</div>
+
+<div class="section-card main">
+  <h3><a href="deep-dive/04-terminal-catchup.md#25-fix-replay-server-batching">fix-replay-server-batching</a> <span style="font-weight:400;font-size:0.85rem;color:var(--text-muted)">&mdash; Jun 7</span></h3>
+  <p>PR #397 (<code>6faf470e</code>). Server-side batch coalescing in replay-ring.ts. Identical +103/−23. Branch: <code>fix-replay-server-batching</code>.</p>
+</div>
+
+<div class="section-card main">
+  <h3><a href="deep-dive/05-settings-electron-codex.md#worktree-21-fix-electron-launch-chooser-fixelectron-launch-chooser-flow">fix-electron-launch-chooser</a> <span style="font-weight:400;font-size:0.85rem;color:var(--text-muted)">&mdash; Jun 10</span></h3>
+  <p>PR #377 + PR #379. All 24 commits on main. Blob hashes match for all core files. Branch: <code>fix/electron-launch-chooser-flow</code>.</p>
+</div>
+
+<div class="section-card main">
+  <h3><a href="deep-dive/05-settings-electron-codex.md#worktree-22-codex-interrupt-freeze-codex-interrupt-freeze">codex-interrupt-freeze</a> <span style="font-weight:400;font-size:0.85rem;color:var(--text-muted)">&mdash; Jun 10</span></h3>
+  <p>PR #400 (<code>9f54a96a</code>). <code>MAX_COMPLETED_TURN_KEYS</code>, active/completed turn sets, duplicate interrupt guard all on main. Branch: <code>codex-interrupt-freeze</code>.</p>
+</div>
+
+<div class="section-card main">
+  <h3><a href="deep-dive/06-tab-status-reliability.md">tab-status-reliability</a> <span style="font-weight:400;font-size:0.85rem;color:var(--text-muted)">&mdash; Jun 4</span></h3>
+  <p>Squash-merged as <code>6e81e505</code>. Identical diff stat: 66 files, +3201/−232. 22 worktree commits accounted for. Branch: <code>fix/tab-status-reliability</code>.</p>
+</div>
+
+<div class="section-card main">
+  <h3><a href="deep-dive/07-opencode-marker-cache.md">plan-opencode-marker-cache</a> <span style="font-weight:400;font-size:0.85rem;color:var(--text-muted)">&mdash; Jun 4</span></h3>
+  <p>PR #391 (<code>a24f22bd</code>). Zero diff tree. All files on main with identical line counts. 22 tests pass. Branch: <code>perf/opencode-marker-cache</code>.</p>
+</div>
+
+<div class="section-card main">
+  <h3><a href="deep-dive/04-terminal-catchup.md#28-warm-tab-delta-replay">warm-tab-delta-replay</a> <span style="font-weight:400;font-size:0.85rem;color:var(--text-muted)">&mdash; Jun 3</span></h3>
+  <p>PR #386 (<code>dd12912b</code>). Warm replay + backpressure fix. 14 files, +918/−80. Branch: <code>fix/warm-tab-delta-replay</code>.</p>
+</div>
+
+<div class="section-card main">
+  <h3><a href="deep-dive/04-terminal-catchup.md#30-fix-mobile-scroll">fix-mobile-scroll</a> <span style="font-weight:400;font-size:0.85rem;color:var(--text-muted)">&mdash; Jun 2</span></h3>
+  <p>PR #383 (<code>2c8978e8</code>). Touch-scroll in alternate buffer with mouse tracking. 3 files, +297/−12. Branch: <code>fix/mobile-opencode-touch-scroll</code>.</p>
+</div>
+
+<!-- Skipped -->
+<h2>&#x1F4DD; Skipped (Plan-Only / Trivial)</h2>
+<p style="color:var(--text-muted);font-size:0.9rem;margin-bottom:0.75rem;">7 worktrees containing no substantive code changes. Not deep-dived.</p>
+
+<div class="skipped-list">
+  <div class="skipped-item">
+    <div class="name">plan-fresh-agent-transcript-contract <span class="type">Plan</span></div>
+    <div class="date">Jun 19</div>
+    <span><code>plan/fresh-agent-transcript-contract</code> &mdash; 685-line design doc</span>
+  </div>
+  <div class="skipped-item">
+    <div class="name">find-bug <span class="type">Trivial</span></div>
+    <div class="date">Jun 17</div>
+    <span><code>find-bug</code> &mdash; 2-line test reorder</span>
+  </div>
+  <div class="skipped-item">
+    <div class="name">durable-ws-reconnect <span class="type">Plan</span></div>
+    <div class="date">Jun 15</div>
+    <span><code>plan/durable-ws-reconnect</code> &mdash; 2200-line plan docs</span>
+  </div>
+  <div class="skipped-item">
+    <div class="name">freshagent-user-jump-plan <span class="type">Plan</span></div>
+    <div class="date">Jun 14</div>
+    <span><code>freshagent-user-jump-plan</code> &mdash; 1908-line plan doc</span>
+  </div>
+  <div class="skipped-item">
+    <div class="name">disable-superpowers-plugin <span class="type">Trivial</span></div>
+    <div class="date">Jun 3</div>
+    <span><code>chore/disable-superpowers-plugin</code> &mdash; 1-line config change</span>
+  </div>
+  <div class="skipped-item">
+    <div class="name">docs-ci-merge-gate <span class="type">Trivial</span></div>
+    <div class="date">May 30</div>
+    <span><code>docs/ci-merge-gate-note</code> &mdash; 21-line docs update</span>
+  </div>
+  <div class="skipped-item">
+    <div class="name">agent-chat-spec-plan <span class="type">Plan</span></div>
+    <div class="date">May 29</div>
+    <span><code>codex/agent-chat-spec-plan</code> &mdash; 823-line design doc</span>
+  </div>
+</div>
+
+<!-- Full Reference Table -->
+<h2>&#x1F4CA; Full Reference Table</h2>
+<p style="color:var(--text-muted);font-size:0.9rem;margin-bottom:0.75rem;">All 32 worktrees, sorted newest to oldest. Click column headers to sort.</p>
+
+<div class="table-controls">
+  <input type="text" id="filterInput" placeholder="Filter worktrees, branches, SHAs, PRs..." oninput="filterTable()">
+  <select id="verdictFilter" onchange="filterTable()">
+    <option value="">All verdicts</option>
+    <option value="Ready">Ready for Landing</option>
+    <option value="Finish">Finish Work</option>
+    <option value="Main">Already in Main</option>
+    <option value="Skipped">Skipped</option>
+  </select>
+</div>
+
+<table id="worktreeTable">
+  <thead>
+    <tr>
+      <th class="col-num" onclick="sortTable(0)"># <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+      <th class="col-worktree" onclick="sortTable(1)">Worktree <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+      <th class="col-branch" onclick="sortTable(2)">Branch <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+      <th class="col-date" onclick="sortTable(3)">Date <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+      <th class="col-verdict" onclick="sortTable(4)">Verdict <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+      <th onclick="sortTable(5)">Analysis <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+    </tr>
+  </thead>
+  <tbody id="tableBody"></tbody>
+</table>
+
+<p style="margin-top:1rem;color:var(--text-muted);font-size:0.85rem;">
+  Deep-dive reports: <a href="deep-dive/01-opencode-freshcodex.md">01-opencode-freshcodex</a> &middot;
+  <a href="deep-dive/02-opencode-think-playback.md">02-opencode-think-playback</a> &middot;
+  <a href="deep-dive/03-fresh-agent-ui.md">03-fresh-agent-ui</a> &middot;
+  <a href="deep-dive/04-terminal-catchup.md">04-terminal-catchup</a> &middot;
+  <a href="deep-dive/05-settings-electron-codex.md">05-settings-electron-codex</a> &middot;
+  <a href="deep-dive/06-tab-status-reliability.md">06-tab-status-reliability</a> &middot;
+  <a href="deep-dive/07-opencode-marker-cache.md">07-opencode-marker-cache</a>
+</p>
+
+</div><!-- .container -->
+
+<script>
+const data = [
+  [1,"rollback-opencode-sidecars","rollback/opencode-sidecars","Jun 21","Ready for Landing","Single-sidecar routing refactor; 205 tests pass; 7 ahead 0 behind", "ready-landing"],
+  [2,"repro-freshopencode-playwright","debug/freshopencode-playwright-repro-dev","Jun 19","Already in Main","PR #454 merged with identical tree", "in-main"],
+  [3,"plan-fresh-agent-transcript-contract","plan/fresh-agent-transcript-contract","Jun 19","Skipped","685-line design doc; no code", "skipped"],
+  [4,"debug-freshcodex-cwd","debug-freshcodex-cwd","Jun 19","Already in Main","PR #450 squash-merged 45efc524; identical tree", "in-main"],
+  [5,"fix-mobile-longpress-menu","fix-mobile-longpress-menu","Jun 19","Already in Main","PR #451 9383c2fb; byte-identical diff", "in-main"],
+  [6,"port-glm-5.2-to-dev","port/glm-5.2-to-dev","Jun 18","Already in Main","PR #447 6dcb9784; same model entry", "in-main"],
+  [7,"investigate-bouncer","investigate-bouncer","Jun 18","Already in Main","Plan doc already on main", "in-main"],
+  [8,"fresh-agent-thinking-muted-color","fix/fresh-agent-thinking-muted-color","Jun 18","Ready for Landing","Muted thinking text CSS + e2e test; no conflicts", "ready-landing"],
+  [9,"opencode-think-normalization","fix/opencode-think-normalization","Jun 17","Ready for Landing","Think tag preservation; 18 tests pass", "ready-landing"],
+  [10,"opencode-refresh-restore-white-page","fix/opencode-refresh-restore-white-page","Jun 17","Ready for Landing","White page fix; 126 tests pass; bug on main", "ready-landing"],
+  [11,"find-bug","find-bug","Jun 17","Skipped","2-line test reorder", "skipped"],
+  [12,"electron-modifier-link-external","electron-modifier-link-external","Jun 17","Already in Main","PR #444 1898a0c4; all commits on main", "in-main"],
+  [13,"fix-freshagent-user-message-quotes","fix-freshagent-user-message-quotes","Jun 15","Already in Main","Code verbatim on main", "in-main"],
+  [14,"opencode-playback-dev-pr","test/opencode-playback-coalescing-dev","Jun 15","Already in Main","Main c50dd6f8; squashed fix", "in-main"],
+  [15,"opencode-playback-coalescing","test/opencode-playback-coalescing","Jun 15","Already in Main","Main c50dd6f8; source branch", "in-main"],
+  [16,"durable-ws-reconnect","plan/durable-ws-reconnect","Jun 15","Skipped","2200-line plan docs only", "skipped"],
+  [17,"freshagent-user-jump-plan","freshagent-user-jump-plan","Jun 14","Skipped","1908-line plan doc only", "skipped"],
+  [18,"freshagent-tool-attribution","freshagent-tool-attribution","Jun 13","Finish Work","Needs rebase onto PR #452; skill filtering", "finish-work"],
+  [19,"freshagent-serif-full-style","freshagent-transcript-no-auto-collapse","Jun 13","Already in Main","PR #452 fixed differently; behaviors on main", "in-main"],
+  [20,"new-settings-ui","new-settings-ui","Jun 12","Finish Work","185 commits behind; needs rebase", "finish-work"],
+  [21,"fix-electron-launch-chooser","fix/electron-launch-chooser-flow","Jun 10","Already in Main","PR #377+#379; blobs match main", "in-main"],
+  [22,"codex-interrupt-freeze","codex-interrupt-freeze","Jun 10","Already in Main","PR #400 9f54a96a; same code on main", "in-main"],
+  [23,"proof-terminal-catchup-architecture","proof-terminal-catchup-architecture","Jun 8","Already in Main","Same dossier content; zero diff", "in-main"],
+  [24,"fix-terminal-catchup","fix-terminal-catchup","Jun 7","Already in Main","PR #396 463eff2f; write-queue coalescing", "in-main"],
+  [25,"fix-replay-server-batching","fix-replay-server-batching","Jun 7","Already in Main","PR #397 6faf470e; server batching", "in-main"],
+  [26,"tab-status-reliability","fix/tab-status-reliability","Jun 4","Already in Main","Squash-merged 6e81e505; 66 files match", "in-main"],
+  [27,"plan-opencode-marker-cache","perf/opencode-marker-cache","Jun 4","Already in Main","PR #391 a24f22bd; zero diff tree", "in-main"],
+  [28,"warm-tab-delta-replay","fix/warm-tab-delta-replay","Jun 3","Already in Main","PR #386 dd12912b; warm replay fix", "in-main"],
+  [29,"disable-superpowers-plugin","chore/disable-superpowers-plugin","Jun 3","Skipped","1-line config change", "skipped"],
+  [30,"fix-mobile-scroll","fix/mobile-opencode-touch-scroll","Jun 2","Already in Main","PR #383 2c8978e8; touch-scroll alt buf", "in-main"],
+  [31,"docs-ci-merge-gate","docs/ci-merge-gate-note","May 30","Skipped","21-line docs update", "skipped"],
+  [32,"agent-chat-spec-plan","codex/agent-chat-spec-plan","May 29","Skipped","823-line design doc only", "skipped"]
+];
+
+const verdictClass = {"Ready for Landing":"ready","Finish Work":"finish","Already in Main":"main","Skipped":"skipped"};
+const sortDirections = [1,1,1,-1,1,1]; // default: date desc (#3), everything else asc
+let sortColumn = 3;
+let sortAsc = false;
+
+function formatDate(dateStr) {
+  const months = {May:0,Jun:5,Jul:6,Aug:7};
+  const parts = dateStr.split(" ");
+  const m = months[parts[0]];
+  const d = parseInt(parts[1]);
+  return new Date(2026, m, d);
+}
+
+function renderTable(rows) {
+  const tbody = document.getElementById("tableBody");
+  tbody.innerHTML = "";
+  rows.forEach(r => {
+    const tr = document.createElement("tr");
+    const cls = verdictClass[r[4]] || "";
+    const deepDiveLink = deepDiveLinkFor(r[0], r[1]);
+    const cells = [
+      r[0],
+      `<a href="${deepDiveLink}">${r[1]}</a>`,
+      `<code>${r[2]}</code>`,
+      r[3],
+      `<span class="badge ${cls}">${r[4]}</span>`,
+      r[5]
+    ];
+    cells.forEach((c, i) => {
+      const td = document.createElement("td");
+      td.setAttribute("data-label", ["#","Worktree","Branch","Date","Verdict","Analysis"][i]);
+      td.innerHTML = c;
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  });
+}
+
+function deepDiveLinkFor(num, name) {
+  const map = {
+    "repro-freshopencode-playwright":"deep-dive/01-opencode-freshcodex.md",
+    "debug-freshcodex-cwd":"deep-dive/01-opencode-freshcodex.md",
+    "rollback-opencode-sidecars":"deep-dive/01-opencode-freshcodex.md",
+    "opencode-think-normalization":"deep-dive/02-opencode-think-playback.md",
+    "opencode-refresh-restore-white-page":"deep-dive/02-opencode-think-playback.md",
+    "opencode-playback-dev-pr":"deep-dive/02-opencode-think-playback.md",
+    "opencode-playback-coalescing":"deep-dive/02-opencode-think-playback.md",
+    "fix-mobile-longpress-menu":"deep-dive/03-fresh-agent-ui.md",
+    "fresh-agent-thinking-muted-color":"deep-dive/03-fresh-agent-ui.md",
+    "fix-freshagent-user-message-quotes":"deep-dive/03-fresh-agent-ui.md",
+    "freshagent-tool-attribution":"deep-dive/03-fresh-agent-ui.md",
+    "freshagent-serif-full-style":"deep-dive/03-fresh-agent-ui.md",
+    "proof-terminal-catchup-architecture":"deep-dive/04-terminal-catchup.md",
+    "fix-terminal-catchup":"deep-dive/04-terminal-catchup.md",
+    "fix-replay-server-batching":"deep-dive/04-terminal-catchup.md",
+    "warm-tab-delta-replay":"deep-dive/04-terminal-catchup.md",
+    "fix-mobile-scroll":"deep-dive/04-terminal-catchup.md",
+    "port-glm-5.2-to-dev":"deep-dive/05-settings-electron-codex.md",
+    "electron-modifier-link-external":"deep-dive/05-settings-electron-codex.md",
+    "new-settings-ui":"deep-dive/05-settings-electron-codex.md",
+    "fix-electron-launch-chooser":"deep-dive/05-settings-electron-codex.md",
+    "codex-interrupt-freeze":"deep-dive/05-settings-electron-codex.md",
+    "tab-status-reliability":"deep-dive/06-tab-status-reliability.md",
+    "plan-opencode-marker-cache":"deep-dive/07-opencode-marker-cache.md"
+  };
+  return map[name] || "#";
+}
+
+function filterTable() {
+  const q = document.getElementById("filterInput").value.toLowerCase();
+  const vf = document.getElementById("verdictFilter").value;
+  let rows = data.filter(r => {
+    const text = r.join(" ").toLowerCase();
+    if (q && text.indexOf(q) === -1) return false;
+    if (vf) {
+      if (vf === "Ready" && r[4] !== "Ready for Landing") return false;
+      if (vf === "Finish" && r[4] !== "Finish Work") return false;
+      if (vf === "Main" && r[4] !== "Already in Main") return false;
+      if (vf === "Skipped" && r[4] !== "Skipped") return false;
+    }
+    return true;
+  });
+  renderTable(rows);
+}
+
+function sortTable(col) {
+  if (sortColumn === col) sortAsc = !sortAsc;
+  else { sortColumn = col; sortAsc = col !== 3; } // default date desc
+  const sorted = [...data].sort((a,b) => {
+    let va = a[col], vb = b[col];
+    if (col === 0) { va = parseInt(va); vb = parseInt(vb); }
+    if (col === 3) { va = formatDate(va); vb = formatDate(vb); }
+    if (typeof va === "string") {
+      va = va.toLowerCase(); vb = vb.toLowerCase();
+    }
+    if (va < vb) return sortAsc ? -1 : 1;
+    if (va > vb) return sortAsc ? 1 : -1;
+    return 0;
+  });
+  renderTable(sorted);
+  document.querySelectorAll("th").forEach((th,i) => {
+    th.classList.toggle("sorted", i === col);
+  });
+}
+
+// Initial render: sort by date descending
+sortTable(3);
+</script>
+</body>
+</html>

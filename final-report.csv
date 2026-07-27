@@ -1,0 +1,33 @@
+num,worktree,branch,date,verdict,category,analysis
+1,rollback-opencode-sidecars,rollback/opencode-sidecars,2026-06-21,Ready for landing,ready-landing,"Single-sidecar routing refactor; 7 ahead 0 behind; reverts cwd sidecars; 205/205 tests pass; typecheck clean"
+2,repro-freshopencode-playwright,debug/freshopencode-playwright-repro-dev,2026-06-19,Already in main,in-main,"PR #454 merged with identical tree; git diff produces zero output"
+3,plan-fresh-agent-transcript-contract,plan/fresh-agent-transcript-contract,2026-06-19,Skipped (plan-only),skipped-plan,685-line design doc for transcript contract; no code changes
+4,debug-freshcodex-cwd,debug-freshcodex-cwd,2026-06-19,Already in main,in-main,"PR #450 squash-merged as 45efc524; identical tree hash 4ebcc3ac"
+5,fix-mobile-longpress-menu,fix-mobile-longpress-menu,2026-06-19,Already in main,in-main,"PR #451 (9383c2fb); byte-identical diff; git diff zero output"
+6,port-glm-5.2-to-dev,port/glm-5.2-to-dev,2026-06-18,Already in main,in-main,"PR #447 (6dcb9784); same model entry opencode-go/glm-5.2"
+7,investigate-bouncer,investigate-bouncer,2026-06-18,Already in main,in-main,Plan doc for freshopencode bouncer status fix; already on main
+8,fresh-agent-thinking-muted-color,fix/fresh-agent-thinking-muted-color,2026-06-18,Ready for landing,ready-landing,"Muted thinking text in serif style; CSS custom property overrides + e2e test; no merge conflicts"
+9,opencode-think-normalization,fix/opencode-think-normalization,2026-06-17,Ready for landing,ready-landing,"Preserves think tag content as thinking items; NormalizedTextSegment type; 18 tests pass"
+10,opencode-refresh-restore-white-page,fix/opencode-refresh-restore-white-page,2026-06-17,Ready for landing,ready-landing,"Fixes white page on hidden OpenCode tab restore; 126 tests pass; bug still present on main"
+11,find-bug,find-bug,2026-06-17,Skipped (trivial),skipped-trivial,2-line test reorder making shared-state websocket suites sequential
+12,electron-modifier-link-external,electron-modifier-link-external,2026-06-17,Already in main,in-main,"PR #444 (1898a0c4); all 8 commits reachable from origin/main"
+13,fix-freshagent-user-message-quotes,fix-freshagent-user-message-quotes,2026-06-15,Already in main,in-main,"Code present verbatim on main; stripOpencodeRunArgumentQuoting() at normalize.ts:95"
+14,opencode-playback-dev-pr,test/opencode-playback-coalescing-dev,2026-06-15,Already in main,in-main,"Main commit c50dd6f8; squashed version of same fix"
+15,opencode-playback-coalescing,test/opencode-playback-coalescing,2026-06-15,Already in main,in-main,"Main commit c50dd6f8; source branch with granular commits"
+16,durable-ws-reconnect,plan/durable-ws-reconnect,2026-06-15,Skipped (plan-only),skipped-plan,WS recovery + legacy codingcli removal plan docs (2200 lines)
+17,freshagent-user-jump-plan,freshagent-user-jump-plan,2026-06-14,Skipped (plan-only),skipped-plan,1908-line plan for user message jump navigation; no code
+18,freshagent-tool-attribution,freshagent-tool-attribution,2026-06-13,Finish work,finish-work,"Skill payload filtering + tool-result attribution; needs rebase onto PR #452 transcript contract"
+19,freshagent-serif-full-style,freshagent-transcript-no-auto-collapse,2026-06-13,Already in main,in-main,"PR #452 fixed auto-collapse regression through different implementation; key behaviors on main"
+20,new-settings-ui,new-settings-ui,2026-06-12,Finish work,finish-work,"Tab-based settings refactor; 3416 insertions; 185 commits behind; needs rebase onto origin/main"
+21,fix-electron-launch-chooser,fix/electron-launch-chooser-flow,2026-06-10,Already in main,in-main,"PR #377+#379; all 24 commits on main; blob hashes match"
+22,codex-interrupt-freeze,codex-interrupt-freeze,2026-06-10,Already in main,in-main,"PR #400 (9f54a96a); same code on origin/main"
+23,proof-terminal-catchup-architecture,proof-terminal-catchup-architecture,2026-06-08,Already in main,in-main,"Same research dossier (14 files +2920); zero diff in shared files vs main 6f74e6f7"
+24,fix-terminal-catchup,fix-terminal-catchup,2026-06-07,Already in main,in-main,"PR #396 (463eff2f); write-queue replay coalescing; identical +225/-14"
+25,fix-replay-server-batching,fix-replay-server-batching,2026-06-07,Already in main,in-main,"PR #397 (6faf470e); server-side batch coalescing; identical +103/-23"
+26,tab-status-reliability,fix/tab-status-reliability,2026-06-04,Already in main,in-main,"Squash-merged as 6e81e505; 66 files +3201/-232 match; 22 commits accounted for"
+27,plan-opencode-marker-cache,perf/opencode-marker-cache,2026-06-04,Already in main,in-main,"PR #391 (a24f22bd); zero diff tree; all files on main with identical line counts"
+28,warm-tab-delta-replay,fix/warm-tab-delta-replay,2026-06-03,Already in main,in-main,"PR #386 (dd12912b); warm replay + backpressure fix; identical +918/-80"
+29,disable-superpowers-plugin,chore/disable-superpowers-plugin,2026-06-03,Skipped (trivial),skipped-trivial,1-line config change in .claude/settings.json (1 insertion 3 deletions)
+30,fix-mobile-scroll,fix/mobile-opencode-touch-scroll,2026-06-02,Already in main,in-main,"PR #383 (2c8978e8); touch-scroll in alt buffer; identical +297/-12"
+31,docs-ci-merge-gate,docs/ci-merge-gate-note,2026-05-30,Skipped (trivial),skipped-trivial,21-line docs update at docs/development/windows-electron-build.md
+32,agent-chat-spec-plan,codex/agent-chat-spec-plan,2026-05-29,Skipped (plan-only),skipped-plan,823-line design doc for agent chat spec split; no code changes
