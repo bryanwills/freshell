@@ -46,6 +46,13 @@ This is the incident-class the strip defends against: **stale persisted live-han
 2. **Canonical gating.** The fold refuses any claude id that fails `isValidClaudeSessionId` (canonical UUID), so a placeholder can never masquerade as durable identity. Rehydration additionally re-checks via `migrateLegacyFreshAgentDurableState({ rejectNonCanonicalClaudeSessionRef: true })` (`persistedState.ts:293-302`).
 3. **The §4.2 authority chain makes a persisted client identity a PROPOSAL, not truth** — this is what makes it safe NOW when it wasn't in April. The chain (campaign plan `docs/plans/2026-07-24-restart-resilience-architecture-analysis.md` §4.2): *in-memory registry (live process truth) → ledger `bound` rows (durable server truth) → client claim (proposal only) → tabs-snapshot (rescue mirror)*. On disagreement "the ledger wins for identity; the client's claim is recorded and answered with a `corrected` verdict… user-visible, never a silent switch." With verdicts live since wave C (`foldFreshAgentVerdict`, `src/lib/pane-reconcile.ts:262-357`), a stale client claim gets `corrected:true` or a loud `dead_session` breadcrumb — never silently honored. Task 5's stale-sessionRef e2e test pins exactly this.
 
+**Validated scope notes (2026-07-27 load-bearing review — evidence in the review ledger; server cites verified against this worktree):**
+
+- The `dead_session` guarantee was verified in server code: an Absent-but-ever-observed claim yields `dead_session{session_not_on_disk}` echoing the claimed ref (`crates/freshell-ws/src/reconcile_freshagent.rs:120-129, 259-265`); `ever_observed` is durable across restart via the ledger; no reconcile arm can bind a *different* session id to a claim (wrong-session attach is structurally impossible). The reconcile snapshot consumes ONLY `pane.session_ref` for fresh-agent panes (`reconcile_freshagent.rs:73-79`) — exactly the field we persist.
+- **The guarantee's precondition is the durable binding recorded at `session.init`** — and `claude.rs:1156-1159` skips that binding when the create carried all-default settings (the no-laundering guard, `identity_sink.rs:10-17`). This hole is unreachable from the shipped client: the sole create constructor `buildCreateMessage` (`FreshAgentView.tsx:951-972`) sends `effort:` unconditionally (`:969`, registry fallback `'high'`, `shared/fresh-agent-models.ts:131-152`), so every real freshclaude/kilroy create is non-default and always binds. **Watch note:** this invariant is un-pinned — do NOT refactor `buildCreateMessage` toward "send only user-chosen fields" without adding a pin, or the silent-`fresh` hole reopens.
+- **Bound on "never":** ledger retention (~30/90d GC horizon) means an *ancient* stale ref can age out of `ever_observed` and adjudicate `fresh` (silent) instead of `dead_session` — but never a wrong-session attach (the actual incident class), and claude transcript retention (`cleanupPeriodDays` ~30d) makes such refs unresumable anyway. Accepted residual.
+- **Real claude resume semantics (verified externally):** default `--resume`/SDK resume REUSES the original session UUID and appends to the same transcript — it does NOT mint a new id per resume; a new id requires explicit `--fork-session`, which our sidecar does not pass (`crates/freshell-claude-sidecar/index.mjs:209`). So the fixture's stable durable id *matches* production default semantics, and a single overwritable `sessionRef` is the correct data model in both id-worlds (newest-wins remains as robustness for ledger supersession / future fork use). **Watch note (future hardening, out of scope):** a cwd-mismatched resume can silently create a fresh session under a new valid UUID which the newest-wins fold would adopt — upstream CLI/SDK behavior, not introduced by this change.
+
 ---
 
 ## Design overview and file structure
@@ -57,9 +64,10 @@ This is the incident-class the strip defends against: **stale persisted live-han
 | File | Change |
 |---|---|
 | `src/store/panesSlice.ts` | NEW reducer `adoptFreshAgentDurableIdentity` — layout-walk (mirroring `materializeFreshAgentSession`, `panesSlice.ts:1454-1481`) matching fresh-agent leaves by live locator (placeholder `sessionId` + `sessionType` + `provider`); writes `sessionRef: { provider, sessionId: cliSessionId }` + `resumeSessionId: cliSessionId`; canonical-gated for claude; no-op when already adopted. **Leaves `content.sessionId` (live handle) untouched** — re-keying it would break the wire protocol (attach messages and incoming events are keyed on the placeholder). |
-| `src/lib/fresh-agent-ws.ts` | Dispatch the new action from the `freshAgent.session.init` (`:217-225`) and `freshAgent.session.metadata` (`:226-234`) cases when `provider === 'claude'` (covers freshclaude AND kilroy sessionTypes) and `cliSessionId` present; dispatch `flushPersistedLayoutNow()` after the init-case fold (mirrors the materialized case at `:171`). |
+| `src/lib/fresh-agent-ws.ts` | Dispatch the new action from the `freshAgent.session.init` (`:217-225`) and `freshAgent.session.metadata` (`:226-234`) cases when `provider === 'claude'` (covers freshclaude AND kilroy sessionTypes) and `cliSessionId` present; dispatch `flushPersistedLayoutNow()` after the init-case fold (mirrors the materialized case at `:171`). **Known race (validated 2026-07-27):** the server spawns the sidecar-stdout consumer BEFORE broadcasting `freshAgent.created` (`claude.rs:426-433` vs `:502-509`, multiple awaits between, no ordering gate), and the fake sidecar emits `sdk.session.init` immediately after `created` (`fake-claude-sidecar.mjs:96-98`) — so `session.init` can reach the client BEFORE `created`, when no pane yet carries the placeholder and the fold would silently no-op. Closed by the created-time catch-up (next two rows; Task 3 Step 3b). |
+| `src/store/freshAgentSlice.ts` | Verify (and if needed make) the `sessionInit` reducer an UPSERT: when `session.init` arrives before `created`, the slice must still retain `cliSessionId` for the session so the created-time catch-up can read it. Unit-test pinned (Task 3 Step 3b). |
 | `src/store/persistMiddleware.ts` | **No production change.** `sessionRef` already survives `stripTransientSessionFields` (`:245-268`). |
-| `src/components/fresh-agent/FreshAgentView.tsx` | **No production change.** Post-reload, the mount create-effect guard (`:1200-1207`) already proceeds when `sessionRef` is present, and `buildCreateMessage` (`:951-972`) already derives `resumeSessionId` from `sessionRef` — the create becomes a create-with-resume with no new wire shape. `triggerRecovery` (`:1079-1130`) already prefers the durable id via `getCanonicalPaneResumeSessionId` (`:216-228`), which reads `pane.sessionRef` first — so respawn/recovery paths carry the durable id forward once it lives in pane content, instead of minting fresh placeholders. Genuinely-new panes (no learned id yet, or explicit `startNewConversation`) keep today's placeholder behavior. |
+| `src/components/fresh-agent/FreshAgentView.tsx` | **One small production change (created-time catch-up, Task 3 Step 3b):** in the `freshAgent.created` handler that writes the placeholder into pane content (`:1432-1456`), after that write, if the freshAgent slice already holds a canonical claude `cliSessionId` for this session (init won the race), dispatch `adoptFreshAgentDurableIdentity` + `flushPersistedLayoutNow`. Everything else stays unchanged: post-reload, the mount create-effect guard (`:1200-1207`) already proceeds when `sessionRef` is present, and `buildCreateMessage` (`:951-972`) already derives `resumeSessionId` from `sessionRef` — the create becomes a create-with-resume with no new wire shape. `triggerRecovery` (`:1079-1130`) already prefers the durable id via `getCanonicalPaneResumeSessionId` (`:216-228`), which reads `pane.sessionRef` first — so respawn/recovery paths carry the durable id forward once it lives in pane content, instead of minting fresh placeholders. Genuinely-new panes (no learned id yet, or explicit `startNewConversation`) keep today's placeholder behavior. |
 | `src/store/paneTypes.ts` | **No change.** `sessionRef?: SessionLocator` already exists on `FreshAgentPaneContent` (`paneTypes.ts:174-209`). (Keeps Lane D1's possible paneTypes edits conflict-free.) |
 | `test/unit/client/store/panesSlice.test.ts` | New reducer tests (Task 2). |
 | `test/unit/client/fresh-agent-ws.test.ts` + `test/unit/client/lib/fresh-agent-ws.test.ts` | New transport-dispatch tests — the two existing copies of this suite; add the case to BOTH (Task 3). |
@@ -131,6 +139,14 @@ npm run test:e2e -- --project=rust-chromium specs/restore-contract-wall-rust.spe
 ```
 
 Expected: 1 **expected-failure** (Playwright reports the `test.fail()`-annotated test as passing-the-suite because it failed as expected). Save the output — this is the red half of the red→green proof for the wall leg. (First e2e invocation also builds client+server via global-setup; allow ~10 min.)
+
+- [ ] **Step 6: Baseline the FULL wall (Task 6's attribution baseline)**
+
+```bash
+npm run test:e2e -- --project=rust-chromium specs/restore-contract-wall-rust.spec.ts
+```
+
+Expected: all legs green, remaining pins failing-as-expected. Save the full output alongside the Step 3 pin inventory — **Task 6 Step 4's decision protocol compares against exactly this baseline** (3 sibling lanes are churning wall-adjacent territory; without a fresh baseline, a pre-existing red would be mis-attributed to our change, or a foreign flip mis-flipped). If any leg is ALREADY red/flipped in ways the pin inventory doesn't explain, record it and proceed — Task 6 treats those as pre-existing, not ours. (Allow 10–30 min.)
 
 No commit for this task.
 
@@ -205,7 +221,11 @@ describe('adoptFreshAgentDurableIdentity', () => {
     expect((next.layouts['tab-1'] as any).content.sessionRef).toBeUndefined()
   })
 
-  it('updates an existing sessionRef to the newest learned durable id (resume mints a new UUID)', () => {
+  // Robustness pin, not the default path: real claude default resume REUSES the
+  // same UUID (verified 2026-07-27 — new ids only via --fork-session, which our
+  // sidecar does not pass). A newer id can still be learned via ledger
+  // supersession (corrected verdicts) or future fork use; newest-wins covers it.
+  it('updates an existing sessionRef to the newest learned durable id (supersession/fork robustness)', () => {
     const NEWER = '66666666-6666-4666-8666-666666666666'
     const withOld = freshclaudeLeaf({ sessionRef: { provider: 'claude', sessionId: DURABLE }, resumeSessionId: DURABLE })
     const next = panesReducer(stateWith(withOld), adopt({ cliSessionId: NEWER }))
@@ -316,7 +336,9 @@ git commit -m "feat(client): adopt freshclaude durable cliSessionId into pane se
 
 **Files:**
 - Modify: `src/lib/fresh-agent-ws.ts` (`freshAgent.session.init` case `:217-225`; `freshAgent.session.metadata` case `:226-234`)
-- Test: `test/unit/client/fresh-agent-ws.test.ts` AND `test/unit/client/lib/fresh-agent-ws.test.ts` (two copies of this suite exist — add the cases to BOTH)
+- Modify: `src/components/fresh-agent/FreshAgentView.tsx` (created-time catch-up in the `freshAgent.created` handler, `:1432-1456` — Step 3b)
+- Modify (verify-first): `src/store/freshAgentSlice.ts` (`sessionInit` reducer upsert — Step 3b)
+- Test: `test/unit/client/fresh-agent-ws.test.ts` AND `test/unit/client/lib/fresh-agent-ws.test.ts` (two copies of this suite exist — add the cases to BOTH); the freshAgentSlice unit test file (find it: `grep -rln "sessionInit" test/unit/client/ --include='*freshAgent*'`; create one if absent)
 
 **Interfaces:**
 - Consumes: `adoptFreshAgentDurableIdentity` from Task 2 (payload `{ sessionId, sessionType, provider, cliSessionId }`); `flushPersistedLayoutNow` from `src/store/persistControl.ts` (already imported in this file for the materialized case, `:171`); the locator built at `fresh-agent-ws.ts:197-201` (`{ sessionId: msg.sessionId, sessionType, provider }` — the placeholder-keyed live locator).
@@ -392,6 +414,15 @@ if (locator.provider === 'claude' && typeof event.cliSessionId === 'string' && e
 ```
 
 (No explicit flush in the metadata case: the reducer is a no-op → same state reference → no dirty-mark when nothing changed; real changes ride the 500ms debounce + unload flush. `locator` here is the `{ sessionId: msg.sessionId, sessionType, provider }` object built at `:197-201`.)
+
+- [ ] **Step 3b: Created-time catch-up for the init-before-created race (validated 2026-07-27)**
+
+The server does NOT guarantee `freshAgent.created` reaches the client before `freshAgent.session.init`: the sidecar-stdout consumer is spawned (`claude.rs:426-433`) before the `created` broadcast (`:502-509`) with multiple awaits between and no ordering gate, and the fake sidecar emits `created` + `sdk.session.init` back-to-back (`fake-claude-sidecar.mjs:96-98`) — so in the plan's own e2e fixture, `session.init` can arrive FIRST, when no pane carries the placeholder and Step 3's fold silently no-ops. At init time there is no client-side breadcrumb mapping placeholder→pane (the init event carries no requestId; `pendingCreates` back-fill races identically), so the catch-up must run when `created` finally arrives:
+
+1. **freshAgentSlice upsert (verify-first):** read the `sessionInit` reducer (the one writing `cliSessionId` at `freshAgentSlice.ts:256`). If it drops the event when no session record exists yet, make it upsert a minimal record retaining `cliSessionId` (in-fence; `freshAgentSlice.ts` is in the scope fence). Add a unit test either way: *"sessionInit retains cliSessionId when it arrives before the session record exists (init-before-created)"* — arrange an empty slice, dispatch `sessionInit` with a canonical claude `cliSessionId`, assert the id is readable afterward.
+2. **FreshAgentView catch-up:** in the `freshAgent.created` handler that writes the placeholder into pane content (`FreshAgentView.tsx:1432-1456`, matched on `message.requestId === paneContentRef.current.createRequestId`), AFTER that write, read the freshAgent slice record for this session (same selector/key derivation the view already uses for its session state); if it already holds a `cliSessionId` that passes `isValidClaudeSessionId` and `provider === 'claude'`, dispatch `adoptFreshAgentDurableIdentity({ sessionId: message.sessionId, sessionType, provider, cliSessionId })` followed by `flushPersistedLayoutNow()`. This is idempotent with Step 3 (the reducer's already-adopted no-op arm makes double-dispatch harmless in the normal order).
+
+End-to-end coverage: Task 5 test 1's FOLD poll exercises exactly this race under the tightest-timing fixture (plus the `--repeat-each=2` flake check).
 
 - [ ] **Step 4: Run to verify GREEN**
 
@@ -628,6 +659,9 @@ Implementation notes for the copier:
 - Match `bootWall`'s option plumbing to how the wall's leg G builds its env/`setupHome` (read leg G's body, `:1168` onward, for the exact fixture wiring — including any transcript/home seeding it performs so history/reconcile see disk truth; `restartAbrupt()` re-runs `setupHome` on every boot, so seeding must be idempotent, wall `:130-153`).
 - If `deleteFilesNamed` finds nothing, the fixture stores transcripts under a different name — `find <homeDir> -name '*.jsonl'` (in a debug run) to locate the artifact naming the durable UUID and adjust the basename; the assertion `deleted.length > 0` keeps this honest.
 - If the dead-session UI evolves field names, the authoritative sources are `foldFreshAgentVerdict` (`src/lib/pane-reconcile.ts:310-325`: pushes `DeadSessionEntry` + `setPaneRestoreError(buildRestoreError('durable_artifact_missing'))`) and `DeadSessionEntry` (`paneTypes.ts:286-295`).
+- **cwd is REQUIRED on `createFreshclaudePane`** (the donor passes it — keep it). Background: the server records the durable identity binding only for non-default create settings (`claude.rs:1156-1159` no-laundering guard); the client always sends `effort` so binding occurs regardless, but the explicit cwd keeps the test aligned with the donor and with real usage.
+- **History must be asserted via RENDERED pane content** (the `toContainText` polls), never via the create-response `session.snapshot` event — the fixture's resume snapshot is empty by design; rehydration flows through the server snapshot adapter reading the transcript (`snapshot.rs:134` → `locate_transcript`).
+- **Zero-creates contingency (test 2, validated 2026-07-27):** `creates == []` holds via the ws-client sender-level create hold (`ws-client.ts:263-284, 687-698`) + fold retraction, bounded by a ~4s verdict window (`ws-client.ts:79`); a cold session index can also transiently yield a `respawn` (same ref) instead of `dead_session` on the first reconcile. If the zero-creates assertion proves flaky for exactly these reasons (verdict later than the hold window / transient respawn), the PRE-DECLARED fallback assertion is: every `freshAgent.create` sent MUST carry the stale durable ref (`resumeSessionId ?? sessionRef.sessionId === DURABLE_CLI_SESSION_ID`) — never a bare fresh create — and the `dead_session` adjudication poll stays as-is. Do NOT weaken further; if the verdict is `fresh`, that is the silent-data-loss hazard — STOP and investigate.
 
 - [ ] **Step 2: Register the spec**
 
@@ -684,6 +718,8 @@ const leafDurableIdentity = (leaf: any): string =>
 (Read the current body first and preserve its exact fallback arms — only hoist `sessionRef?.sessionId` to the front.)
 
 - [ ] **Step 2: Flip the pin**
+
+(Order matters: the flip is only valid AFTER Step 1's reader reorder — the pin's 2026-07-26 "server must expose the durable id as the primary handle" theory presumed today's sessionId-first reader; with sessionRef-first + persisted identity, the closure is client-side. Validated 2026-07-27.)
 
 In the `freshclaude: SIGKILL restore rebinds with history rehydrated and status not wedged` test (`:1144`):
 1. **Delete** the entire `test.fail(...)` call (`:1165-1168`, the one whose reason begins `EXPECTED-FAIL WALL PIN (narrowed 2026-07-26 by reconcile-completion)`).
@@ -814,3 +850,12 @@ Report, in this order:
 **2. Placeholder scan.** Two deliberate copy-by-reference instructions remain (spec-local e2e helpers "copy verbatim from restore-contract-wall-rust.spec.ts:<line>" and the split-arm recursion "copy the exact shape from panesSlice.ts:1454-1481"): these point at exact existing code by file:line per the suite's own per-spec-ownership convention — the engineer copies mechanically rather than inventing. No TBD/TODO/"handle edge cases" items.
 
 **3. Type consistency.** `adoptFreshAgentDurableIdentity` payload `{ sessionId: string; sessionType: FreshAgentSessionType; provider: FreshAgentRuntimeProvider; cliSessionId: string }` is identical in Task 2 (reducer + tests), Task 3 (dispatch `{ ...locator, cliSessionId }` where locator = `{ sessionId, sessionType, provider }`, and ws tests). `sessionRef` shape `{ provider, sessionId }` matches `SessionLocator` usage in `applyFreshAgentReconcileAttach` (`panesSlice.ts:1997-2024`) and `materializeFreshAgentPaneSession`. e2e reader `durableIdentity` matches the parity spec's proven expression. Consistent throughout.
+
+## Self-Review addendum (2026-07-27 load-bearing validation pass)
+
+The plan was hardened after an 11-assumption validation review (ledger: `.worktrees/.the-usual-logs/freshclaude-identity-persistence/load-bearing-ledger.md` — 9 verified, 2 falsified-and-fixed, 3 accepted residuals). Re-review of the edited tasks:
+
+- **Spec coverage.** Both falsified assumptions are now handled in-plan: the init-before-created race (Task 3 Step 3b: freshAgentSlice upsert + created-time catch-up, all in-fence) and the resume-id-semantics correction (Task 2 test-4 comment + Archaeology scope notes). Task 1 Step 6 gives Task 6's decision protocol a real attribution baseline. ✔
+- **1b. No silent deferrals.** Step 3b's slice upsert has a unit test; the FreshAgentView catch-up's observable outcome is Task 5 test 1's FOLD poll under the tightest-timing fixture (init emitted back-to-back with created) plus the `--repeat-each=2` flake check — the race path is exercised end-to-end, not stubbed. The zero-creates contingency in Task 5 is a PRE-DECLARED fallback assertion (still loud, still stale-ref-carrying), not a weakening escape hatch: `fresh` verdicts remain a STOP. ✔
+- **Placeholder scan.** Step 3b's "same selector/key derivation the view already uses" is a verify-first pointer at existing code (same convention as the plan's other copy-by-reference instructions), with the reducer's no-op arm making double-dispatch safe regardless. No TBDs added. ✔
+- **Type consistency.** The catch-up dispatches the SAME payload shape `{ sessionId, sessionType, provider, cliSessionId }` — no payload or reducer change was needed for the race fix; Task 2's reducer and tests are untouched by the addendum. ✔
