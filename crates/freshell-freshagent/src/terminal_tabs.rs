@@ -51,7 +51,8 @@ use freshell_platform::{
 use freshell_protocol::{ServerMessage, SessionLocator, UiCommand};
 
 use crate::{
-    authorized, fail_json, ok_json, text_plain, FreshAgentState, TabRecord, TerminalPaneEntry,
+    authorized, fail_json, fail_json_code, ok_json, text_plain, FreshAgentState, TabRecord,
+    TerminalPaneEntry,
 };
 
 /// The exact legacy rejection text for a raw (non-`sessionRef`) `resumeSessionId`
@@ -635,6 +636,45 @@ pub(crate) async fn spawn_terminal_pane(
     }
 
     let (mut resume_session_id, accepted_session_ref) = derive_resume_identity(body, &mode)?;
+
+    // D7 live-session guard, REST rung -- mirrors the WS terminal.create guard
+    // (freshell-ws/src/terminal.rs D7 block) via the shared
+    // TerminalRegistry::live_session_owner predicate: a resume derived from a
+    // wire `sessionRef` whose (provider, sessionId) is already owned by a
+    // RUNNING terminal is refused. Never spawn a second `<cli> --resume <sid>`
+    // while the original live PTY owns <sid> (one-JSONL-writer doctrine).
+    // Placement: before any side effect (no PTY, no MCP write, no port alloc,
+    // no codex plan), so refusal needs zero rollback. This is the single choke
+    // point for POST /api/tabs, /api/panes/:id/split, and /api/panes/:id/respawn
+    // (every spawn_terminal_pane caller). Scoped to the sessionRef rung exactly
+    // like WS (`accepted_session_ref` already implies provider == mode); the
+    // legacy bare-resumeSessionId rung keeps its existing behavior. No
+    // self-exemption for respawn: the old terminal is deliberately never
+    // killed ("detach, don't kill"), so resuming its live session in a second
+    // PTY would be exactly the two-writers corruption this guard forbids.
+    if let Some(live_sid) = accepted_session_ref
+        .as_ref()
+        .map(|r| r.session_id.as_str())
+        .filter(|sid| !sid.is_empty() && resume_session_id.as_deref() == Some(*sid))
+    {
+        if registry
+            .live_session_owner(state.session_identity.as_deref(), &mode, live_sid)
+            .is_some()
+        {
+            tracing::warn!(
+                target: "freshell_freshagent::terminal_tabs",
+                mode = %mode,
+                session_id = %live_sid,
+                pane_id = %pane_id,
+                "spawn_refused: a Running terminal already owns this session (D7 live-guard, REST rung)"
+            );
+            return Err(fail_json_code(
+                StatusCode::CONFLICT,
+                "RESTORE_UNAVAILABLE",
+                format!("Session {live_sid} is still running on the server."),
+            ));
+        }
+    }
 
     let terminal_id = Uuid::new_v4().to_string();
     let stream_id = Uuid::new_v4().to_string();
@@ -2666,6 +2706,154 @@ mod tests {
 
         state.terminal_registry.clone().unwrap().kill(&terminal_id);
         let _ = std::fs::remove_file(&argv_file);
+    }
+
+    // ── D7 live-session guard, REST rung (ks38) ──────────────────────────────
+
+    #[derive(Debug)]
+    struct StubSessionIdentity {
+        provider: &'static str,
+        session_id: &'static str,
+        terminal_id: &'static str,
+    }
+
+    impl freshell_terminal::registry::SessionIdentityLookup for StubSessionIdentity {
+        fn terminal_for_session(&self, provider: &str, session_id: &str) -> Option<String> {
+            (provider == self.provider && session_id == self.session_id)
+                .then(|| self.terminal_id.to_string())
+        }
+    }
+
+    const LIVE_SESSION: &str = "22222222-3333-4444-8555-666666666666";
+
+    /// Forge what a REST-spawned live resume leaves behind: a Running registry
+    /// row carrying (mode, resume_session_id). Headless: no real PTY.
+    fn forge_live_owner(registry: &freshell_terminal::TerminalRegistry, terminal_id: &str) {
+        registry.register_headless(freshell_terminal::registry::HeadlessTerminal {
+            terminal_id: terminal_id.to_string(),
+            stream_id: format!("s-{terminal_id}"),
+            mode: "claude".to_string(),
+            resume_session_id: Some(LIVE_SESSION.to_string()),
+            create_request_id: None,
+            created_at: None,
+        });
+    }
+
+    #[tokio::test]
+    async fn rest_create_resume_onto_live_session_is_refused_409_restore_unavailable() {
+        let argv_file = unique_argv_file("d7-rest-live-refusal");
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec("claude", &argv_file)]));
+        let registry = state.terminal_registry.clone().unwrap();
+        forge_live_owner(&registry, "t-live-owner");
+        let rows_before = registry.identity_probe_rows().len();
+
+        let (status, body) = post(
+            app(state),
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": { "provider": "claude", "sessionId": LIVE_SESSION },
+            }),
+            true,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["status"], json!("error"), "{body}");
+        assert_eq!(
+            body["code"],
+            json!("RESTORE_UNAVAILABLE"),
+            "exact wire code: {body}"
+        );
+        let msg = body["message"].as_str().expect("message");
+        assert!(
+            msg.contains(LIVE_SESSION),
+            "message must name the live session: {msg}"
+        );
+        // No duplicate spawn: only the forged owner exists.
+        assert_eq!(
+            registry.identity_probe_rows().len(),
+            rows_before,
+            "no new terminal"
+        );
+
+        registry.kill("t-live-owner");
+    }
+
+    #[tokio::test]
+    async fn rest_create_resume_onto_exited_session_still_works() {
+        let argv_file = unique_argv_file("d7-rest-exited-ok");
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec("claude", &argv_file)]));
+        let registry = state.terminal_registry.clone().unwrap();
+        forge_live_owner(&registry, "t-old-owner");
+        assert!(registry.finish_pty_exit("t-old-owner", 0));
+
+        let (status, body) = post(
+            app(state),
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": { "provider": "claude", "sessionId": LIVE_SESSION },
+            }),
+            true,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let new_tid = body["data"]["terminalId"]
+            .as_str()
+            .expect("terminalId")
+            .to_string();
+        assert!(
+            registry.is_running(&new_tid),
+            "resume onto an exited session spawns"
+        );
+
+        registry.kill(&new_tid);
+    }
+
+    #[tokio::test]
+    async fn rest_create_resume_refused_when_identity_registry_owns_live_session() {
+        // Locator-adopted shape (d9b71f50): Running row with NO resume id; the
+        // binding lives only in the injected identity store.
+        let argv_file = unique_argv_file("d7-rest-identity-refusal");
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec("claude", &argv_file)]))
+            .with_session_identity(Arc::new(StubSessionIdentity {
+                provider: "claude",
+                session_id: LIVE_SESSION,
+                terminal_id: "t-adopted",
+            }));
+        let registry = state.terminal_registry.clone().unwrap();
+        registry.register_headless(freshell_terminal::registry::HeadlessTerminal {
+            terminal_id: "t-adopted".to_string(),
+            stream_id: "s-t-adopted".to_string(),
+            mode: "claude".to_string(),
+            resume_session_id: None,
+            create_request_id: None,
+            created_at: None,
+        });
+
+        let (status, body) = post(
+            app(state),
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": { "provider": "claude", "sessionId": LIVE_SESSION },
+            }),
+            true,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], json!("RESTORE_UNAVAILABLE"), "{body}");
+
+        registry.kill("t-adopted");
     }
 
     #[tokio::test]

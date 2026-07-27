@@ -116,6 +116,13 @@ pub struct FreshAgentState {
     /// unchanged (terminal-mode routes 503 instead of touching a registry
     /// that was never given to them).
     pub(crate) terminal_registry: Option<freshell_terminal::TerminalRegistry>,
+    /// Read-only session-identity lookup (in production: the WS-side
+    /// TerminalIdentityRegistry behind the freshell-terminal
+    /// SessionIdentityLookup seam, wired by freshell-server). Powers the
+    /// identity arm of the REST D7 live-session guard. `None` (unwired)
+    /// narrows the guard to the registry-row arm.
+    pub(crate) session_identity:
+        Option<Arc<dyn freshell_terminal::registry::SessionIdentityLookup>>,
     /// paneId -> terminal pane record (Slice 1 `mode:'shell'` terminals
     /// created via `POST /api/tabs`). Disjoint from `panes` (fresh-agent-only)
     /// and `content_panes` (browser/editor) -- a pane id appears in exactly
@@ -238,6 +245,7 @@ impl FreshAgentState {
             opencode: Arc::new(tokio::sync::Mutex::new(None)),
             sessions_revision: Arc::new(AtomicI64::new(0)),
             terminal_registry: None,
+            session_identity: None,
             terminal_panes: Arc::new(Mutex::new(HashMap::new())),
             content_panes: Arc::new(Mutex::new(HashMap::new())),
             tabs: Arc::new(Mutex::new(HashMap::new())),
@@ -385,6 +393,20 @@ impl FreshAgentState {
     /// builder pattern.
     pub fn with_terminal_registry(mut self, registry: freshell_terminal::TerminalRegistry) -> Self {
         self.terminal_registry = Some(registry);
+        self
+    }
+
+    /// D7 live-session guard (REST rung): wire in the read-only
+    /// session-identity lookup (in production the WS-side
+    /// `TerminalIdentityRegistry`, injected by `freshell-server`'s `main.rs`)
+    /// so `spawn_terminal_pane` can probe the identity arm of
+    /// [`freshell_terminal::TerminalRegistry::live_session_owner`]. Unwired
+    /// (`None`), the guard degrades to the registry-row arm only.
+    pub fn with_session_identity(
+        mut self,
+        identity: Arc<dyn freshell_terminal::registry::SessionIdentityLookup>,
+    ) -> Self {
+        self.session_identity = Some(identity);
         self
     }
 
@@ -1253,6 +1275,17 @@ fn fail_json(status: StatusCode, message: String) -> Response {
     (
         status,
         Json(json!({ "status": "error", "message": message })),
+    )
+        .into_response()
+}
+
+/// `fail_json` + a machine-readable code, matching how the WS side keys
+/// errors (`error["code"] == "RESTORE_UNAVAILABLE"`). Envelope is additive:
+/// `{status:"error", code, message}`.
+pub(crate) fn fail_json_code(status: StatusCode, code: &str, message: String) -> Response {
+    (
+        status,
+        Json(json!({ "status": "error", "code": code, "message": message })),
     )
         .into_response()
 }
