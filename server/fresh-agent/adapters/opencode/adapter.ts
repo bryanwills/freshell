@@ -17,6 +17,11 @@ import {
   recordFreshAgentObservabilityEvent,
 } from '../../observability.js'
 import {
+  type FreshAgentRecoveryStore,
+  getFreshAgentRecoveryStore,
+} from '../../recovery-store.js'
+import { detectInterruptedTurn } from './interrupted-turn.js'
+import {
   type OpencodeExport,
   normalizeOpencodeSnapshot,
   normalizeOpencodeTurnBody,
@@ -33,6 +38,12 @@ import { serveEventToSdk, splitOpencodeModel } from './serve-events.js'
 const OPENCODE_REAL_SESSION_ID = /^ses_/
 const OPENCODE_PLACEHOLDER_SESSION_ID = /^freshopencode-/
 const DEFAULT_TURN_TIMEOUT_MS = 600_000
+
+/** Freshell-OWNED continuation instruction for a recovered interrupted turn. Never echoes
+ * user text; safe to hardcode. It appears in the transcript as a user-role message — that
+ * IS the visible transcript marker for the recovery. */
+const FRESHELL_CONTINUATION_PROMPT =
+  'Freshell detected that your previous response was interrupted (for example by a restart). Please continue exactly where you left off. If the work was already complete, briefly confirm the final result.'
 
 /** Module-scope monotonic counter for OpencodeSessionState identity. Holds no
  * per-instance state; every newly constructed state gets the next value. */
@@ -77,6 +88,12 @@ type OpencodeSessionState = {
    * licenses the client's snapshot busy-clear gate (kata zrrj, Task 4's server half).
    */
   initialReconcileCompleted?: boolean
+  /**
+   * The in-flight interrupted-turn recovery pass kicked off by resume/attach (kata zrrj).
+   * Fire-and-forget for callers (restore must never fail because recovery failed); kept
+   * on the state for test determinism. Never rejects — failures are logged internally.
+   */
+  pendingRecovery?: Promise<void>
 }
 
 type CreateOpencodeFreshAgentAdapterOptions = {
@@ -88,6 +105,9 @@ type CreateOpencodeFreshAgentAdapterOptions = {
   turnTimeoutMs?: number
   validateCwd?: (cwd: string) => Promise<void>
   canonicalizePath?: (cwd: string) => Promise<string>
+  /** Durable interrupt-intent + recovery ledger (kata zrrj). Tests inject a store on a
+   * temp file; production defaults to the process-wide singleton. */
+  recoveryStore?: FreshAgentRecoveryStore
 }
 
 function makePlaceholderId(requestId: string): string {
@@ -110,6 +130,7 @@ async function defaultValidateCwd(cwd: string): Promise<void> {
 
 export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgentAdapterOptions): FreshAgentRuntimeAdapter {
   const serveManager = options.serveManager
+  const recoveryStore = options.recoveryStore ?? getFreshAgentRecoveryStore()
   const turnTimeoutMs = options.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS
   const validateCwd = options.validateCwd ?? defaultValidateCwd
   const canonicalizePath = options.canonicalizePath ?? realpath
@@ -473,7 +494,12 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
     })
   }
 
-  async function materializeOrSend(state: OpencodeSessionState, text: string, settings?: Partial<FreshAgentCreateRequest>): Promise<FreshAgentSendResult> {
+  async function materializeOrSend(
+    state: OpencodeSessionState,
+    text: string,
+    settings?: Partial<FreshAgentCreateRequest>,
+    opts?: { freshellContinuation?: boolean },
+  ): Promise<FreshAgentSendResult> {
     const normalized = settings
       ? normalizeOpencodeInput({ requestId: state.placeholderId, sessionType: 'freshopencode', provider: 'opencode', ...settings } as FreshAgentCreateRequest)
       : undefined
@@ -504,6 +530,12 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
 
       const realId = state.realSessionId!
       await ensureMutableRoute(state)
+      if (!opts?.freshellContinuation) {
+        // A user follow-up cancels any recorded stop intent (kata zrrj). Freshell-owned
+        // continuation sends are internal and must NOT clear it — otherwise a recovery
+        // injection would erase the very intent that gates future recoveries.
+        await recoveryStore.clearInterrupt(realId)
+      }
       // The user send owns this turn: cancel any still-pending restore idle-recovery
       // monitor (it would otherwise resolve on THIS turn's idle and double-emit
       // idle/chime), and flag the send so armIdleRecovery cannot arm a second waiter
@@ -548,6 +580,111 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       emitStatus(state, 'idle')
       throw error
     }
+  }
+
+  /** Send-queue entry shared by the public send() and the recovery continuation: every
+   * send is serialized on the state's queue, route-validated (ensureMutableRoute) and
+   * armed with onceIdle inside materializeOrSend. */
+  async function sendForState(
+    state: OpencodeSessionState,
+    input: { text: string; settings?: Partial<FreshAgentCreateRequest>; freshellContinuation?: boolean },
+  ): Promise<FreshAgentSendResult> {
+    const opts = { freshellContinuation: input.freshellContinuation }
+    const run = state.sendQueue.then(
+      () => materializeOrSend(state, input.text, input.settings, opts),
+      () => materializeOrSend(state, input.text, input.settings, opts),
+    )
+    state.sendQueue = run.catch(() => undefined)
+    return await run
+  }
+
+  type TurnRecoveryAction =
+    | 'continuation_injected'
+    | 'suppressed_user_stop'
+    | 'suppressed_user_followup'
+    | 'suppressed_already_recovered'
+    | 'suppressed_low_confidence'
+    | 'suppressed_no_route'
+
+  /** Restore-time interrupted-turn recovery (kata zrrj): after a resume/attach reconciled
+   * the session as idle, inspect the live transcript and inject at most ONE Freshell-owned
+   * continuation per failed turn. Gates, in order: durable user stop intent, evidence-based
+   * detection, route/mutability precondition, then the persisted once-per-(session, message)
+   * ledger — recorded BEFORE injection so a crash can never double-recover. Never throws. */
+  async function maybeRecoverInterruptedTurn(state: OpencodeSessionState): Promise<void> {
+    const realId = state.realSessionId
+    if (!realId) return
+    const audit = (action: TurnRecoveryAction, reason: string, messageId?: string) =>
+      recordFreshAgentObservabilityEvent({
+        kind: 'fresh_agent_turn_recovery',
+        provider: 'opencode',
+        sessionIdHash: hashForLogs(realId),
+        ...(state.cwd ? { cwdHash: hashForLogs(state.cwd) } : {}),
+        action,
+        reason,
+        ...(messageId ? { messageIdHash: hashForLogs(messageId) } : {}),
+      })
+    try {
+      if (await recoveryStore.hasInterrupt(realId)) {
+        // NEVER auto-recover after an explicit user stop.
+        audit('suppressed_user_stop', 'user_interrupt_on_record')
+        return
+      }
+      const route = cwdRoute(state.cwd)
+      const page = route
+        ? await serveManager.listMessages(realId, { limit: DEFAULT_SNAPSHOT_TURN_LIMIT }, route)
+        : await serveManager.listMessages(realId, { limit: DEFAULT_SNAPSHOT_TURN_LIMIT })
+      const verdict = detectInterruptedTurn(page.messages, { nowMs: Date.now() })
+      if (!verdict.interrupted) {
+        if (verdict.reason === 'last_message_not_assistant') {
+          audit('suppressed_user_followup', verdict.reason)
+        } else if (verdict.reason !== 'empty_transcript') {
+          audit('suppressed_low_confidence', verdict.reason)
+        }
+        return
+      }
+      if (!verdict.messageId) {
+        // An id-less trailing message cannot be tracked in the per-(session, message)
+        // ledger, so an injection could never be made once-only. Err on the safe side.
+        audit('suppressed_low_confidence', 'missing_message_id')
+        return
+      }
+      // Route/mutability precondition BEFORE any ledger write (A6/N-V1a):
+      // ensureMutableRoute throws for a non-provider-created state without a cwd. If we
+      // recorded the recovery first and the send then threw, the (session, message)
+      // ledger entry would be permanently burned — a later cwd-bearing attach could never
+      // recover this turn. So: no usable route -> audit and return WITHOUT recording.
+      const hasUsableRoute = state.providerCreatedInThisAdapter
+        || (typeof state.cwd === 'string' && state.cwd.trim().length > 0)
+      if (!hasUsableRoute) {
+        audit('suppressed_no_route', 'no_cwd_for_mutation', verdict.messageId)
+        return
+      }
+      if (await recoveryStore.hasRecovery(realId, verdict.messageId)) {
+        audit('suppressed_already_recovered', 'ledger_hit', verdict.messageId)
+        return
+      }
+      // Record BEFORE injecting: crash-safe loop prevention. Accepted residual: a
+      // transient send failure after this write burns the one allowed recovery for the
+      // turn — errs on the safe side (never risks double injection).
+      await recoveryStore.recordRecovery(realId, verdict.messageId)
+      audit('continuation_injected', verdict.evidence.join(','), verdict.messageId)
+      state.events.emit('event', {
+        type: 'sdk.session.changed', sessionId: state.placeholderId, reason: 'freshell-turn-recovery',
+      })
+      await sendForState(state, { text: FRESHELL_CONTINUATION_PROMPT, freshellContinuation: true })
+    } catch (error) {
+      log.warn({ provider: 'opencode', sessionIdHash: hashForLogs(realId), err: error }, 'interrupted-turn recovery failed')
+    }
+  }
+
+  /** Fire-and-forget recovery kickoff after reconcileStatus on resume/attach. Only an
+   * idle-reconciled restore is a candidate — a running session is being monitored by
+   * armIdleRecovery; if that monitor later reports loss, the NEXT restore attempt will
+   * find the unfinished transcript and recover it here. */
+  function scheduleInterruptedTurnRecovery(state: OpencodeSessionState): void {
+    if (state.status !== 'idle') return
+    state.pendingRecovery = maybeRecoverInterruptedTurn(state)
   }
 
   async function assembleExport(
@@ -613,6 +750,7 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
         remember(state)
         bindServeStream(state)
         await reconcileStatus(state)
+        scheduleInterruptedTurnRecovery(state)
         return { sessionId: real, sessionRef: { provider: 'opencode', sessionId: real } }
       }
       if (!isRealOpencodeSessionId(sessionId)) {
@@ -625,6 +763,7 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       remember(state)
       bindServeStream(state)
       await reconcileStatus(state)
+      scheduleInterruptedTurnRecovery(state)
       return { sessionId, sessionRef: { provider: 'opencode', sessionId } }
     },
 
@@ -641,6 +780,7 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
         }
         remember(existing)
         await reconcileStatus(existing)
+        scheduleInterruptedTurnRecovery(existing)
         return { sessionId: locator.sessionId, sessionRef: { provider: 'opencode', sessionId: locator.sessionId } }
       }
       if (isPlaceholderOpencodeSessionId(locator.sessionId) || !isRealOpencodeSessionId(locator.sessionId)) {
@@ -660,6 +800,7 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       remember(state)
       bindServeStream(state)
       await reconcileStatus(state)
+      scheduleInterruptedTurnRecovery(state)
       return { sessionId: locator.sessionId, sessionRef: { provider: 'opencode', sessionId: locator.sessionId } }
     },
 
@@ -676,12 +817,7 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
 
     async send(sessionId, input) {
       const state = requireState(sessionId)
-      const run = state.sendQueue.then(
-        () => materializeOrSend(state, input.text, input.settings),
-        () => materializeOrSend(state, input.text, input.settings),
-      )
-      state.sendQueue = run.catch(() => undefined)
-      return await run
+      return await sendForState(state, { text: input.text, settings: input.settings })
     },
 
     async interrupt(sessionId) {
@@ -689,12 +825,20 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       // Mark before aborting so the in-flight send (parked on onceIdle) sees the abort and
       // suppresses its turn-complete chime when the abort-triggered idle resolves it.
       state.turnAborted = true
+      const realId = state.realSessionId
       try {
+        // Record the user's explicit stop intent durably BEFORE the abort lands (kata
+        // zrrj): if the process dies right after the abort, a later restore must already
+        // see the intent and never auto-recover a turn the user deliberately stopped.
+        if (realId) await recoveryStore.recordInterrupt(realId)
         await abortForState(state)
       } catch (error) {
         // The abort never landed, so the turn may still complete normally — clear the flag
-        // so a genuine completion is not silently swallowed.
+        // so a genuine completion is not silently swallowed, and roll back the durable
+        // stop intent (mirroring the turnAborted rollback) so a genuine later
+        // interruption can still be recovered.
         state.turnAborted = false
+        if (realId) await recoveryStore.clearInterrupt(realId).catch(() => undefined)
         throw error
       }
       emitStatus(state, 'idle')

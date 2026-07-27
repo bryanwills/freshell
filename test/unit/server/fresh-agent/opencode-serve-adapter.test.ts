@@ -1,4 +1,7 @@
 import { EventEmitter } from 'node:events'
+import { mkdtempSync } from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 
 const observabilityMocks = vi.hoisted(() => ({
@@ -30,6 +33,7 @@ vi.mock('../../../../server/logger.js', () => ({ logger: loggerMocks.logger, fre
 
 import { createOpencodeFreshAgentAdapter } from '../../../../server/fresh-agent/adapters/opencode/adapter.js'
 import { OpencodeServeLostError } from '../../../../server/fresh-agent/adapters/opencode/serve-manager.js'
+import { FreshAgentRecoveryStore } from '../../../../server/fresh-agent/recovery-store.js'
 import { FRESHOPENCODE_DEFAULT_MODEL } from '../../../../shared/fresh-agent-models.js'
 
 type FakeManager = ReturnType<typeof makeFakeManager>
@@ -82,11 +86,27 @@ function makeFakeManager() {
   }
 }
 
+/** Isolated recovery store on a fresh temp file — tests must never touch ~/.freshell. */
+function makeTempRecoveryStore() {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'freshell-recovery-test-'))
+  return new FreshAgentRecoveryStore({ filePath: path.join(dir, 'r.json') })
+}
+
+/** Drain the fire-and-forget recovery chain (recovery-store fs I/O + send queue). */
+async function flushRecovery() {
+  for (let i = 0; i < 25; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  }
+}
+
 function makeAdapter(manager: FakeManager, overrides: Partial<Parameters<typeof createOpencodeFreshAgentAdapter>[0]> = {}) {
   return createOpencodeFreshAgentAdapter({
     serveManager: manager as any,
     validateCwd: async () => undefined,
     canonicalizePath: async (value: string) => value,
+    // Every test adapter gets an isolated recovery store by default so no test can
+    // read or write the real user-level recovery file.
+    recoveryStore: makeTempRecoveryStore(),
     ...overrides,
   })
 }
@@ -1403,5 +1423,119 @@ describe('statusFromLiveState (zrrj, Task 4 gate)', () => {
     })
     expect(snapshot.status).toBe('running')
     expect(snapshot.extensions.opencode.statusFromLiveState).toBe(true)
+  })
+})
+
+describe('interrupted-turn recovery (zrrj)', () => {
+  const OLD = Date.now() - 60_000
+  const interruptedTranscript = {
+    messages: [
+      // realistic: user messages never carry time.completed (verified, V2)
+      { info: { id: 'm1', role: 'user', time: { created: OLD - 10 } }, parts: [] },
+      { info: { id: 'm2', role: 'assistant', time: { created: OLD } }, parts: [{ type: 'tool', state: { status: 'running' } }] },
+    ],
+    nextCursor: null,
+  }
+
+  function turnRecoveryAudits(): Array<Record<string, unknown>> {
+    return observabilityMocks.recordFreshAgentObservabilityEvent.mock.calls
+      .map(([event]) => event as Record<string, unknown>)
+      .filter((event) => event.kind === 'fresh_agent_turn_recovery')
+  }
+
+  it('injects exactly one continuation for an interrupted turn on attach', async () => {
+    observabilityMocks.recordFreshAgentObservabilityEvent.mockClear()
+    const manager = makeFakeManager()
+    manager.getSessionStatus.mockResolvedValue(undefined) // idle
+    manager.listMessages.mockResolvedValue(interruptedTranscript as any)
+    const adapter = makeAdapter(manager, { recoveryStore: makeTempRecoveryStore() })
+    await adapter.attach!({ sessionId: 'ses_int', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' })
+    await flushRecovery()
+    expect(manager.promptAsync).toHaveBeenCalledTimes(1)
+    const body = (manager.promptAsync.mock.calls[0] as any[])[1]
+    expect(body.parts[0].text).toMatch(/interrupted/i)
+
+    // Auditable: exactly one continuation_injected row, hashed identity only.
+    const injected = turnRecoveryAudits().filter((e) => e.action === 'continuation_injected')
+    expect(injected).toHaveLength(1)
+    expect(JSON.stringify(injected[0])).not.toContain('ses_int')
+    expect(JSON.stringify(injected[0])).not.toContain('/w')
+
+    // Second attach (same store): ledger suppresses.
+    manager.promptAsync.mockClear()
+    await adapter.attach!({ sessionId: 'ses_int', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' })
+    await flushRecovery()
+    expect(manager.promptAsync).not.toHaveBeenCalled()
+    expect(turnRecoveryAudits().some((e) => e.action === 'suppressed_already_recovered')).toBe(true)
+  })
+
+  it('never recovers after an explicit user interrupt, across adapter instances', async () => {
+    const store = makeTempRecoveryStore()
+    const manager = makeFakeManager()
+    manager.getSessionStatus.mockResolvedValue(undefined)
+    manager.listMessages.mockResolvedValue(interruptedTranscript as any)
+    const adapter1 = makeAdapter(manager, { recoveryStore: store })
+    await adapter1.attach!({ sessionId: 'ses_int', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' })
+    await flushRecovery()
+    await adapter1.interrupt!('ses_int') // user stop
+    expect(await store.hasInterrupt('ses_int')).toBe(true)
+
+    // Simulated restart: fresh adapter + manager sharing the durable store.
+    const manager2 = makeFakeManager()
+    manager2.getSessionStatus.mockResolvedValue(undefined)
+    manager2.listMessages.mockResolvedValue(interruptedTranscript as any)
+    const adapter2 = makeAdapter(manager2, { recoveryStore: store })
+    await adapter2.attach!({ sessionId: 'ses_int', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' })
+    await flushRecovery()
+    expect(manager2.promptAsync).not.toHaveBeenCalled()
+  })
+
+  it('does not burn the recovery ledger on a no-cwd attach (route check precedes record)', async () => {
+    observabilityMocks.recordFreshAgentObservabilityEvent.mockClear()
+    const store = makeTempRecoveryStore()
+    const manager = makeFakeManager()
+    manager.getSessionStatus.mockResolvedValue(undefined)
+    manager.listMessages.mockResolvedValue(interruptedTranscript as any)
+    const adapter = makeAdapter(manager, { recoveryStore: store })
+    await adapter.attach!({ sessionId: 'ses_int', sessionType: 'freshopencode', provider: 'opencode' }) // NO cwd — the incident shape
+    await flushRecovery()
+    expect(manager.promptAsync).not.toHaveBeenCalled() // no injection possible
+    expect(turnRecoveryAudits().some((e) => e.action === 'suppressed_no_route')).toBe(true)
+    expect(await store.hasRecovery('ses_int', 'm2')).toBe(false) // ledger NOT burned
+
+    // A later cwd-bearing attach can still recover the turn.
+    await adapter.attach!({ sessionId: 'ses_int', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' })
+    await flushRecovery()
+    expect(manager.promptAsync).toHaveBeenCalledTimes(1)
+    expect(await store.hasRecovery('ses_int', 'm2')).toBe(true)
+  })
+
+  it('does not recover when the user already sent a follow-up', async () => {
+    observabilityMocks.recordFreshAgentObservabilityEvent.mockClear()
+    const manager = makeFakeManager()
+    manager.getSessionStatus.mockResolvedValue(undefined)
+    manager.listMessages.mockResolvedValue({
+      messages: [
+        ...interruptedTranscript.messages,
+        { info: { id: 'm3', role: 'user', time: { created: OLD + 5 } }, parts: [] },
+      ],
+      nextCursor: null,
+    } as any)
+    const adapter = makeAdapter(manager, { recoveryStore: makeTempRecoveryStore() })
+    await adapter.attach!({ sessionId: 'ses_int', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' })
+    await flushRecovery()
+    expect(manager.promptAsync).not.toHaveBeenCalled()
+    expect(turnRecoveryAudits().some((e) => e.action === 'suppressed_user_followup')).toBe(true)
+  })
+
+  it('a normal user send clears recorded interrupt intent', async () => {
+    const store = makeTempRecoveryStore()
+    const manager = makeFakeManager()
+    const adapter = makeAdapter(manager, { recoveryStore: store })
+    await adapter.attach!({ sessionId: 'ses_int', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' })
+    await adapter.interrupt!('ses_int')
+    expect(await store.hasInterrupt('ses_int')).toBe(true)
+    await adapter.send!('ses_int', { text: 'user follow-up' })
+    expect(await store.hasInterrupt('ses_int')).toBe(false)
   })
 })
