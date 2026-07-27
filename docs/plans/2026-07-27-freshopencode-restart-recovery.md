@@ -1134,40 +1134,50 @@ describe('sidecar replacement resilience (zrrj)', () => {
 
 Adjust the private-access spelling (`(manager as any).running` / `dispatchEvent`) to whatever the existing suite already uses to reach internals — this file already drives the real class with injected doubles; reuse its idioms (e.g. if existing tests trigger death via the injected `fetchFn` timeout instead, do the same).
 
-And add the **generation-aware rebind** test to `test/unit/server/ws-handler-fresh-agent.test.ts` (vi.fn() runtime-manager stub harness):
+And add the **generation-aware rebind** test to `test/unit/server/ws-handler-fresh-agent.test.ts`. Harness reality (verified): the file's ONLY helpers are `makeUserConfig`, `createServer(options)` → `{ server, registry, handler }`, and `connectAndAuth(server)` → a real `ws` WebSocket; there is NO `makeManagerStub` and NO `waitForMessage`/message-frame helper. The runtime-manager stub is an inline object of `vi.fn()`s per test; outbound frames are captured with a per-test `seenMessages` array pushed from a `ws.on('message', ...)` listener; the only synchronization primitive is `vi.waitFor`; teardown is a `finally` block calling `handler.close()`, `registry.shutdown()`, and awaiting `server.close()` (canonical example: the send/interrupt/kill test at `:363-485`). Critically, the server sends **NO success/ack frame** for `freshAgent.attach` (`ws-handler.ts:3467-3509` — only error/`freshAgent.event`/`session.materialized` frames can appear), so the test must synchronize on stub calls, never on an attach response:
 
 ```ts
 it('rebinds the freshAgent subscription when the adapter state generation changes (zrrj)', async () => {
-  // Stub: subscribe() records its listener; sessionStateGeneration() returns a settable number.
   let stateGeneration = 1
   const listeners: Array<(ev: unknown) => void> = []
-  const subscribe = vi.fn((_locator: unknown, listener: (ev: unknown) => void) => {
-    listeners.push(listener)
-    return () => {}
-  })
-  const sessionStateGeneration = vi.fn(() => stateGeneration)
-  const { server } = await createServer({
-    freshAgentRuntimeManager: makeManagerStub({ subscribe, sessionStateGeneration, attach: vi.fn().mockResolvedValue({ sessionId: 'ses_9' }) }),
-  })
-  const ws = await connectAndAuth(server)
-  // First attach subscribes and delivers events
-  ws.send(JSON.stringify({ type: 'freshAgent.attach', sessionId: 'ses_9', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' }))
-  await waitForMessage(ws, (m) => m.type === 'freshAgent.attached' || m.type === 'freshAgent.session.state')
-  expect(subscribe).toHaveBeenCalledTimes(1)
+  const off = vi.fn()
+  const runtimeManager = {
+    attach: vi.fn().mockResolvedValue({ sessionId: 'ses_9', sessionType: 'freshopencode', runtimeProvider: 'opencode' }),
+    subscribe: vi.fn((_locator: unknown, listener: (ev: unknown) => void) => {
+      listeners.push(listener)
+      return off
+    }),
+    sessionStateGeneration: vi.fn(() => stateGeneration),
+  }
+  const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+  try {
+    const ws = await connectAndAuth(server)
+    const seenMessages: any[] = []
+    ws.on('message', (data) => { seenMessages.push(JSON.parse(data.toString())) })
 
-  // Simulate adapter-state recreation: new generation, new emitter (a NEW listener registration is required)
-  stateGeneration = 2
-  ws.send(JSON.stringify({ type: 'freshAgent.attach', sessionId: 'ses_9', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' }))
-  await waitForMessage(ws, (m) => m.type === 'freshAgent.attached' || m.type === 'freshAgent.session.state')
-  expect(subscribe).toHaveBeenCalledTimes(2)   // FAILS today: ensureFreshAgentSubscription short-circuits (:1504-1511)
+    // First attach subscribes. No ack frame exists for attach — wait on the stub call.
+    ws.send(JSON.stringify({ type: 'freshAgent.attach', sessionId: 'ses_9', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' }))
+    await vi.waitFor(() => expect(runtimeManager.subscribe).toHaveBeenCalledTimes(1))
 
-  // Events dispatched through the NEW listener reach the pane
-  listeners.at(-1)!({ type: 'sdk.session.snapshot', sessionId: 'ses_9', status: 'running' })
-  await waitForMessage(ws, (m) => m.type === 'freshAgent.event')
+    // Simulate adapter-state recreation: new generation, new emitter (a NEW listener registration is required)
+    stateGeneration = 2
+    ws.send(JSON.stringify({ type: 'freshAgent.attach', sessionId: 'ses_9', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' }))
+    // FAILS today (vi.waitFor times out): ensureFreshAgentSubscription short-circuits on the existing entry (:1504-1511)
+    await vi.waitFor(() => expect(runtimeManager.subscribe).toHaveBeenCalledTimes(2))
+    expect(off).toHaveBeenCalledTimes(1)   // the stale subscription was cancelled before rebinding
+
+    // Events dispatched through the NEW listener reach the client as freshAgent.event frames
+    listeners.at(-1)!({ type: 'sdk.session.snapshot', sessionId: 'ses_9', status: 'running' })
+    await vi.waitFor(() => expect(seenMessages.some((m) => m.type === 'freshAgent.event')).toBe(true))
+  } finally {
+    handler.close()
+    registry.shutdown()
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
 })
 ```
 
-Match the stub's `subscribe` signature and the attach-response frame names to the file's existing attach tests (copy the nearest passing attach arrangement — the harness already stubs `subscribe`).
+Arrangement constraints (verified against the handler): `freshAgent.attach` itself authorizes the locator (`ws-handler.ts:3485`), and durable freshopencode (`ses_*` + opencode) authorization keys include a non-empty cwd — keep `cwd: '/w'` on both attach frames. And the file already PINS the repeat-attach no-op at `:1101`: that test's stub has no `sessionStateGeneration`, so the implementation must rebind ONLY when the manager exposes `sessionStateGeneration` AND the returned generation differs from the recorded one; when the method is absent, the existing-entry branch returns early exactly as today, keeping the pinned test green.
 
 - [ ] **Step 2: Run to verify the replacement test fails**
 
@@ -1497,36 +1507,76 @@ Add to `test/unit/server/ws-handler-fresh-agent.test.ts`:
 
 ```ts
 it('propagates FRESH_AGENT_LOST_SESSION (with requestId) when the manager reports lost-session', async () => {
-  const send = vi.fn().mockRejectedValue(new FreshAgentLostSessionError('Fresh-agent session freshopencode/opencode/ses_9 is not tracked'))
-  const { server } = await createServer({ freshAgentRuntimeManager: makeManagerStub({ send }) })
-  const ws = await connectAndAuth(server)
-  ws.send(JSON.stringify({
-    type: 'freshAgent.send', requestId: 'r1', sessionId: 'ses_9',
-    sessionType: 'freshopencode', provider: 'opencode', text: 'hello',   // NO cwd — the incident shape
-  }))
-  const err = await waitForMessage(ws, (m) => m.type === 'error')
-  expect(err.code).toBe('FRESH_AGENT_LOST_SESSION')
-  expect(err.requestId).toBe('r1')
-  expect(send).toHaveBeenCalledTimes(1)
+  const runtimeManager = {
+    create: vi.fn().mockResolvedValue({ sessionId: 'ses_9', sessionType: 'freshopencode', runtimeProvider: 'opencode' }),
+    subscribe: vi.fn().mockReturnValue(() => undefined),
+    send: vi.fn().mockRejectedValue(new FreshAgentLostSessionError('Fresh-agent session freshopencode/opencode/ses_9 is not tracked')),
+  }
+  const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+  try {
+    const ws = await connectAndAuth(server)
+    const seenMessages: any[] = []
+    ws.on('message', (data) => { seenMessages.push(JSON.parse(data.toString())) })
+
+    // Authorize ses_9 via create (the file's canonical idiom, :363-485) — NOT via attach.
+    ws.send(JSON.stringify({ type: 'freshAgent.create', requestId: 'req-1', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' }))
+    await vi.waitFor(() => expect(runtimeManager.create).toHaveBeenCalled())
+
+    ws.send(JSON.stringify({
+      type: 'freshAgent.send', requestId: 'r1', sessionId: 'ses_9',
+      sessionType: 'freshopencode', provider: 'opencode', cwd: '/w', text: 'hello',
+    }))
+    await vi.waitFor(() => {
+      const err = seenMessages.find((m) => m.type === 'error' && m.requestId === 'r1')
+      expect(err).toBeTruthy()
+      expect(err.code).toBe('FRESH_AGENT_LOST_SESSION')
+    })
+    expect(runtimeManager.send).toHaveBeenCalledTimes(1)
+  } finally {
+    handler.close()
+    registry.shutdown()
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
 })
 
 it('does not attach-retry inside the handler even for a cwd-bearing durable locator (client owns recovery)', async () => {
-  const send = vi.fn().mockRejectedValue(new FreshAgentLostSessionError('Fresh-agent session freshopencode/opencode/ses_9 is not tracked'))
-  const attach = vi.fn()
-  const { server } = await createServer({ freshAgentRuntimeManager: makeManagerStub({ send, attach }) })
-  const ws = await connectAndAuth(server)
-  ws.send(JSON.stringify({
-    type: 'freshAgent.send', requestId: 'r1', sessionId: 'ses_9',
-    sessionType: 'freshopencode', provider: 'opencode', cwd: '/w', text: 'hello',
-  }))
-  const err = await waitForMessage(ws, (m) => m.type === 'error')
-  expect(err.code).toBe('FRESH_AGENT_LOST_SESSION')
-  expect(attach).not.toHaveBeenCalled()   // no server-side retry: cwd-bearing recovery already ran inside manager.send
-  expect(send).toHaveBeenCalledTimes(1)   // no blind retry loop
+  const runtimeManager = {
+    create: vi.fn().mockResolvedValue({ sessionId: 'ses_9', sessionType: 'freshopencode', runtimeProvider: 'opencode' }),
+    subscribe: vi.fn().mockReturnValue(() => undefined),
+    send: vi.fn().mockRejectedValue(new FreshAgentLostSessionError('Fresh-agent session freshopencode/opencode/ses_9 is not tracked')),
+    attach: vi.fn(),
+  }
+  const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+  try {
+    const ws = await connectAndAuth(server)
+    const seenMessages: any[] = []
+    ws.on('message', (data) => { seenMessages.push(JSON.parse(data.toString())) })
+
+    // Authorization comes from create — the client never sends freshAgent.attach in this test,
+    // so the attach spy is a pure detector for a server-side attach-retry.
+    ws.send(JSON.stringify({ type: 'freshAgent.create', requestId: 'req-1', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' }))
+    await vi.waitFor(() => expect(runtimeManager.create).toHaveBeenCalled())
+
+    ws.send(JSON.stringify({
+      type: 'freshAgent.send', requestId: 'r1', sessionId: 'ses_9',
+      sessionType: 'freshopencode', provider: 'opencode', cwd: '/w', text: 'hello',
+    }))
+    await vi.waitFor(() => {
+      const err = seenMessages.find((m) => m.type === 'error' && m.requestId === 'r1')
+      expect(err).toBeTruthy()
+      expect(err.code).toBe('FRESH_AGENT_LOST_SESSION')
+    })
+    expect(runtimeManager.attach).not.toHaveBeenCalled()   // no server-side retry: cwd-bearing recovery already ran inside manager.send
+    expect(runtimeManager.send).toHaveBeenCalledTimes(1)   // no blind retry loop
+  } finally {
+    handler.close()
+    registry.shutdown()
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
 })
 ```
 
-Reuse the file's existing manager-stub construction and message-frame helpers verbatim (the suite already has patterns for `freshAgent.send` frames including authorization setup — follow the nearest passing send test; the fresh-agent send path requires prior authorization via create/attach in some configurations: mirror whatever arrangement the file's existing send tests use, e.g. an initial `freshAgent.attach` frame).
+Harness reality (verified — do not look for helpers that don't exist): the file's ONLY helpers are `makeUserConfig`, `createServer(options)` → `{ server, registry, handler }`, and `connectAndAuth(server)`; there is NO `makeManagerStub` and NO `waitForMessage`. Runtime-manager stubs are inline objects of `vi.fn()`s; outbound frames are observed via a per-test `seenMessages` array; synchronization is `vi.waitFor`; teardown is the `finally` block shown (all per the canonical send test at `:363-485`). Authorization notes: `freshAgent.send` is gated by `waitForFreshAgentAuthorization` (`ws-handler.ts:3519` → `:1449`), and durable freshopencode (`ses_*` + opencode) authorization keys include a non-empty cwd (`ws-handler.ts:1279-1286`, `:1338-1341`; the locator cwd derives from `m.cwd ?? m.settings?.cwd`, `:1288`) — hence `cwd: '/w'` on BOTH the create and send frames so the keys align (if the create schema carries cwd only under `settings.cwd`, put it there; the locator derivation accepts either). These ws-level tests deliberately use cwd-bearing frames: the no-cwd incident population is exercised at the runtime-manager level, and the handler's catch-branch mapping (the behavior under test here) is cwd-agnostic.
 
 - [ ] **Step 2: Run to verify they fail**
 
@@ -1602,14 +1652,23 @@ it('re-attaches with the route cwd and resends once when a send fails with FRESH
     expect(frames.filter((m) => m.type === 'freshAgent.send' && m.text === 'hello again')).toHaveLength(1)
   })
 
-  // Second failure for the retried request must NOT loop
+  // Second failure for the retried request must NOT loop...
   const retried = wsMock.send.mock.calls.map(([f]) => JSON.parse(f)).find((m) => m.type === 'freshAgent.send')
   wsMock.send.mockClear()
   act(() => wsHandler({ type: 'error', code: 'FRESH_AGENT_LOST_SESSION', requestId: retried.requestId, message: 'still not tracked' }))
   await new Promise((r) => setTimeout(r, 100))
   expect(wsMock.send.mock.calls.map(([f]) => JSON.parse(f)).filter((m) => m.type === 'freshAgent.send')).toHaveLength(0)
+
+  // ...and the cleanup fall-through (Step 3 item 4) must fire for the final failure:
+  await waitFor(() => {
+    expect(screen.queryByText('hello again')).not.toBeInTheDocument()   // stale local echo cleared
+  })
+  expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined()   // Redux copy cleared too (dual-write)
+  expect(getFreshAgentPaneContent(store).status).not.toBe('running')   // optimistic busy released
 })
 ```
+
+(`getFreshAgentPaneContent(store)` is the file's existing store-reading helper; the echo renders as a synthetic appended user turn, so `queryByText` of the sent text is the presence probe the file already uses.)
 
 No existing test injects a `type: 'error'` frame into a fresh-agent view test (verified — write these fresh, do not look for a precedent to copy). The harness's captured `wsMock.onMessage` handler (`FreshAgentView.test.tsx:20-38` idiom: capture `wsMock.onMessage.mock.calls[0][0]` post-render, or `onMessage.mockImplementation((h) => { captured = h })` pre-render) accepts arbitrary frames; inject the real `ErrorMessage` shape from `shared/ws-protocol.ts:707-719` — `{ type: 'error', code, message, requestId, timestamp }` (add `timestamp: Date.now()` to the frames in the test above; the component branch must key off `type`/`code`/`requestId` only).
 
@@ -1648,7 +1707,27 @@ if (errorCode === 'FRESH_AGENT_LOST_SESSION'
 
 The `startsWith('ses_')` guard keeps genuinely-invalid placeholder/non-durable lost-session errors on the normal error path (the server no longer filters these — Task 9).
 
-3. Implement `resendPendingMessage` by extracting the existing send-frame construction into a helper reused by the composer submit path and the retry (same fields, plus `cwd`); the retry's own pending-metadata entry retains the same `text` (so its failure still cleans up normally through the fall-through path).
+3. Implement `resendPendingMessage` by extracting the existing send-frame construction into a helper reused by the composer submit path and the retry (same fields, plus `cwd`); the retry's own pending-metadata entry retains the same `text` (so its failure still cleans up normally through the fall-through path). The retry also RE-STAMPS the visible local echo's `requestId` to the retry's requestId (same text) via the `setLocalEcho` dual-write helper (`:655-664`), so the retry's eventual acceptance or failure correlates with the echo that is on screen.
+
+4. Add the cleanup fall-through at the end of the owned-error branch — reached by every owned send failure that did not take the retry path, including a retried request failing again:
+
+```ts
+// failedRequestId is owned (a pendingSendMetadataRef entry exists) and no retry fired:
+pendingSendMetadataRef.current.delete(failedRequestId)
+if (localEchoRef.current?.requestId === failedRequestId) {
+  // setLocalEcho is the DUAL-WRITE helper (:655-664): it clears both the React state and
+  // paneContent.pendingLocalEcho in Redux. Do NOT call the raw React setter here — the
+  // Redux-sync effect (:665-673) would re-seed the echo from the surviving Redux copy.
+  setLocalEcho(undefined)
+}
+if (paneContentRef.current?.provider === 'opencode' && paneContentRef.current.status === 'running') {
+  // Release the optimistic busy written by sendUserText's mergePaneContent (:2001-2008,
+  // the `status: 'running'` spread at :2005) — mirror that call shape with status: 'idle'.
+  mergePaneContent({ status: 'idle' })
+}
+```
+
+Locate the exact setter/helper names by the quoted code (per this plan's locate-by-quoted-code rule); the three cleanup targets are exactly the three leaks named in the premise above (metadata entry, `pendingLocalEcho`, optimistic `running`).
 
 - [ ] **Step 4: Run to verify pass**
 
