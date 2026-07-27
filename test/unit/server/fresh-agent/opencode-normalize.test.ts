@@ -443,3 +443,116 @@ describe('OpenCode fresh-agent normalization', () => {
     expect(FreshAgentTurnPageSchema.parse(fallback).nextCursor).toBe('fallback-cursor')
   })
 })
+
+describe('turn evidence extraction (zrrj)', () => {
+  it('surfaces missing completion time, abort error, and running tool parts', () => {
+    const snapshot = normalizeOpencodeSnapshot({
+      sessionType: 'freshopencode',
+      threadId: 'ses_1',
+      status: 'idle',
+      exported: {
+        info: { id: 'ses_1', time: { updated: 10 } },
+        messages: [
+          // realistic: user messages never carry time.completed (verified, V2)
+          { info: { id: 'm1', role: 'user', time: { created: 1 } }, parts: [] },
+          {
+            info: {
+              id: 'm2', role: 'assistant', time: { created: 2, completed: 3 }, // clean prior turn
+              tokens: { input: 10, output: 40 }, cost: 0.01,
+            },
+            parts: [{ type: 'step-start' }, { type: 'step-finish' }],
+          },
+          {
+            info: {
+              id: 'm3', role: 'assistant', time: { created: 4 }, // NO completed
+              error: { name: 'MessageAbortedError', message: 'aborted' },
+              tokens: { input: 100, output: 0 }, cost: 0,
+            },
+            parts: [
+              { type: 'tool', state: { status: 'running' } },
+              { type: 'step-start' },
+            ],
+          },
+        ],
+      },
+    })
+    // The client hard-validates snapshots against the shared contract; an
+    // evidence-bearing snapshot must still parse.
+    FreshAgentSnapshotSchema.parse(snapshot)
+    const evidence = (snapshot.extensions as any).opencode.turnEvidence
+    expect(evidence).toHaveLength(3)
+    expect(evidence[2]).toMatchObject({
+      turnId: 'm3', role: 'assistant',
+      timeCreated: 4,
+      error: { name: 'MessageAbortedError', message: 'aborted' },
+      tokens: { input: 100, output: 0 },
+      cost: 0,
+      runningToolPartCount: 1, stepStartCount: 1, stepFinishCount: 0,
+    })
+    // absent => unfinished: the property must be truly absent, not undefined-valued
+    expect(evidence[2]).not.toHaveProperty('timeCompleted')
+    expect(evidence[1]).toMatchObject({
+      turnId: 'm2', role: 'assistant', timeCreated: 2, timeCompleted: 3, cost: 0.01,
+      tokens: { input: 10, output: 40 },
+      runningToolPartCount: 0, stepStartCount: 1, stepFinishCount: 1,
+    })
+    expect(evidence[1].error).toBeUndefined()
+    expect(evidence[0]).toMatchObject({
+      turnId: 'm1', role: 'user', timeCreated: 1,
+      runningToolPartCount: 0, stepStartCount: 0, stepFinishCount: 0,
+    })
+    expect(evidence[0]).not.toHaveProperty('timeCompleted')
+  })
+
+  it('tolerates alternate error shapes and absent fields without crashing', () => {
+    const snapshot = normalizeOpencodeSnapshot({
+      sessionType: 'freshopencode',
+      threadId: 'ses_err_shapes',
+      exported: {
+        messages: [
+          { info: { id: 'm1', role: 'assistant', error: { data: { message: 'nested boom' } } }, parts: [] },
+          { info: { id: 'm2', role: 'assistant', error: 'plain boom' }, parts: [] },
+          { info: { id: 'm3', role: 'assistant' } }, // no parts array, no optional fields
+        ],
+      },
+    })
+    const evidence = (snapshot.extensions as any).opencode.turnEvidence
+    expect(evidence).toHaveLength(3)
+    expect(evidence[0].error).toEqual({ message: 'nested boom' })
+    expect(evidence[1].error).toEqual({ message: 'plain boom' })
+    expect(evidence[2]).toEqual({
+      turnId: 'm3',
+      role: 'assistant',
+      runningToolPartCount: 0,
+      stepStartCount: 0,
+      stepFinishCount: 0,
+    })
+  })
+
+  it('never leaks message text into evidence', () => {
+    const snapshot = normalizeOpencodeSnapshot({
+      sessionType: 'freshopencode',
+      threadId: 'ses_secret',
+      exported: {
+        info: { id: 'ses_secret', time: { updated: 5 } },
+        messages: [
+          {
+            info: { id: 'm1', role: 'assistant', time: { created: 1 } },
+            parts: [
+              { id: 'p1', type: 'text', text: 'the secret assistant text' },
+              {
+                id: 'p2',
+                type: 'tool',
+                tool: 'bash',
+                state: { status: 'running', input: { command: 'echo the secret assistant text' }, output: 'the secret assistant text' },
+              },
+            ],
+          },
+        ],
+      },
+    })
+    const json = JSON.stringify((snapshot.extensions as any).opencode.turnEvidence)
+    expect(json).not.toContain('the secret assistant text')
+    expect((snapshot.extensions as any).opencode.turnEvidence[0]).toMatchObject({ turnId: 'm1', runningToolPartCount: 1 })
+  })
+})

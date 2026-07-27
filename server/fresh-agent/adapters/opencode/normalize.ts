@@ -17,6 +17,69 @@ export type OpencodeExport = {
 const STRUCTURAL_PART_TYPES = new Set(['step-start', 'step-finish'])
 const VISIBLE_PART_TYPES = new Set(['text', 'reasoning', 'tool', 'file', 'patch', 'compaction'])
 
+/** Per-turn interruption evidence surfaced under `extensions.opencode.turnEvidence`
+ * (kata zrrj). Field names validated against opencode 1.18.x live data; extraction
+ * stays defensive because future sidecar versions may drift. NEVER carries payload
+ * beyond error name/message — no prompt/assistant/tool text. */
+export type OpencodeTurnEvidence = {
+  turnId: string
+  role: string
+  timeCreated?: number
+  timeCompleted?: number // absent => unfinished (assistant)
+  error?: { name?: string; message?: string } // e.g. { name: 'MessageAbortedError' }
+  tokens?: { input?: number; output?: number }
+  cost?: number
+  runningToolPartCount: number // parts with state.status === 'running'
+  stepStartCount: number
+  stepFinishCount: number
+}
+
+/** Pure extraction of interruption evidence from the raw sidecar message passthrough.
+ * Tolerates `{ name, message }`, `{ data: { message } }`, and plain-string error shapes
+ * (mirroring opencodeErrorMessage in serve-events.ts). Absent fields yield absent
+ * evidence properties; malformed input never crashes. */
+function extractTurnEvidence(messages: NonNullable<OpencodeExport['messages']>): OpencodeTurnEvidence[] {
+  return messages.map((message) => {
+    const info = message?.info ?? {}
+    const parts = Array.isArray(message?.parts) ? message.parts : []
+    const err = info?.error
+    const error = err
+      ? {
+          ...(typeof err?.name === 'string' ? { name: err.name } : {}),
+          ...(typeof err?.message === 'string'
+            ? { message: err.message }
+            : typeof err?.data?.message === 'string'
+              ? { message: err.data.message }
+              : typeof err === 'string' ? { message: err } : {}),
+        }
+      : undefined
+    const counts = { running: 0, stepStart: 0, stepFinish: 0 }
+    for (const part of parts) {
+      if (part?.type === 'tool' && part?.state?.status === 'running') counts.running += 1
+      if (part?.type === 'step-start') counts.stepStart += 1
+      if (part?.type === 'step-finish') counts.stepFinish += 1
+    }
+    const tokens = info?.tokens && typeof info.tokens === 'object'
+      ? {
+          ...(Number.isFinite(info.tokens.input) ? { input: Number(info.tokens.input) } : {}),
+          ...(Number.isFinite(info.tokens.output) ? { output: Number(info.tokens.output) } : {}),
+        }
+      : undefined
+    return {
+      turnId: String(info?.id ?? ''),
+      role: typeof info?.role === 'string' ? info.role : 'unknown',
+      ...(Number.isFinite(info?.time?.created) ? { timeCreated: Number(info.time.created) } : {}),
+      ...(Number.isFinite(info?.time?.completed) ? { timeCompleted: Number(info.time.completed) } : {}),
+      ...(error && (error.name || error.message) ? { error } : {}),
+      ...(tokens && (tokens.input !== undefined || tokens.output !== undefined) ? { tokens } : {}),
+      ...(Number.isFinite(info?.cost) ? { cost: Number(info.cost) } : {}),
+      runningToolPartCount: counts.running,
+      stepStartCount: counts.stepStart,
+      stepFinishCount: counts.stepFinish,
+    }
+  })
+}
+
 type OpencodeExportWithPageMetadata = OpencodeExport & {
   nextCursor?: string | null
 }
@@ -361,6 +424,10 @@ export function normalizeOpencodeSnapshot(input: {
   status?: string
   model?: string
   effort?: string
+  /** Server half of the client busy-clear gate (kata zrrj): true only when the
+   * adapter holds live state whose initial status reconcile completed. Absent
+   * when the caller has no live-state notion (e.g. turn pages). */
+  statusFromLiveState?: boolean
 }): FreshAgentSnapshot {
   const info = input.exported?.info ?? {}
   const messages = Array.isArray(input.exported?.messages) ? input.exported.messages : []
@@ -400,7 +467,13 @@ export function normalizeOpencodeSnapshot(input: {
     diffs: [],
     childThreads: [],
     turns,
-    extensions: { opencode: opencodeExtensions },
+    extensions: {
+      opencode: {
+        ...opencodeExtensions,
+        turnEvidence: extractTurnEvidence(messages),
+        ...(typeof input.statusFromLiveState === 'boolean' ? { statusFromLiveState: input.statusFromLiveState } : {}),
+      },
+    },
   }
 }
 

@@ -70,6 +70,13 @@ type OpencodeSessionState = {
    * and Codex's `status === 'completed'`.
    */
   turnErrored?: boolean
+  /**
+   * True once reconcileStatus's getSessionStatus read has resolved to a trustworthy
+   * answer (busy/retry, or confirmed idle via absence / a non-busy status). Left unset
+   * on the error-swallow and malformed/missing-helper fallbacks, so a failed read never
+   * licenses the client's snapshot busy-clear gate (kata zrrj, Task 4's server half).
+   */
+  initialReconcileCompleted?: boolean
 }
 
 type CreateOpencodeFreshAgentAdapterOptions = {
@@ -216,6 +223,7 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       // consistent with the serve manager's onceIdle treatment of absence as idle —
       // rather than logging a false-positive malformed warning.
       if (status == null) {
+        state.initialReconcileCompleted = true
         settleIdle()
         return
       }
@@ -229,6 +237,7 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
         return
       }
       const type = status.type
+      state.initialReconcileCompleted = true
       if (type === 'busy' || type === 'retry') {
         emitStatus(state, 'running')
         // A restored running session needs a waiter or no idle/turn-complete ever
@@ -752,6 +761,9 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
         sessionType: 'freshopencode', threadId: thread.threadId,
         exported: { ...exported, info: { ...(exported.info ?? {}), time: { ...((exported.info?.time) ?? {}), updated: revision } } },
         status: liveState?.status ?? 'idle', model: liveState?.model, effort: liveState?.effort,
+        // Task 4's client busy-clear gate: only a snapshot whose status comes from live,
+        // reconciled adapter state may clear busy; the untracked default above must not.
+        statusFromLiveState: liveState?.initialReconcileCompleted === true,
       })
     },
 

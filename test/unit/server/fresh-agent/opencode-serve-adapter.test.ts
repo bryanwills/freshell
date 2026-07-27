@@ -1322,3 +1322,86 @@ describe('restore reconciliation emits and monitors (zrrj)', () => {
     expect(completions).toHaveLength(1)
   })
 })
+
+describe('statusFromLiveState (zrrj, Task 4 gate)', () => {
+  it('is false/absent for an untracked session snapshot (idle default)', async () => {
+    const manager = makeFakeManager()
+    const adapter = makeAdapter(manager)
+
+    // getSnapshot for a ses_ id with no adapter state: status falls back to the
+    // placeholder-default 'idle', which must NOT license a client busy-clear.
+    const snapshot: any = await adapter.getSnapshot?.({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      threadId: 'ses_untracked',
+      cwd: '/repo/safe',
+    })
+
+    expect(snapshot.status).toBe('idle')
+    expect(snapshot.extensions.opencode.statusFromLiveState).not.toBe(true)
+    expect(snapshot.extensions.opencode.statusFromLiveState).toBe(false)
+  })
+
+  it('is true only after the initial reconcile completed', async () => {
+    // Reconcile resolves (absent from the status map => confirmed idle) -> true.
+    const manager = makeFakeManager()
+    manager.getSessionStatus = vi.fn(async () => undefined)
+    const adapter = makeAdapter(manager)
+    await adapter.attach?.({
+      sessionId: 'ses_reconciled',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })
+    const snapshot: any = await adapter.getSnapshot?.({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      threadId: 'ses_reconciled',
+      cwd: '/repo/safe',
+    })
+    expect(snapshot.status).toBe('idle')
+    expect(snapshot.extensions.opencode.statusFromLiveState).toBe(true)
+
+    // Error-swallow path: getSessionStatus rejecting must leave the flag false —
+    // a failed read never licenses a busy-clear.
+    const failingManager = makeFakeManager()
+    failingManager.getSessionStatus = vi.fn(async () => { throw new Error('status failed') })
+    const failingAdapter = makeAdapter(failingManager)
+    await failingAdapter.attach?.({
+      sessionId: 'ses_reconcile_failed',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })
+    const failedSnapshot: any = await failingAdapter.getSnapshot?.({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      threadId: 'ses_reconcile_failed',
+      cwd: '/repo/safe',
+    })
+    expect(failedSnapshot.status).toBe('idle')
+    expect(failedSnapshot.extensions.opencode.statusFromLiveState).toBe(false)
+  })
+
+  it('is true when the reconcile resolves busy (running branch)', async () => {
+    const manager = makeFakeManager()
+    manager.getSessionStatus = vi.fn(async () => ({ type: 'busy' }))
+    // Keep the restore idle-recovery monitor pending so the session stays running.
+    manager.onceIdle = vi.fn(() => new Promise<void>(() => {}))
+    const adapter = makeAdapter(manager)
+    await adapter.attach?.({
+      sessionId: 'ses_busy_flag',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })
+    const snapshot: any = await adapter.getSnapshot?.({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      threadId: 'ses_busy_flag',
+      cwd: '/repo/safe',
+    })
+    expect(snapshot.status).toBe('running')
+    expect(snapshot.extensions.opencode.statusFromLiveState).toBe(true)
+  })
+})
