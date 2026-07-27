@@ -9,6 +9,16 @@ vi.mock('../../../server/config-store.js', () => ({
   },
 }))
 
+const observabilityMocks = vi.hoisted(() => ({
+  recordFreshAgentObservabilityEvent: vi.fn(),
+}))
+
+vi.mock('../../../server/fresh-agent/observability.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../server/fresh-agent/observability.js')>()
+  return { ...actual, recordFreshAgentObservabilityEvent: observabilityMocks.recordFreshAgentObservabilityEvent }
+})
+
+import { hashForLogs } from '../../../server/fresh-agent/observability.js'
 import { WsHandler } from '../../../server/ws-handler.js'
 import { TerminalRegistry } from '../../../server/terminal-registry.js'
 import { FreshAgentLostSessionError } from '../../../server/fresh-agent/runtime-manager.js'
@@ -38,6 +48,7 @@ describe('WsHandler fresh-agent routing', () => {
     originalAuthToken = process.env.AUTH_TOKEN
     process.env.AUTH_TOKEN = TEST_AUTH_TOKEN
     vi.mocked(configStore.snapshot).mockResolvedValue(makeUserConfig(true))
+    observabilityMocks.recordFreshAgentObservabilityEvent.mockClear()
   })
 
   async function createServer(options: Record<string, unknown> = {}) {
@@ -1245,6 +1256,184 @@ describe('WsHandler fresh-agent routing', () => {
       })
       expect(runtimeManager.attach).not.toHaveBeenCalled()   // no server-side retry: cwd-bearing recovery already ran inside manager.send
       expect(runtimeManager.send).toHaveBeenCalledTimes(1)   // no blind retry loop
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
+  it('emits identity-hashed send and interrupt rows (zrrj)', async () => {
+    const observabilitySpy = observabilityMocks.recordFreshAgentObservabilityEvent
+    const runtimeManager = {
+      create: vi.fn().mockResolvedValue({ sessionId: 'ses_9', sessionType: 'freshopencode', runtimeProvider: 'opencode' }),
+      subscribe: vi.fn().mockReturnValue(() => undefined),
+      send: vi.fn().mockResolvedValue({ submittedTurnId: 'display-user-1' }),
+      interrupt: vi.fn().mockResolvedValue(undefined),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+    try {
+      const ws = await connectAndAuth(server)
+      ws.send(JSON.stringify({ type: 'freshAgent.create', requestId: 'req-1', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' }))
+      await vi.waitFor(() => expect(runtimeManager.create).toHaveBeenCalled())
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.send', requestId: 'r1', sessionId: 'ses_9',
+        sessionType: 'freshopencode', provider: 'opencode', cwd: '/w', text: 'hello',
+      }))
+      await vi.waitFor(() => expect(runtimeManager.send).toHaveBeenCalled())
+      ws.send(JSON.stringify({
+        type: 'freshAgent.interrupt', sessionId: 'ses_9',
+        sessionType: 'freshopencode', provider: 'opencode', cwd: '/w',
+      }))
+
+      await vi.waitFor(() => {
+        expect(observabilitySpy).toHaveBeenCalledWith(expect.objectContaining({
+          kind: 'fresh_agent_send', sessionType: 'freshopencode', provider: 'opencode',
+          sessionIdHash: hashForLogs('ses_9'), cwdHash: hashForLogs('/w'),
+          requestId: 'r1', outcome: 'accepted', durationMs: expect.any(Number),
+        }))
+        expect(observabilitySpy).toHaveBeenCalledWith(expect.objectContaining({
+          kind: 'fresh_agent_interrupt', outcome: 'ok', sessionIdHash: hashForLogs('ses_9'),
+          sessionType: 'freshopencode', provider: 'opencode',
+        }))
+      })
+      // No raw ids or prompt text anywhere in the payloads:
+      for (const [payload] of observabilitySpy.mock.calls) {
+        expect(JSON.stringify(payload)).not.toContain('ses_9')
+        expect(JSON.stringify(payload)).not.toContain('hello')
+      }
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
+  it('emits a failed send row carrying the lost-session error code (zrrj)', async () => {
+    const observabilitySpy = observabilityMocks.recordFreshAgentObservabilityEvent
+    const runtimeManager = {
+      create: vi.fn().mockResolvedValue({ sessionId: 'ses_9', sessionType: 'freshopencode', runtimeProvider: 'opencode' }),
+      subscribe: vi.fn().mockReturnValue(() => undefined),
+      send: vi.fn().mockRejectedValue(new FreshAgentLostSessionError('Fresh-agent session freshopencode/opencode/ses_9 is not tracked')),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+    try {
+      const ws = await connectAndAuth(server)
+      ws.send(JSON.stringify({ type: 'freshAgent.create', requestId: 'req-1', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' }))
+      await vi.waitFor(() => expect(runtimeManager.create).toHaveBeenCalled())
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.send', requestId: 'r1', sessionId: 'ses_9',
+        sessionType: 'freshopencode', provider: 'opencode', cwd: '/w', text: 'hello',
+      }))
+
+      await vi.waitFor(() => {
+        expect(observabilitySpy).toHaveBeenCalledWith(expect.objectContaining({
+          kind: 'fresh_agent_send', outcome: 'failed', errorCode: 'FRESH_AGENT_LOST_SESSION',
+          sessionIdHash: hashForLogs('ses_9'), requestId: 'r1', durationMs: expect.any(Number),
+        }))
+      })
+      for (const [payload] of observabilitySpy.mock.calls) {
+        expect(JSON.stringify(payload)).not.toContain('ses_9')
+        expect(JSON.stringify(payload)).not.toContain('hello')
+      }
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
+  it('emits a fresh_agent_attach row on successful attach (zrrj)', async () => {
+    const observabilitySpy = observabilityMocks.recordFreshAgentObservabilityEvent
+    const runtimeManager = {
+      attach: vi.fn().mockResolvedValue({ sessionId: 'ses_att', sessionType: 'freshclaude', runtimeProvider: 'claude' }),
+      subscribe: vi.fn().mockResolvedValue(() => undefined),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+    try {
+      const ws = await connectAndAuth(server)
+      ws.send(JSON.stringify({
+        type: 'freshAgent.attach', sessionId: 'ses_att',
+        sessionType: 'freshclaude', provider: 'claude', cwd: '/repo/w',
+      }))
+      await vi.waitFor(() => {
+        expect(observabilitySpy).toHaveBeenCalledWith(expect.objectContaining({
+          kind: 'fresh_agent_attach', outcome: 'ok', sessionType: 'freshclaude', provider: 'claude',
+          sessionIdHash: hashForLogs('ses_att'), cwdHash: hashForLogs('/repo/w'),
+        }))
+      })
+      for (const [payload] of observabilitySpy.mock.calls) {
+        expect(JSON.stringify(payload)).not.toContain('ses_att')
+        expect(JSON.stringify(payload)).not.toContain('/repo/w')
+      }
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
+  it('emits a failed fresh_agent_attach row when the manager attach rejects (zrrj)', async () => {
+    const observabilitySpy = observabilityMocks.recordFreshAgentObservabilityEvent
+    const runtimeManager = {
+      attach: vi.fn().mockRejectedValue(new Error('sidecar unreachable')),
+      subscribe: vi.fn().mockResolvedValue(() => undefined),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+    try {
+      const ws = await connectAndAuth(server)
+      ws.send(JSON.stringify({
+        type: 'freshAgent.attach', sessionId: 'ses_att_fail',
+        sessionType: 'freshopencode', provider: 'opencode', cwd: '/repo/w',
+      }))
+      await vi.waitFor(() => {
+        expect(observabilitySpy).toHaveBeenCalledWith(expect.objectContaining({
+          kind: 'fresh_agent_attach', outcome: 'failed', errorCode: 'INTERNAL_ERROR',
+          sessionIdHash: hashForLogs('ses_att_fail'),
+        }))
+      })
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
+  it('emits a fresh_agent_materialized row at the materialization choke point (zrrj)', async () => {
+    const observabilitySpy = observabilityMocks.recordFreshAgentObservabilityEvent
+    const runtimeManager = {
+      create: vi.fn().mockResolvedValue({ sessionId: 'freshopencode-req-mat', sessionType: 'freshopencode', runtimeProvider: 'opencode' }),
+      subscribe: vi.fn().mockReturnValue(() => undefined),
+      send: vi.fn().mockResolvedValue({
+        sessionId: 'ses_mat_1',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_mat_1' },
+      }),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+    try {
+      const ws = await connectAndAuth(server)
+      ws.send(JSON.stringify({ type: 'freshAgent.create', requestId: 'req-mat', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' }))
+      await vi.waitFor(() => expect(runtimeManager.create).toHaveBeenCalled())
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.send', requestId: 'r-mat', sessionId: 'freshopencode-req-mat',
+        sessionType: 'freshopencode', provider: 'opencode', cwd: '/w', text: 'hello',
+      }))
+
+      await vi.waitFor(() => {
+        expect(observabilitySpy).toHaveBeenCalledWith(expect.objectContaining({
+          kind: 'fresh_agent_materialized', sessionType: 'freshopencode', provider: 'opencode',
+          previousSessionIdHash: hashForLogs('freshopencode-req-mat'),
+          sessionIdHash: hashForLogs('ses_mat_1'),
+          cwdHash: hashForLogs('/w'),
+        }))
+      })
+      for (const [payload] of observabilitySpy.mock.calls) {
+        expect(JSON.stringify(payload)).not.toContain('ses_mat_1')
+        expect(JSON.stringify(payload)).not.toContain('hello')
+      }
     } finally {
       handler.close()
       registry.shutdown()

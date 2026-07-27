@@ -1916,6 +1916,7 @@ export function FreshAgentView({
       // isStaleSnapshotRequest() when the outcome is applied, not by aborting.
       getFreshAgentThreadSnapshot(requestSessionType, provider, sessionId, {
         ...(requestCwd ? { cwd: requestCwd } : {}),
+        trigger,
       }),
     ).then((outcome) => {
       if (isStaleSnapshotRequest()) return

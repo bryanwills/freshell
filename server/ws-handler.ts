@@ -119,6 +119,7 @@ import {
   normalizeFreshAgentProviderEvent,
 } from './fresh-agent/sdk-events.js'
 import { FreshAgentLostSessionError } from './fresh-agent/runtime-manager.js'
+import { hashForLogs, recordFreshAgentObservabilityEvent } from './fresh-agent/observability.js'
 
 type WsHandlerConfig = {
   maxConnections: number
@@ -1309,6 +1310,27 @@ export class WsHandler {
     }
   }
 
+  // Identity convention for structured observability rows (zrrj): never log raw
+  // session ids or cwd paths — only provider + sessionIdHash + cwdHash.
+  private freshAgentIdentityFields(locator: FreshAgentLocator): {
+    sessionType: string
+    provider: string
+    sessionIdHash: string
+    cwdHash?: string
+  } {
+    return {
+      sessionType: locator.sessionType,
+      provider: locator.provider,
+      sessionIdHash: hashForLogs(locator.sessionId),
+      ...(locator.cwd ? { cwdHash: hashForLogs(locator.cwd) } : {}),
+    }
+  }
+
+  private freshAgentErrorCode(error: unknown): string {
+    const code = (error as { code?: unknown } | null | undefined)?.code
+    return typeof code === 'string' && code.length > 0 ? code : 'INTERNAL_ERROR'
+  }
+
   private freshAgentEventMessage(locator: FreshAgentLocator, event: unknown) {
     return {
       type: 'freshAgent.event',
@@ -1436,6 +1458,16 @@ export class WsHandler {
       next.sessionId,
       sessionRef,
     )
+    // Single choke point for materialization: every freshAgent.session.materialized
+    // frame the WS layer sends flows through here (zrrj).
+    recordFreshAgentObservabilityEvent({
+      kind: 'fresh_agent_materialized',
+      sessionType: locator.sessionType,
+      provider: locator.provider,
+      previousSessionIdHash: hashForLogs(next.previousSessionId ?? locator.sessionId),
+      sessionIdHash: hashForLogs(next.sessionId),
+      ...(locator.cwd ? { cwdHash: hashForLogs(locator.cwd) } : {}),
+    })
     return materializedLocator
   }
 
@@ -3516,7 +3548,18 @@ export class WsHandler {
         state.pendingFreshAgentAttachByKey.set(authorizationKey, pendingEntry)
         try {
           await attachPromise
+          recordFreshAgentObservabilityEvent({
+            kind: 'fresh_agent_attach',
+            ...this.freshAgentIdentityFields(locator),
+            outcome: 'ok',
+          })
         } catch (error) {
+          recordFreshAgentObservabilityEvent({
+            kind: 'fresh_agent_attach',
+            ...this.freshAgentIdentityFields(locator),
+            outcome: 'failed',
+            errorCode: this.freshAgentErrorCode(error),
+          })
           if (this.clientStates.get(ws) !== state) return
           log.warn({
             err: error instanceof Error ? error : new Error(String(error)),
@@ -3540,12 +3583,20 @@ export class WsHandler {
         }
         const locator = this.freshAgentLocatorFromMessage(m)
         if (!await this.waitForFreshAgentAuthorization(ws, state, locator, m.requestId)) return
+        const startedAt = Date.now()
         try {
           const result = await manager.send(locator, {
             requestId: m.requestId,
             text: m.text,
             images: m.images,
             settings: m.settings,
+          })
+          recordFreshAgentObservabilityEvent({
+            kind: 'fresh_agent_send',
+            ...this.freshAgentIdentityFields(locator),
+            ...(m.requestId ? { requestId: m.requestId } : {}),
+            outcome: 'accepted',
+            durationMs: Date.now() - startedAt,
           })
           let acceptedLocator = locator
           if (result?.sessionId && result.sessionId !== m.sessionId) {
@@ -3575,6 +3626,14 @@ export class WsHandler {
             })
           }
         } catch (error) {
+          recordFreshAgentObservabilityEvent({
+            kind: 'fresh_agent_send',
+            ...this.freshAgentIdentityFields(locator),
+            ...(m.requestId ? { requestId: m.requestId } : {}),
+            outcome: 'failed',
+            errorCode: this.freshAgentErrorCode(error),
+            durationMs: Date.now() - startedAt,
+          })
           if (error instanceof FreshAgentLostSessionError) {
             this.sendError(ws, { code: 'FRESH_AGENT_LOST_SESSION', message: errorMessage(error), requestId: m.requestId })
             return
@@ -3594,7 +3653,18 @@ export class WsHandler {
         if (!this.requireFreshAgentAuthorization(ws, state, locator)) return
         try {
           await manager.interrupt(locator)
+          recordFreshAgentObservabilityEvent({
+            kind: 'fresh_agent_interrupt',
+            ...this.freshAgentIdentityFields(locator),
+            outcome: 'ok',
+          })
         } catch (error) {
+          recordFreshAgentObservabilityEvent({
+            kind: 'fresh_agent_interrupt',
+            ...this.freshAgentIdentityFields(locator),
+            outcome: 'failed',
+            errorCode: this.freshAgentErrorCode(error),
+          })
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: errorMessage(error) })
         }
         return

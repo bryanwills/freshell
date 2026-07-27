@@ -419,7 +419,7 @@ export async function getFreshAgentThreadSnapshot(
   sessionType: string,
   provider: string,
   threadId: string,
-  query: { revision?: number; cwd?: string; signal?: AbortSignal } = {},
+  query: { revision?: number; cwd?: string; trigger?: string; signal?: AbortSignal } = {},
   options: ApiRequestOptions = {},
 ): Promise<any> {
   const signal = query.signal ?? options.signal
@@ -427,6 +427,7 @@ export async function getFreshAgentThreadSnapshot(
     `/api/fresh-agent/threads/${encodeURIComponent(sessionType)}/${encodeURIComponent(provider)}/${encodeURIComponent(threadId)}${buildQueryString([
       ['revision', query.revision],
       ['cwd', query.cwd],
+      ['trigger', query.trigger],
     ])}`,
     { ...options, signal },
   )

@@ -96,7 +96,40 @@ export function createFreshAgentRouter(deps: {
     }
   }
 
-  function sendFreshAgentError(res: any, error: unknown, options?: { sessionId?: string }) {
+  type SnapshotFailureContext = {
+    sessionType: string
+    provider: string
+    threadId: string
+    startedAt: number
+    trigger?: string
+    cwd?: string
+  }
+
+  function sendFreshAgentError(
+    res: any,
+    error: unknown,
+    options?: { sessionId?: string; snapshot?: SnapshotFailureContext },
+  ) {
+    const result = writeFreshAgentError(res, error, options)
+    const snapshot = options?.snapshot
+    if (snapshot) {
+      const code = (error as { code?: unknown } | null | undefined)?.code
+      recordFreshAgentObservabilityEvent({
+        kind: 'fresh_agent_snapshot_failed',
+        sessionType: snapshot.sessionType,
+        provider: snapshot.provider,
+        threadIdHash: hashForLogs(snapshot.threadId),
+        httpStatus: res.statusCode,
+        ...(typeof code === 'string' && code.length > 0 ? { code } : {}),
+        durationMs: Date.now() - snapshot.startedAt,
+        ...(snapshot.trigger ? { trigger: snapshot.trigger } : {}),
+        ...(snapshot.cwd ? { cwdHash: hashForLogs(snapshot.cwd) } : {}),
+      })
+    }
+    return result
+  }
+
+  function writeFreshAgentError(res: any, error: unknown, options?: { sessionId?: string }) {
     if (error instanceof ClaudeFreshAgentStaleHistoryRevisionError) {
       return res.status(409).json({
         error: 'Stale restore revision',
@@ -172,10 +205,12 @@ export function createFreshAgentRouter(deps: {
       priority: ReadModelPrioritySchema.optional(),
       revision: z.coerce.number().int().nonnegative().optional(),
       cwd: z.string().trim().min(1).optional(),
+      trigger: z.string().max(32).optional(),
     }).safeParse({
       priority: typeof req.query.priority === 'string' ? req.query.priority : undefined,
       revision: typeof req.query.revision === 'string' ? req.query.revision : undefined,
       cwd: typeof req.query.cwd === 'string' ? req.query.cwd : undefined,
+      trigger: typeof req.query.trigger === 'string' ? req.query.trigger : undefined,
     })
 
     if (!params.success || !query.success) {
@@ -221,10 +256,21 @@ export function createFreshAgentRouter(deps: {
         ...(latestTurnId ? { lastTurnIdHash: hashForLogs(latestTurnId) } : {}),
         ...(revision !== undefined ? { revision } : {}),
         ...(query.data.cwd ? { cwdHash: hashForLogs(query.data.cwd) } : {}),
+        ...(query.data.trigger ? { trigger: query.data.trigger } : {}),
       })
     } catch (error) {
       if (signal.aborted || isReadModelAbortError(error)) return
-      return sendFreshAgentError(res, error, { sessionId: params.data.threadId })
+      return sendFreshAgentError(res, error, {
+        sessionId: params.data.threadId,
+        snapshot: {
+          sessionType: params.data.sessionType,
+          provider: params.data.provider,
+          threadId: params.data.threadId,
+          startedAt: snapshotStart,
+          ...(query.data.trigger ? { trigger: query.data.trigger } : {}),
+          ...(query.data.cwd ? { cwd: query.data.cwd } : {}),
+        },
+      })
     }
   })
 

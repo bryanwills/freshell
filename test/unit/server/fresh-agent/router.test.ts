@@ -14,7 +14,11 @@ vi.mock('../../../../server/fresh-agent/observability.js', async (importOriginal
 import { createCodexFreshAgentAdapter } from '../../../../server/fresh-agent/adapters/codex/adapter.js'
 import { FreshAgentProviderRegistry } from '../../../../server/fresh-agent/provider-registry.js'
 import { createFreshAgentRouter } from '../../../../server/fresh-agent/router.js'
-import { FreshAgentRuntimeManager, FreshAgentStaleThreadRevisionError } from '../../../../server/fresh-agent/runtime-manager.js'
+import {
+  FreshAgentLostSessionError,
+  FreshAgentRuntimeManager,
+  FreshAgentStaleThreadRevisionError,
+} from '../../../../server/fresh-agent/runtime-manager.js'
 
 function makeCodexThread(id: string, turns: unknown[] = []) {
   return {
@@ -332,5 +336,55 @@ describe('fresh-agent router: snapshot served observability', () => {
     expect(events).toHaveLength(1)
     expect(events[0].cwdHash).toBeDefined()
     expect(JSON.stringify(events[0])).not.toContain('/repo/work')
+  })
+
+  it('threads the trigger query param into fresh_agent_snapshot_served', async () => {
+    observabilityMocks.recordFreshAgentObservabilityEvent.mockClear()
+    const manager = {
+      getSnapshot: vi.fn().mockResolvedValue({
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        threadId: 'ses_1',
+        revision: 1,
+        status: 'idle',
+        turns: [],
+      }),
+    } as unknown as FreshAgentRuntimeManager
+
+    const app = express()
+    app.use('/api', createFreshAgentRouter({ runtimeManager: manager }))
+
+    await request(app).get('/api/fresh-agent/threads/freshopencode/opencode/ses_1?trigger=poll').expect(200)
+
+    expect(observabilityMocks.recordFreshAgentObservabilityEvent).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'fresh_agent_snapshot_served', trigger: 'poll',
+    }))
+  })
+
+  it('emits fresh_agent_snapshot_failed with the mapped status on errors', async () => {
+    observabilityMocks.recordFreshAgentObservabilityEvent.mockClear()
+    const manager = {
+      getSnapshot: vi.fn().mockRejectedValue(new FreshAgentLostSessionError('gone')),
+    } as unknown as FreshAgentRuntimeManager
+
+    const app = express()
+    app.use('/api', createFreshAgentRouter({ runtimeManager: manager }))
+
+    await request(app).get('/api/fresh-agent/threads/freshopencode/opencode/ses_gone?trigger=event').expect(404)
+
+    expect(observabilityMocks.recordFreshAgentObservabilityEvent).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'fresh_agent_snapshot_failed',
+      httpStatus: 404,
+      trigger: 'event',
+      code: 'FRESH_AGENT_LOST_SESSION',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      durationMs: expect.any(Number),
+    }))
+    const failed = observabilityMocks.recordFreshAgentObservabilityEvent.mock.calls
+      .map(([event]) => event as Record<string, unknown>)
+      .find((event) => event.kind === 'fresh_agent_snapshot_failed')
+    expect(failed).toBeDefined()
+    expect(JSON.stringify(failed)).not.toContain('ses_gone')
   })
 })

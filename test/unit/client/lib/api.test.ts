@@ -286,6 +286,17 @@ describe('visible-first read-model helpers', () => {
     )
   })
 
+  it('appends the snapshot trigger to the fresh-agent snapshot query when provided', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson(codexContractSnapshot))
+
+    await getFreshAgentThreadSnapshot('freshcodex', 'codex', 'thread-1', { revision: 7, trigger: 'poll' })
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/api/fresh-agent/threads/freshcodex/codex/thread-1?revision=7&trigger=poll',
+      expect.objectContaining({ headers: expect.any(Headers) }),
+    )
+  })
+
   it('rejects thread-turn requests that omit the pinned restore revision', async () => {
     await expect(getFreshAgentThreadTurns('session-1', { priority: 'visible' }, { signal: new AbortController().signal }))
       .rejects
