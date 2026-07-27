@@ -217,7 +217,7 @@ export function resetSnapshotSchedulerForTests(): void
 **Semantics (implement exactly):**
 - Debounce: triggers `event`, `send-accepted`, `reveal`, `reconnect` wait `SNAPSHOT_DEBOUNCE_MS = 250` before running (a burst within the window coalesces into one run and all callers share that run's outcome). Triggers `identity`, `manual`, `materialized`, `poll`, `idle-incomplete` run immediately (debounce 0).
 - Single-flight: at most one in-flight `run()` per key. Calls arriving mid-flight coalesce into **one** trailing run scheduled after the in-flight completes (+debounce); they all share the trailing run's promise. A caller absorbed by an already-pending debounce timer resolves with the shared run's outcome (not `'coalesced'`); `'coalesced'` is returned only when a trailing run is already fully subscribed and this call adds nothing new (keep it simple: everyone sharing a pending run gets that run's outcome; `'coalesced'` is unused in practice but kept in the type for the trailing-overflow case where a trailing run is already queued).
-- 429 backoff: when `run()` rejects with `ApiError` status 429, set `backoffUntil = now + (retryAfterMs ?? nextExponential)` where `nextExponential` doubles from `1000` ms capped at `30_000` ms per consecutive 429 on that key; resolve all sharers with `{ status: 'rate-limited', retryAtMs }`. While backoff is active, `schedule()` resolves immediately `{ status: 'backoff', retryAtMs }` with **no network call**. A successful run resets the exponential counter and clears backoff.
+- 429 backoff: when `run()` rejects with `ApiError` status 429, set `backoffUntil = now + (retryAfterMs ?? nextExponential)` where `nextExponential` doubles from `1000` ms capped at `30_000` ms per consecutive 429 on that key; resolve ALL sharers with `{ status: 'rate-limited', retryAtMs }` — **including callers that arrived mid-flight and were queued for the trailing run**: a 429 cancels the trailing run and resolves that queued cohort with the same rate-limited outcome (no promise may be left pending — a stranded promise means a pane whose refresh coalesced behind the rate-limited run never gets an outcome). While backoff is active, `schedule()` resolves immediately `{ status: 'backoff', retryAtMs }` with **no network call**. A successful run resets the exponential counter and clears backoff.
 - Other rejections resolve `{ status: 'error', error }` (never throw out of `schedule`).
 - **Run-closure contract (validated, A2):** the scheduler may execute a `run` closure long after the caller's React effect cleaned up (debounce/trailing), and one caller's closure runs on behalf of ALL sharers of the key. Callers therefore must NOT bind caller-scoped AbortControllers/signals into `run` — an owner abort mid-flight (or a debounced run firing an already-aborted signal) would resolve `{ status: 'error', AbortError }` to every sharer, which the component layer swallows, silently dropping the refresh for panes that are still alive. Task 3 passes no signal; staleness is handled by result-application guards, not cancellation.
 - **Key note:** the `cwd` component of the key must be the caller's RESOLVED route cwd (Task 3 resolves it once and uses the same value for both the key and the request), so sibling panes on one session converge to one key.
@@ -311,6 +311,20 @@ describe('FreshAgentSnapshotScheduler', () => {
     const after = await scheduler.schedule(KEY, 'poll', ok)
     expect(after).toEqual({ status: 'ok', value: 'fresh' })
     expect(scheduler.getBackoffUntil(KEY)).toBeNull()
+  })
+
+  it('resolves mid-flight sharers with rate-limited on a 429 instead of stranding their promises', async () => {
+    const scheduler = getSnapshotScheduler()
+    let reject!: (e: unknown) => void
+    const gated = new Promise<never>((_, r) => { reject = r })
+    const run = vi.fn(() => gated)
+    const first = scheduler.schedule(KEY, 'manual', run)
+    const midFlight = scheduler.schedule(KEY, 'event', run)   // arrives while in flight -> queued for the trailing run
+    reject(new ApiError(429, 'Too many requests', undefined, 5_000))
+    const [o1, o2] = await Promise.all([first, midFlight])    // BOTH must settle
+    expect(o1.status).toBe('rate-limited')
+    expect(o2.status).toBe('rate-limited')
+    expect(run).toHaveBeenCalledTimes(1)                      // the trailing run is cancelled: no second network call
   })
 
   it('falls back to exponential backoff when Retry-After is absent and doubles per consecutive 429', async () => {
@@ -461,9 +475,15 @@ export class FreshAgentSnapshotScheduler {
         const fallback = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** (s.consecutive429 - 1))
         const retryAtMs = Date.now() + (error.retryAfterMs ?? fallback)
         s.backoffUntil = retryAtMs
-        // A 429 supersedes any trailing request: suppress until expiry.
-        s.trailingRequested = false
         outcome = { status: 'rate-limited', retryAtMs }
+        // A 429 supersedes any trailing request: cancel it AND resolve the
+        // mid-flight cohort queued behind this run with the same rate-limited
+        // outcome — their promises must never be left pending.
+        s.trailingRequested = false
+        const trailing = s.pendingResolvers
+        s.pendingResolvers = []
+        s.pendingRun = null
+        for (const resolve of trailing) resolve(outcome)
       } else {
         outcome = { status: 'error', error }
       }
@@ -1549,15 +1569,17 @@ git commit -m "fix(server,shared): preserve FRESH_AGENT_LOST_SESSION over WS (sh
 
 With Task 9, a lost-session send failure reaches the client as `code: 'FRESH_AGENT_LOST_SESSION'` (there is deliberately no server-side retry — see Task 9's coverage restatement; this client path is the kata's "attach/recover and retry once" for the incident's no-cwd locators). The client knows the route cwd (`freshOpenCodeRouteCwd`, `FreshAgentView.tsx:613-615` via `src/lib/fresh-opencode-route.ts`) even when the original send omitted it. On this code, re-issue `freshAgent.attach` with the route cwd, then resend the message exactly once.
 
-**Resend source (corrected by validation, A10):** `PendingSendMetadata` (`FreshAgentView.tsx:102-108`) is `{ cwd?, checkpointId?, submittedTurnId?, legacyAccepted?, metadataUpdateStarted? }` — it does **NOT** retain the message text. Retain the original send payload explicitly: add `text: string` to `PendingSendMetadata`, populated at the composer-submit site where the entry is created (the same place the `freshAgent.send` frame is built, so the retained text is byte-identical to what was sent). **Ordering constraint:** the lost-session retry branch must run BEFORE the generic send-error handling that clears the pane's local echo / pending metadata — if the generic path runs first, both the metadata entry and the visible echo are gone and there is nothing to resend.
+**Resend source (corrected by validation, A10):** `PendingSendMetadata` (`FreshAgentView.tsx:102-108`) is `{ cwd?, checkpointId?, submittedTurnId?, legacyAccepted?, metadataUpdateStarted? }` — it does **NOT** retain the message text. Retain the original send payload explicitly: add `text: string` to `PendingSendMetadata`, populated in `sendUserText` (`:1942-2009`) where `recordPendingSendMetadata(requestId, {})` is called (`:1947`) and the `freshAgent.send` frame is built (`:1984-1999`), so the retained text is byte-identical to what was sent.
+
+**Error-frame reality (corrected by fresh-eyes review — the prior premise was false):** FreshAgentView's `ws.onMessage` handler (`:1404`) has **NO branch for `type: 'error'` frames today** — it handles only `pane.reconcile.result`, `freshAgent.created`, `freshAgent.create.failed`, `freshAgent.session.materialized`, `freshAgent.event`, `freshAgent.send.accepted`, and `freshAgent.forked`. There is no existing send-failure path and no echo-clearing-on-error code: a failed send currently leaves `pendingLocalEcho` rendered forever, leaks its `pendingSendMetadataRef` entry, and (opencode) pins the pane's optimistic `running` status (`shouldClearStaleLocalEcho` `:147` requires `accepted`, which only `send.accepted` sets). The server reports a send failure via `this.sendError(...)` in the `freshAgent.send` catch (`server/ws-handler.ts:3554-3556`) with wire shape `{ type: 'error', code, message, requestId, timestamp }` (`ErrorMessage`, `shared/ws-protocol.ts:707-719`); `requestId` is the ONLY correlation handle (no sessionId/paneId on the frame), and `freshAgent.send` is the only fresh-agent path that threads it. Task 9 makes that code `FRESH_AGENT_LOST_SESSION` for lost sessions. This task therefore ADDS the `type: 'error'` branch to the handler; frames whose `requestId` matches a `pendingSendMetadataRef` entry are owned send failures — the lost-session retry check runs first, and every other owned failure (including a retried request failing again) takes the NEW cleanup fall-through this task introduces (clear the pending-metadata entry + stale local echo + optimistic `running`). Error frames with no matching `requestId` are left to any generic handling and are out of scope here.
 
 **Files:**
-- Modify: `src/components/fresh-agent/FreshAgentView.tsx` (`PendingSendMetadata` type `:102-108` + its composer-submit writer; WS error handling for sends — locate the existing handler for send failures: search the file for `INTERNAL_ERROR` or the `sendError`-frame consumption path used to clear local echo on failure)
+- Modify: `src/components/fresh-agent/FreshAgentView.tsx` (`PendingSendMetadata` type `:102-108` + its `sendUserText` writer `:1947`; NEW `type: 'error'` branch in the `ws.onMessage` handler `:1404`)
 - Test: `test/unit/client/components/fresh-agent/FreshAgentView.test.tsx`
 
 **Interfaces:**
-- Consumes: `wsMock.send` scaffold; `freshOpenCodeRouteCwdRef`; `pendingSendMetadataRef` — extended by this task with the retained `text`.
-- Produces: `PendingSendMetadata` gains `text: string`; one retry per failed requestId, tracked in `lostSessionRetryRef: useRef<Set<string>>` (requestIds already retried — never retried twice); the retry branch is evaluated before (and, when it fires, instead of) the echo-clearing error fall-through.
+- Consumes: `wsMock.send` scaffold; `freshOpenCodeRouteCwdRef`; `pendingSendMetadataRef` — extended by this task with the retained `text`; `ErrorMessage` frame shape from `shared/ws-protocol.ts:707-719`.
+- Produces: `PendingSendMetadata` gains `text: string`; a NEW `type: 'error'` branch for owned send requestIds; one retry per failed requestId, tracked in `lostSessionRetryRef: useRef<Set<string>>` (requestIds already retried — never retried twice); the retry check is evaluated before (and, when it fires, instead of) the cleanup fall-through this task adds.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1589,7 +1611,7 @@ it('re-attaches with the route cwd and resends once when a send fails with FRESH
 })
 ```
 
-Check how error frames reach the component today (the `wsHandler` capture receives all frames; if send errors arrive with a different shape — e.g. `{ type: 'freshAgent.send.failed' }` or a generic `{ type: 'error' }` — mirror the real shape emitted by `this.sendError` in `ws-handler.ts`, which the existing tests for send failure already model; copy from them).
+No existing test injects a `type: 'error'` frame into a fresh-agent view test (verified — write these fresh, do not look for a precedent to copy). The harness's captured `wsMock.onMessage` handler (`FreshAgentView.test.tsx:20-38` idiom: capture `wsMock.onMessage.mock.calls[0][0]` post-render, or `onMessage.mockImplementation((h) => { captured = h })` pre-render) accepts arbitrary frames; inject the real `ErrorMessage` shape from `shared/ws-protocol.ts:707-719` — `{ type: 'error', code, message, requestId, timestamp }` (add `timestamp: Date.now()` to the frames in the test above; the component branch must key off `type`/`code`/`requestId` only).
 
 - [ ] **Step 2: Run to verify it fails**
 
@@ -1598,9 +1620,9 @@ Expected: FAIL — no attach, no resend.
 
 - [ ] **Step 3: Implement** in `FreshAgentView.tsx`:
 
-1. Extend `PendingSendMetadata` (`:102-108`) with `text: string`, and populate it at the composer-submit site where the metadata entry for the requestId is created (the same code that builds the `freshAgent.send` frame — retain exactly the text that went into the frame). This is the retained resend payload; do NOT read it from the local echo after the fact (the echo is cleared by error paths).
+1. Extend `PendingSendMetadata` (`:102-108`) with `text: string`, and populate it in `sendUserText` where the metadata entry for the requestId is created (`recordPendingSendMetadata(requestId, {...})`, `:1947` — the same code that builds the `freshAgent.send` frame, `:1984-1999`; retain exactly the text that went into the frame). This is the retained resend payload; do NOT read it from the local echo after the fact.
 
-2. In the WS error-frame handling for owned send requests, add the retry branch **as the FIRST thing the send-failure path evaluates — before the existing handling that clears the local echo / pending metadata and shows the error** (if the clearing runs first, the payload is gone):
+2. Add a NEW `type: 'error'` branch to the `ws.onMessage` handler (`:1404`) — remember, no such branch exists today. It applies only to frames whose `requestId` matches a `pendingSendMetadataRef` entry (owned send failures). The retry check is the FIRST thing the branch evaluates; everything else falls through to the cleanup added in item 4:
 
 ```ts
 if (errorCode === 'FRESH_AGENT_LOST_SESSION'
@@ -1615,13 +1637,13 @@ if (errorCode === 'FRESH_AGENT_LOST_SESSION'
     ws.send(JSON.stringify({
       type: 'freshAgent.attach', sessionId, sessionType: 'freshopencode', provider: 'opencode', cwd,
     }))
-    const retryRequestId = createRequestId()      // the file's existing id generator
+    const retryRequestId = nanoid()               // the file's existing id generator (:1945)
     lostSessionRetryRef.current.add(retryRequestId)   // the retry itself is never retried
     resendPendingMessage(retryRequestId, pendingMeta.text, cwd)   // re-issue freshAgent.send with the retained text + cwd
     return   // do NOT fall through: the echo stays visible while the retry is in flight
   }
 }
-// fall through to the existing error handling (clear echo, show error)
+// fall through to the cleanup this task adds in item 4 (clear pending metadata + stale echo)
 ```
 
 The `startsWith('ses_')` guard keeps genuinely-invalid placeholder/non-durable lost-session errors on the normal error path (the server no longer filters these — Task 9).
@@ -2250,6 +2272,12 @@ async function awaitTranscriptSettled(state: OpencodeSessionState, sentAtMs: num
 
 Settled means: `listMessages` (limit e.g. 20, newest page) contains an assistant message with `info.time.created >= sentAtMs - CLOCK_SKEW_MS` (use `CLOCK_SKEW_MS = 5_000`) AND a finite `info.time.completed`. Poll with `TRANSCRIPT_SETTLE_POLL_MS` sleeps between attempts; inject the sleep fn for tests (`options.sleep`, default `(ms) => new Promise(r => setTimeout(r, ms))`). (Pagination contract verified live on opencode v1.18.6, V2: `?limit=N` returns exactly the N newest messages in ascending chronological order — last element is the latest; limit-only paging is all this plan uses, so the newest-page premise holds.)
 
+**Suite-wide impact (corrected by fresh-eyes review — this task retro-touches Task 8's tests and the shared harness):** the settle loop runs on BOTH the send path and Task 8's monitor-resolve path, and the harness's `makeFakeManager` default `listMessages` fixture (`{ messages: [], nextCursor: null }`) never settles. Without harness changes, every pre-existing send-path test and Task 8's monitor tests would burn 10 polls x a REAL 150 ms sleep (~1.35 s each) before idle is emitted, breaking Task 8's single-`setImmediate` assertions and Step 4's full-suite gate. Step 3 therefore MUST include these test-harness changes (they land in the same commit):
+
+1. In the test suite's `makeAdapter` helper, default the adapter's injected `settleSleep` to a no-op (`async () => {}`) for ALL tests (merge it into the options it forwards; explicit per-test options still win). The PRODUCTION default stays the real `setTimeout` sleep — only the harness default changes.
+2. With a no-op sleep, legacy tests using the never-settling default fixture exhaust the 10-poll budget in pure microtasks and still emit idle in the same order — their `await new Promise((r) => setImmediate(r))` flushes drain the whole settle loop before the assertion runs (microtasks complete before the macrotask fires), so Task 8's monitor tests and the pre-existing send tests keep passing without per-test edits. If any test asserts an exact `listMessages` call count, adjust it for the settle polls (up to 10 extra calls per completed turn); inspect the first failing run's actual counts and keep ORDER assertions as the real contract.
+3. If a Task 8 monitor-resolve assertion still races despite the no-op sleep (e.g. an environment where the flush is insufficient), replace that test's single `setImmediate` with `await vi.waitFor(() => expect(events.some(...)).toBe(true))` rather than reintroducing real sleeps.
+
 In `materializeOrSend`, capture `const sentAtMs = Date.now()` just before `promptAsyncForState` (`:363`), then after `await idle` (`:368`) insert `await awaitTranscriptSettled(state, sentAtMs)` BEFORE `emitStatus(state, 'idle')` (`:371`) and the chime (`:377-381`). Also call it (with `sentAtMs = 0`, i.e. "any completed assistant message") in Task 8's monitor resolve path before its `emitStatus(state, 'idle')`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -2300,9 +2328,9 @@ describe('idle freshness (zrrj)', () => {
 
 - [ ] **Step 2: Run to verify fail** — idle is emitted immediately today; `listMessages` not polled.
 
-- [ ] **Step 3: Implement** `awaitTranscriptSettled` + the two call sites; thread `settleSleep` through adapter options (default real sleep). On `false` (exhausted), also emit an observability row: `recordFreshAgentObservabilityEvent({ kind: 'fresh_agent_monitor', provider: 'opencode', sessionIdHash, phase: 'timeout', ... })` is the wrong kind — instead log `log.warn({...}, 'transcript did not settle after idle')`.
+- [ ] **Step 3: Implement** `awaitTranscriptSettled` + the two call sites; thread `settleSleep` through adapter options (PRODUCTION default: real sleep). On `false` (exhausted), also emit an observability row: `recordFreshAgentObservabilityEvent({ kind: 'fresh_agent_monitor', provider: 'opencode', sessionIdHash, phase: 'timeout', ... })` is the wrong kind — instead log `log.warn({...}, 'transcript did not settle after idle')`. In the SAME change, apply the harness updates from the "Suite-wide impact" note above: default `settleSleep` to a no-op inside the test suite's `makeAdapter` helper, and adjust any pre-existing exact `listMessages` call-count assertions.
 
-- [ ] **Step 4: Run to verify pass** — full adapter suite.
+- [ ] **Step 4: Run to verify pass** — full adapter suite (`npm run test:vitest -- --run test/unit/server/fresh-agent/opencode-serve-adapter.test.ts`). The legacy tests and Task 8's monitor tests stay green and fast because the harness `settleSleep` is a no-op (see the Suite-wide impact note); if any fail, fix per that note's items 2-3 — do NOT loosen the new order assertions.
 
 - [ ] **Step 5: Commit**
 
