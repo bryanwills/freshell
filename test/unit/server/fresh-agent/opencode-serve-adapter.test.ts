@@ -1321,6 +1321,30 @@ describe('restore reconciliation emits and monitors (zrrj)', () => {
     expect(completions).toHaveLength(1)
   })
 
+  it('disarms a cold monitor when a compact starts (no double idle/chime)', async () => {
+    const manager = makeFakeManager()
+    manager.getSessionStatus = vi.fn(async () => ({ type: 'busy' }))
+    const monitorIdle = createDeferred<void>()
+    manager.onceIdle = vi.fn()
+      .mockReturnValueOnce(monitorIdle.promise) // the cold monitor's waiter
+      .mockResolvedValue(undefined) // the compact path's own waiter
+    const adapter = makeAdapter(manager)
+    await adapter.attach!({ sessionId: 'ses_live', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' })
+    expect(manager.onceIdle).toHaveBeenCalledTimes(1)
+    const events: any[] = []
+    adapter.subscribe?.('ses_live', (ev) => events.push(ev))
+
+    await adapter.compact?.('ses_live')
+    // The cancelled monitor resolving later must not add a second idle/chime for this turn.
+    monitorIdle.resolve()
+    await new Promise((r) => setImmediate(r))
+
+    const idles = events.filter((e) => e.type === 'sdk.session.snapshot' && e.status === 'idle')
+    const completions = events.filter((e) => e.type === 'sdk.turn.complete')
+    expect(idles).toHaveLength(1)
+    expect(completions).toHaveLength(1)
+  })
+
   it('does not arm a monitor when an attach reconciles busy during an in-flight send (no double idle/chime)', async () => {
     const sendIdle = createDeferred<void>()
     const manager = makeFakeManager()

@@ -365,24 +365,36 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
     state.turnAborted = false
     state.turnErrored = false
     emitStatus(state, 'running')
-    const idle = route
-      ? serveManager.onceIdle(realId, turnTimeoutMs, route)
-      : serveManager.onceIdle(realId, turnTimeoutMs)
-    void idle.catch(() => {})
+    // The compact turn owns its idle (same mechanic as materializeOrSend): cancel any
+    // still-pending restore idle-recovery monitor (it would otherwise resolve on THIS
+    // turn's idle and double-emit idle/chime), and flag the turn so armIdleRecovery
+    // cannot arm a second waiter while we are parked on our own onceIdle.
+    disarmIdleRecovery(realId)
+    sendsInFlight.add(realId)
     try {
-      if (route) await serveManager.compact(realId, input, route)
-      else if (input) await serveManager.compact(realId, input)
-      else await serveManager.compact(realId)
-      await idle
-      emitStatus(state, 'idle')
-      if (!state.turnAborted && !state.turnErrored) {
-        const completionAt = nextMonotonicTurnCompleteAt(state.lastTurnCompleteAt, Date.now())
-        state.lastTurnCompleteAt = completionAt
-        state.events.emit('event', { type: 'sdk.turn.complete', sessionId: state.placeholderId, at: completionAt })
+      const idle = route
+        ? serveManager.onceIdle(realId, turnTimeoutMs, route)
+        : serveManager.onceIdle(realId, turnTimeoutMs)
+      void idle.catch(() => {})
+      try {
+        if (route) await serveManager.compact(realId, input, route)
+        else if (input) await serveManager.compact(realId, input)
+        else await serveManager.compact(realId)
+        await idle
+        emitStatus(state, 'idle')
+        if (!state.turnAborted && !state.turnErrored) {
+          const completionAt = nextMonotonicTurnCompleteAt(state.lastTurnCompleteAt, Date.now())
+          state.lastTurnCompleteAt = completionAt
+          state.events.emit('event', { type: 'sdk.turn.complete', sessionId: state.placeholderId, at: completionAt })
+        }
+      } catch (error) {
+        emitStatus(state, 'idle')
+        throw error
       }
-    } catch (error) {
-      emitStatus(state, 'idle')
-      throw error
+    } finally {
+      // The compact's turn has settled either way; a later restore/attach may arm a
+      // monitor again.
+      sendsInFlight.delete(realId)
     }
   }
 

@@ -174,6 +174,24 @@ describe('agent-api fresh-agent: send-keys', () => {
     expect(attach).toHaveBeenCalledWith({ sessionId: 'ses_real_1', sessionType: 'freshopencode', provider: 'opencode' })
     expect(send).toHaveBeenCalledTimes(2)
   })
+
+  it('detects the lost session by its code, not its name (wrapped/subclassed errors still retry)', async () => {
+    // FreshAgentLostSessionError guarantees code = 'FRESH_AGENT_LOST_SESSION'; a subclass or
+    // wrapper may carry a different name but must still trigger the attach-and-retry path.
+    const wrapped = Object.assign(new Error('not tracked'), { code: 'FRESH_AGENT_LOST_SESSION' })
+    wrapped.name = 'WrappedLostSessionError'
+    const send = vi.fn().mockRejectedValueOnce(wrapped).mockResolvedValueOnce({ sessionId: 'ses_real_1' })
+    const attach = vi.fn(async () => ({ sessionId: 'ses_real_1' }))
+    const { app } = makeApp({ freshAgentRuntimeManager: {
+      create: vi.fn(async () => ({ sessionId: 'ses_real_1', sessionType: 'freshopencode', runtimeProvider: 'opencode' })),
+      send, attach,       getSnapshot: vi.fn(async () => ({ status: 'idle', turns: [] })),
+    } })
+    const created = await request(app).post('/api/tabs').send({ agent: 'opencode' })
+    const res = await request(app).post(`/api/panes/${created.body.data.paneId}/send-keys`).send({ data: 'hi' })
+    expect(res.status).toBe(200)
+    expect(attach).toHaveBeenCalledWith({ sessionId: 'ses_real_1', sessionType: 'freshopencode', provider: 'opencode' })
+    expect(send).toHaveBeenCalledTimes(2)
+  })
 })
 
 describe('agent-api fresh-agent: capture', () => {

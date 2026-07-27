@@ -1699,7 +1699,7 @@ export function createAgentApiRouter({
         try {
           result = await runSend()
         } catch (err: any) {
-          if (err?.name === 'FreshAgentLostSessionError' && freshAgentRuntimeManager.attach) {
+          if (err?.code === 'FRESH_AGENT_LOST_SESSION' && freshAgentRuntimeManager.attach) {
             await freshAgentRuntimeManager.attach(locator)
             result = await runSend()
           } else {
