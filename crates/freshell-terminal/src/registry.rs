@@ -2121,6 +2121,7 @@ impl TerminalRegistry {
     /// if any. Two arms, exactly the WS guard's join (see commit d9b71f50):
     /// 1. identity arm: the injected identity store's owner, probed Running;
     /// 2. row arm: any directory row with this mode + resume_session_id, Running.
+    ///
     /// `identity: None` (e.g. the seam is unwired) narrows to the row arm.
     pub fn live_session_owner(
         &self,
@@ -4422,8 +4423,14 @@ mod tests {
             "row arm: Running row with matching mode+resume_session_id is a live owner"
         );
         // Wrong mode / unknown session: no owner.
-        assert_eq!(registry.live_session_owner(None, "codex", "sess-live"), None);
-        assert_eq!(registry.live_session_owner(None, "claude", "sess-other"), None);
+        assert_eq!(
+            registry.live_session_owner(None, "codex", "sess-live"),
+            None
+        );
+        assert_eq!(
+            registry.live_session_owner(None, "claude", "sess-other"),
+            None
+        );
 
         registry.kill("t-row-owner");
     }
