@@ -242,10 +242,15 @@ function findFreshAgentLeaf(node: any): any {
   return null
 }
 
+// Durable identity reader: sessionRef IS the durable identity per the
+// 2026-04-19 durable-session contract; content.sessionId is a live handle
+// (for claude, the create-time fc-e2e-* placeholder forever -- see
+// freshclaude-restart-parity-rust.spec.ts:140-148). sessionRef-first keeps
+// this reader reload-symmetric for every fresh-agent provider.
 function leafDurableIdentity(leaf: any): string | undefined {
   return (
-    leaf?.content?.sessionId ??
     leaf?.content?.sessionRef?.sessionId ??
+    leaf?.content?.sessionId ??
     leaf?.content?.resumeSessionId
   )
 }
@@ -1157,26 +1162,20 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     e2eServerKind,
   }) => {
     expect(e2eServerKind).toBe('rust')
-    // EXPECTED-FAIL WALL PIN -- P0.2 (§2.8), PARTIALLY LANDED by
-    // feat/freshclaude-restart-parity: the attach-resume arm + claude snapshot
-    // adapter shipped, so post-reload the HISTORY leg passes ('Fixture claude
-    // turn' renders from the REST snapshot) and the STATUS leg passes (not
-    // 'error'/'creating') -- probed 2026-07-25 with the identity leg
-    // neutralized: green in one run. The IDENTITY leg still fails, and the
-    // blocker is the CLIENT persistence gap this pin has always named:
-    // persistMiddleware strips content.sessionId (src/store/
-    // persistMiddleware.ts:245-266), so after reload the pane re-CREATEs
-    // (resumeSessionId carries the durable UUID -- the conversation itself
-    // resumes) and receives a NEW create-time sidecar id; observed
-    // pre-kill fc-e2e-84069-1785038517244 vs post-reload
-    // fc-e2e-88780-1785038519518, so leafDurableIdentity's first arm
-    // (content.sessionId) can never match across reload until the client
-    // persists it. FLIP when claude pane identity survives reload
-    // (client-side persistMiddleware work -- out of this branch's fence).
-    test.fail(
-      e2eServerKind === 'rust',
-      'EXPECTED-FAIL WALL PIN (narrowed 2026-07-26 by reconcile-completion): pre-kill content.sessionId is the sidecar-minted placeholder, not the durable ref; the SIGKILL flow yields a respawn verdict which mints a new placeholder -- closing requires claude created/create to expose the durable id as the primary handle (not in C2 scope).',
-    )
+    // HISTORY: the P0.2 pin was FLIPPED 2026-07-27 by lane D4
+    // (freshclaude-identity-persistence). Investigation showed the durable
+    // identity ALREADY survives reload: FreshAgentView's merge effect folds
+    // the canonical claude cliSessionId into content.sessionRef +
+    // resumeSessionId (FreshAgentView.tsx mergePaneContent effect), and
+    // persistMiddleware round-trips sessionRef -- the 2026-04-19
+    // durable-session contract's designated durable identity -- while the
+    // live placeholder in content.sessionId stays unpersisted. This leg was
+    // red only because leafDurableIdentity read content.sessionId (the
+    // fc-e2e-* live handle, legitimately different across reloads) FIRST;
+    // the reader is sessionRef-first accordingly. The stale-claim hazard
+    // that motivated the original strip is pinned by
+    // specs/freshclaude-identity-persistence-rust.spec.ts (dead_session,
+    // never silent).
 
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-freshclaude-'))
     const projectDir = path.join(sharedRoot, 'project')
