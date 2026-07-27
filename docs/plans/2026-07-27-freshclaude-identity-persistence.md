@@ -207,7 +207,7 @@ git commit -m "test(client): pin freshclaude durable sessionRef persist round-tr
 - Modify: `test/e2e-browser/playwright.config.ts` — add `/freshclaude-identity-persistence-rust\.spec\.ts$/` to `RUST_ONLY_SPECS` (~`:89`) AND to the `rust-chromium` project's `testMatch` (~`:265`)
 
 **Interfaces:**
-- Consumes: `RustServer` (`test/e2e-browser/helpers/rust-server.ts:272` — `.start()`, `.restartAbrupt()` `:344`, `.stop()`, `info.homeDir`); `TestHarness` (`helpers/test-harness.ts` — `getState()`, `getPaneLayout(tabId)`, `getActiveTabId()`, `getSentWsMessages()`, `clearSentWsMessages()`); spec-local helper bodies COPIED (per this suite's per-spec-ownership convention, wall spec file doc `:47-51`) from `restore-contract-wall-rust.spec.ts`: `seedWallConfig` (`:131`), `bootWall` (`:156`), `flushPersistence` (`:118`), `reloadAndReconnect` (`:124`), `waitForWsReady` (`:108`), `findFreshAgentLeaf` (`:233`), `createFreshclaudePane` (`:436` — **returns `Promise<void>`; it does NOT return a tab id**), `sendFreshAgentTurn` (`:371`); IMPORTED (not copied): `openPanePicker` from `helpers/pane-picker.ts` (the copied `createFreshclaudePane` body calls it -- wall imports it at `:29`) and `fileURLToPath` from `node:url` (feeds the copied `FAKE_CLAUDE_SIDECAR_SOURCE` constant, wall `:34,:39`); `Page` type comes from `@playwright/test` (fixtures.ts exports only `test`/`expect`); plus the fake-sidecar env plumbing the wall's leg G uses (fixture `test/e2e-browser/fixtures/fake-claude-sidecar.mjs`; env keys `FRESHELL_CLAUDE_SIDECAR`, `FAKE_CLAUDE_SIDECAR_LOG`; durable UUID constant `44444444-4444-4444-8444-444444444444`; assistant reply text `'Fixture claude turn'`).
+- Consumes: `RustServer` (`test/e2e-browser/helpers/rust-server.ts:272` — `.start()`, `.restartAbrupt()` `:344`, `.stop()`, `info.homeDir`); `TestHarness` (`helpers/test-harness.ts` — `getState()`, `getPaneLayout(tabId)`, `getActiveTabId()`, `getSentWsMessages()`, `clearSentWsMessages()`); spec-local helper bodies COPIED (per this suite's per-spec-ownership convention, wall spec file doc `:47-51`) from `restore-contract-wall-rust.spec.ts`: `selectShellIfPickerShowing` (`:95` \u2014 the boot-picker settle guard every donor creation path runs before `createFreshclaudePane`; leg G `:1179`, leg M `:2017`), `seedWallConfig` (`:131`), `bootWall` (`:156`), `flushPersistence` (`:118`), `reloadAndReconnect` (`:124`), `waitForWsReady` (`:108`), `findFreshAgentLeaf` (`:233`), `createFreshclaudePane` (`:436` — **returns `Promise<void>`; it does NOT return a tab id**), `sendFreshAgentTurn` (`:371`); IMPORTED (not copied): `openPanePicker` from `helpers/pane-picker.ts` (the copied `createFreshclaudePane` body calls it -- wall imports it at `:29`) and `fileURLToPath` from `node:url` (feeds the copied `FAKE_CLAUDE_SIDECAR_SOURCE` constant, wall `:34,:39`); `Page` type comes from `@playwright/test` (fixtures.ts exports only `test`/`expect`); plus the fake-sidecar env plumbing the wall's leg G uses (fixture `test/e2e-browser/fixtures/fake-claude-sidecar.mjs`; env keys `FRESHELL_CLAUDE_SIDECAR`, `FAKE_CLAUDE_SIDECAR_LOG`; durable UUID constant `44444444-4444-4444-8444-444444444444`; assistant reply text `'Fixture claude turn'`).
 - Produces: the e2e evidence Task 5 reports; the stale-identity guard that pins the archaeology safety argument.
 
 - [ ] **Step 1: Write the spec**
@@ -254,7 +254,8 @@ const durableIdentity = (leaf: any): string =>
   leaf?.content?.sessionRef?.sessionId ?? leaf?.content?.resumeSessionId ?? ''
 
 // [COPY VERBATIM from restore-contract-wall-rust.spec.ts]
-// waitForWsReady (:108), flushPersistence (:118), reloadAndReconnect (:124),
+// selectShellIfPickerShowing (:95), waitForWsReady (:108),
+// flushPersistence (:118), reloadAndReconnect (:124),
 // seedWallConfig (:131), bootWall (:156), findFreshAgentLeaf (:233),
 // createFreshclaudePane (:436), sendFreshAgentTurn (:371)
 // -- createFreshclaudePane's body calls openPanePicker; that helper is
@@ -271,12 +272,24 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
 
   test('durable identity survives browser reload, then SIGKILL restart resumes the SAME conversation', async ({ page, e2eServerKind }) => {
     expect(e2eServerKind).toBe('rust')
-    const { server, harness } = await bootWall(page, { /* leg-G env: fake sidecar + request log */ })
+    const { server, harness } = await bootWall(page, {
+      // EXACT leg-G options (wall :1174-1177):
+      env: { FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE },
+      setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
+    })
     try {
-      // createFreshclaudePane returns void; the tab id comes from the
-      // harness, exactly as the wall's leg G does (:1180).
-      const tabId = await harness.getActiveTabId()
+      // Donor creation sequence, copied from leg G :1179-1187 (leg M
+      // :2017-2022 is identical): settle the boot picker, THEN read the tab
+      // id, THEN the boot-picker fade-out guard (.xterm visible), THEN
+      // create. Skipping the guard makes openPanePicker race the boot
+      // picker's fade-out and the Freshclaude click is swallowed (donor
+      // comment at leg G :1181-1185).
+      await selectShellIfPickerShowing(page)
+      const tabId = (await harness.getActiveTabId())!
       expect(tabId).toBeTruthy()
+      await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+      // createFreshclaudePane returns void (:436); the tab id comes from the
+      // harness, exactly as the wall's leg G does (:1180).
       await createFreshclaudePane(page, harness, /* cwd per donor */)
       await sendFreshAgentTurn(page, harness, tabId!, 'first turn before reload')
       await expect(page.locator('[data-context="fresh-agent"]').last()).toContainText('Fixture claude turn', { timeout: 30_000 })
@@ -323,10 +336,19 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
 
   test('HAZARD GUARD: stale persisted sessionRef yields loud dead_session, never silent wrong-session attach or silent fresh', async ({ page, e2eServerKind }) => {
     expect(e2eServerKind).toBe('rust')
-    const { server, info, harness } = await bootWall(page, { /* same env */ })
+    const { server, info, harness } = await bootWall(page, {
+      // Same exact leg-G options as test 1 (env: fake sidecar via
+      // FAKE_CLAUDE_SIDECAR_SOURCE; setupHome: seedWallConfig claude+freshAgent).
+      env: { FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE },
+      setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
+    })
     try {
-      const tabId = await harness.getActiveTabId()
+      // Same donor creation sequence as test 1 (leg G :1179-1187): settle
+      // guard, tab id, .xterm fade-out guard, then create.
+      await selectShellIfPickerShowing(page)
+      const tabId = (await harness.getActiveTabId())!
       expect(tabId).toBeTruthy()
+      await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
       await createFreshclaudePane(page, harness, /* cwd per donor */)
       await sendFreshAgentTurn(page, harness, tabId!, 'turn that will become stale')
       await expect
