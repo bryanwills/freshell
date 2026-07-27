@@ -1656,6 +1656,173 @@ describe('FreshAgentView', () => {
     expect(screen.getByText('Do not disappear on reload')).toBeInTheDocument()
   })
 
+  it('re-attaches with the route cwd and resends once when a send fails with FRESH_AGENT_LOST_SESSION', async () => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+      onMessage = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'empty',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [],
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-lost-session',
+        sessionId: 'ses_9',
+        status: 'idle',
+        initialCwd: '/w',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+    })
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'hello again' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    const sendFrame = sentFreshAgentMessages('freshAgent.send').at(-1)
+    expect(sendFrame).toBeTruthy()
+    expect(sendFrame?.text).toBe('hello again')
+    await waitFor(() => {
+      expect(getFreshAgentPaneContent(store)).toMatchObject({ status: 'running' })
+    })
+    wsMock.send.mockClear()
+
+    // Act: server rejects with the lost-session code for that request
+    expect(onMessage).toBeTypeOf('function')
+    act(() => {
+      onMessage?.({
+        type: 'error',
+        code: 'FRESH_AGENT_LOST_SESSION',
+        requestId: sendFrame?.requestId,
+        message: 'not tracked',
+        timestamp: Date.now(),
+      })
+    })
+
+    // Assert: exactly one attach (with cwd) then one resend of the same text
+    await waitFor(() => {
+      const attaches = sentFreshAgentMessages('freshAgent.attach')
+      expect(attaches.some((m) => m.sessionId === 'ses_9' && m.cwd === '/w')).toBe(true)
+      expect(sentFreshAgentMessages('freshAgent.send').filter((m) => m.text === 'hello again')).toHaveLength(1)
+    })
+    // The echo stays visible while the retry is in flight
+    expect(screen.getByText('hello again')).toBeInTheDocument()
+
+    // Second failure for the retried request must NOT loop...
+    const retried = sentFreshAgentMessages('freshAgent.send').at(-1)
+    expect(retried?.requestId).toEqual(expect.any(String))
+    expect(retried?.requestId).not.toBe(sendFrame?.requestId)
+    wsMock.send.mockClear()
+    act(() => {
+      onMessage?.({
+        type: 'error',
+        code: 'FRESH_AGENT_LOST_SESSION',
+        requestId: retried?.requestId,
+        message: 'still not tracked',
+        timestamp: Date.now(),
+      })
+    })
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 100))
+    })
+    expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+    expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(0)
+
+    // ...and the cleanup fall-through must fire for the final failure:
+    await waitFor(() => {
+      expect(screen.queryByText('hello again')).not.toBeInTheDocument() // stale local echo cleared
+    })
+    expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined() // Redux copy cleared too (dual-write)
+    expect(getFreshAgentPaneContent(store).status).not.toBe('running') // optimistic busy released
+  })
+
+  it('keeps placeholder-session lost-session failures on the normal cleanup path without a retry', async () => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+      onMessage = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'empty',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [],
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-placeholder-lost',
+        sessionId: 'freshopencode-req-placeholder-lost',
+        status: 'idle',
+        initialCwd: '/w',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+    })
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'hello placeholder' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    const sendFrame = sentFreshAgentMessages('freshAgent.send').at(-1)
+    expect(sendFrame?.text).toBe('hello placeholder')
+    await waitFor(() => {
+      expect(getFreshAgentPaneContent(store)).toMatchObject({ status: 'running' })
+    })
+    wsMock.send.mockClear()
+
+    expect(onMessage).toBeTypeOf('function')
+    act(() => {
+      onMessage?.({
+        type: 'error',
+        code: 'FRESH_AGENT_LOST_SESSION',
+        requestId: sendFrame?.requestId,
+        message: 'not tracked',
+        timestamp: Date.now(),
+      })
+    })
+
+    // No retry for a placeholder (non-ses_) session: cleanup path only.
+    await waitFor(() => {
+      expect(screen.queryByText('hello placeholder')).not.toBeInTheDocument()
+    })
+    expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(0)
+    expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+    expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined()
+    expect(getFreshAgentPaneContent(store).status).not.toBe('running')
+  })
+
   it('does not transmit stale Freshopencode permissionMode on create or send', async () => {
     const creatingStore = createStore()
     creatingStore.dispatch(initLayout({

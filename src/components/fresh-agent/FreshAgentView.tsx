@@ -105,6 +105,10 @@ type PendingSendMetadata = {
   submittedTurnId?: string
   legacyAccepted?: boolean
   metadataUpdateStarted?: boolean
+  /** The exact text of the freshAgent.send frame -- retained as the resend
+   * payload for the lost-session retry (Task 10). Never read back from the
+   * local echo. */
+  text?: string
 }
 
 function localEchoLanded(
@@ -642,6 +646,10 @@ export function FreshAgentView({
   const localEchoRef = useRef<LocalEcho | null>(null)
   localEchoRef.current = localEcho
   const pendingSendMetadataRef = useRef<Map<string, PendingSendMetadata>>(new Map())
+  // Task 10: requestIds whose FRESH_AGENT_LOST_SESSION failure already fired a
+  // retry, plus the retry requestIds themselves -- a retry is never retried,
+  // so a resend can happen at most once per failed request (loop-proof).
+  const lostSessionRetryRef = useRef<Set<string>>(new Set())
   const descriptor = resolveFreshAgentType(paneContent.sessionType)
   // Capability-gated commands (e.g. /fork) only appear once the snapshot
   // confirms the provider supports the action.
@@ -862,6 +870,45 @@ export function FreshAgentView({
         }
       })
   }, [])
+
+  /** Builds and sends the freshAgent.send frame. Shared by the composer
+   * submit path (sendUserText) and the lost-session retry (Task 10) so the
+   * retry frame carries exactly the same fields, plus the route cwd. */
+  const sendFreshAgentSendFrame = useCallback((requestId: string, text: string, cwd?: string) => {
+    const current = paneContentRef.current
+    if (!current.sessionId) return
+    sendFreshAgentMessage({
+      type: 'freshAgent.send',
+      requestId,
+      sessionId: current.sessionId,
+      sessionType: current.sessionType,
+      provider: current.provider,
+      ...(cwd ? { cwd } : {}),
+      text,
+      settings: {
+        ...(current.initialCwd ? { cwd: current.initialCwd } : {}),
+        ...(resolveEffectiveFreshAgentModel(current, providerDefaults) ? { model: resolveEffectiveFreshAgentModel(current, providerDefaults) } : {}),
+        ...(getEffectiveFreshAgentPermissionMode(current) ? { permissionMode: getEffectiveFreshAgentPermissionMode(current) } : {}),
+        ...(current.sandbox ? { sandbox: current.sandbox } : {}),
+        ...(getEffectiveFreshAgentEffort(current, providerDefaults) ? { effort: getEffectiveFreshAgentEffort(current, providerDefaults) } : {}),
+      },
+    })
+  }, [providerDefaults, sendFreshAgentMessage])
+
+  /** Task 10: re-issue a failed send under a fresh requestId with the
+   * retained text + route cwd. The retry gets its own pending-metadata entry
+   * (same text) so a second failure cleans up through the normal fall-through
+   * path, and the visible local echo is re-stamped to the retry's requestId
+   * so the retry's eventual acceptance or failure correlates with what is on
+   * screen. */
+  const resendPendingMessage = useCallback((retryRequestId: string, text: string, cwd: string) => {
+    recordPendingSendMetadata(retryRequestId, { text })
+    sendFreshAgentSendFrame(retryRequestId, text, cwd)
+    const echo = localEchoRef.current
+    if (echo && echo.text === text) {
+      setLocalEcho({ ...echo, requestId: retryRequestId })
+    }
+  }, [recordPendingSendMetadata, sendFreshAgentSendFrame, setLocalEcho])
 
   const migratePendingAutoTitle = useCallback((
     previousSessionId: string | undefined,
@@ -1538,6 +1585,60 @@ export function FreshAgentView({
         }
         requestSnapshotRefresh('send-accepted')
       }
+      if (message.type === 'error') {
+        // Task 10: owned send failures. `requestId` is the only correlation
+        // handle on an error frame, and freshAgent.send is the only
+        // fresh-agent path that threads it: frames whose requestId matches a
+        // pendingSendMetadataRef entry are this pane's send failures. Frames
+        // with no matching requestId are not ours -- leave them alone.
+        const failedRequestId = typeof message.requestId === 'string' ? message.requestId : undefined
+        if (!failedRequestId || !pendingSendMetadataRef.current.has(failedRequestId)) return
+        const current = paneContentRef.current
+        if (
+          message.code === 'FRESH_AGENT_LOST_SESSION'
+          && current.sessionType === 'freshopencode'
+          && !lostSessionRetryRef.current.has(failedRequestId)
+        ) {
+          const pendingMeta = pendingSendMetadataRef.current.get(failedRequestId)
+          const cwd = freshOpenCodeRouteCwdRef.current
+          const sessionId = current.sessionId
+          // The ses_ guard keeps genuinely-invalid placeholder/non-durable
+          // lost-session errors on the normal cleanup path below.
+          if (pendingMeta?.text && cwd && sessionId && sessionId.startsWith('ses_')) {
+            // Re-attach with the route cwd (the incident's no-cwd locator),
+            // then resend the retained text exactly once. The original
+            // request is consumed here; the retry itself is never retried.
+            lostSessionRetryRef.current.add(failedRequestId)
+            pendingSendMetadataRef.current.delete(failedRequestId)
+            sendFreshAgentMessage({
+              type: 'freshAgent.attach',
+              sessionId,
+              sessionType: 'freshopencode',
+              provider: 'opencode',
+              cwd,
+            })
+            const retryRequestId = nanoid()
+            lostSessionRetryRef.current.add(retryRequestId)
+            resendPendingMessage(retryRequestId, pendingMeta.text, cwd)
+            // Do NOT fall through: the echo stays visible while the retry is
+            // in flight.
+            return
+          }
+        }
+        // Cleanup fall-through: every owned send failure that did not take
+        // the retry path (including a retried request failing again) releases
+        // the three leaks a failed send otherwise leaves behind -- the
+        // pending-metadata entry, the stale local echo (dual-write), and the
+        // optimistic `running` status.
+        pendingSendMetadataRef.current.delete(failedRequestId)
+        if (localEchoRef.current?.requestId === failedRequestId) {
+          setLocalEcho(null)
+        }
+        if (current.provider === 'opencode' && current.status === 'running') {
+          dispatch(mergePaneContent({ tabId, paneId, updates: { status: 'idle' } }))
+        }
+        return
+      }
       if (
         isSnapshotInvalidatingFreshAgentEvent(message)
         && locatorMatchesPane(message, paneContentRef.current, freshOpenCodeRouteCwdRef.current)
@@ -1583,7 +1684,7 @@ export function FreshAgentView({
       }
     })
     return unsubscribe
-  }, [agentSession?.cwd, clearReserveRedrive, commitSnapshot, dispatch, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, recordPendingSendMetadata, redriveAfterSessionReserved, releasePendingRebind, requestSnapshotRefresh, sendFreshAgentMessage, setLocalEcho, tabId, ws])
+  }, [agentSession?.cwd, clearReserveRedrive, commitSnapshot, dispatch, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, recordPendingSendMetadata, redriveAfterSessionReserved, releasePendingRebind, requestSnapshotRefresh, resendPendingMessage, sendFreshAgentMessage, setLocalEcho, tabId, ws])
 
   useEffect(() => {
     if (!snapshotThreadId) return
@@ -1981,7 +2082,9 @@ export function FreshAgentView({
     if (!current.sessionId) return
     const requestId = nanoid()
     const routeCwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
-    recordPendingSendMetadata(requestId, {})
+    // Retain the exact outgoing text as the resend payload (Task 10): the
+    // lost-session retry resends from this metadata, never from the echo.
+    recordPendingSendMetadata(requestId, { text })
     // Checkpoint the working tree before the agent acts on this message, so
     // "rewind code to here" on this turn restores the pre-turn state. Fire and
     // forget: a failed snapshot must never block the send.
@@ -2018,22 +2121,7 @@ export function FreshAgentView({
       }))
     }
     const nextLocalEcho: LocalEcho = { text, requestId }
-    sendFreshAgentMessage({
-      type: 'freshAgent.send',
-      requestId,
-      sessionId: current.sessionId,
-      sessionType: current.sessionType,
-      provider: current.provider,
-      ...(routeCwd ? { cwd: routeCwd } : {}),
-      text,
-      settings: {
-        ...(current.initialCwd ? { cwd: current.initialCwd } : {}),
-        ...(resolveEffectiveFreshAgentModel(current, providerDefaults) ? { model: resolveEffectiveFreshAgentModel(current, providerDefaults) } : {}),
-        ...(getEffectiveFreshAgentPermissionMode(current) ? { permissionMode: getEffectiveFreshAgentPermissionMode(current) } : {}),
-        ...(current.sandbox ? { sandbox: current.sandbox } : {}),
-        ...(getEffectiveFreshAgentEffort(current, providerDefaults) ? { effort: getEffectiveFreshAgentEffort(current, providerDefaults) } : {}),
-      },
-    })
+    sendFreshAgentSendFrame(requestId, text, routeCwd)
     setLocalEchoState(nextLocalEcho)
     dispatch(mergePaneContent({
       tabId,
@@ -2043,7 +2131,7 @@ export function FreshAgentView({
         pendingLocalEcho: nextLocalEcho,
       },
     }))
-  }, [dispatch, paneId, providerDefaults, recordPendingSendMetadata, sendFreshAgentMessage, snapshotConfirmsNoUserTurns, tabId])
+  }, [dispatch, paneId, recordPendingSendMetadata, sendFreshAgentSendFrame, snapshotConfirmsNoUserTurns, tabId])
 
   // Flush queued messages when the turn ends. One flush per status change is
   // enough: all queued entries are delivered in order for the next turn.
