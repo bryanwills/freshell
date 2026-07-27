@@ -5,7 +5,7 @@
 > quality review after each task. Steps use checkbox (`- [ ]`) syntax
 > for tracking.
 
-**Goal:** Guard the amplifier events tailer against OOM by skipping to EOF (instead of draining) when the live offset→EOF backlog exceeds a byte cap — the same policy already used for attach catch-up.
+**Goal:** Bound the amplifier events tailer's worst-case live drain by skipping to EOF (instead of draining) when the live offset→EOF backlog exceeds a byte cap — the same policy already used for attach catch-up. (Kata `myap` filed this as "OOM fix 1"; load-bearing validation showed the drain alone does not reproduce the OOM — see Validated Findings — so this lands as a bounded-work guard rail with honest messaging, and the kata's scoped deliverable, the cap, is still delivered in full.)
 
 **Architecture:** A single guard inside `readAppended()` in `server/coding-cli/amplifier-events-tailer.ts`: after the existing stat/shrink checks and before the batch drain loop, if `size - offset > AMPLIFIER_TAILER_BACKLOG_MAX_BYTES`, adopt state from the tail (jump `offset` to `size`, clear the partial-line buffer and the oversized-line-skip flag), emit one structured `warn`, and return an ok/empty result. Because both `read()` and `forceRead()` funnel into `readAppended()`, one guard covers every live drain path (chokidar watcher events, Enter-keypress force-read, deadman force-read). A second, small change plumbs the integration's existing `warn` logger into the tailer so the skip is visible in production logs.
 
@@ -16,7 +16,7 @@
 - Kata issue: `myap` — "OOM fix 1: cap live backlog drain in amplifier-events-tailer (skip-to-tail)" (P1, labels: oom, perf).
 - Worktree: `/home/dan/code/freshell/.worktrees/tailer-backlog-cap`, branch `fix/tailer-backlog-cap`, PR targets `main`. All commands below run from the worktree root.
 - Red-Green-Refactor TDD: write the failing test, watch it fail, minimal implementation, watch it pass, refactor, stay green.
-- Server test runs use the coordinated repo-owned path: `npm run test:vitest -- run <file> --config config/vitest/vitest.server.config.ts` (the `--config` flag is REQUIRED — the default config excludes `test/unit/server/**` and silently matches zero tests).
+- Server test runs use the coordinated repo-owned path: `npm run test:vitest -- run <file> --config config/vitest/vitest.server.config.ts` (the `--config` flag is REQUIRED — without it the repo's test coordinator still injects the server config but treats `run` as a positional filter, running the target file PLUS unrelated files matching "run"; always pass `--config` for a scoped single-file run). The server config's globalSetup compiles `server/**` via tsc, so server source must compile for any test run to start; test files themselves are never typechecked.
 - Never restart the self-hosted Freshell server; never use broad kill patterns (`pkill -f node` etc.).
 - Git commits use the repo's Amplifier co-author footer (shown verbatim in each commit step).
 - `gh` operations use the `dan@danshapiro.com` identity.
@@ -27,11 +27,24 @@
 
 These were settled during planning from a full read of the tailer, the integration, the tracker, and both test files:
 
-1. **Guard lives inside `readAppended()`** (per the issue text: `amplifier-events-tailer.ts:148-154`). A call-site variant (in the integration's `pump()`) was considered and rejected: `offset` is tailer-private state mutated inside a serialized promise chain, so an outside `getOffset()` + stat is racy against in-flight reads, and there are three independent drivers (watcher, submit-grace force-read, deadman force-read) — one guard inside the tailer covers all of them atomically with the stat it already performs.
-2. **Cap value: `64 MiB`** (`AMPLIFIER_TAILER_BACKLOG_MAX_BYTES = 64 * 1024 * 1024`), exported hard-coded const (house style — no env var; matches `AMPLIFIER_CATCHUP_MAX_BYTES`, `AMPLIFIER_TAILER_PARTIAL_MAX_BYTES`, `AMPLIFIER_TAILER_READ_BATCH_MAX_BYTES`). Why 64 MiB and not the attach cap's 4 MiB: the cap must stay STRICTLY GREATER than `AMPLIFIER_TAILER_READ_BATCH_MAX_BYTES` (16 MiB) or the multi-batch drain loop becomes dead code and the existing batch-boundary test (`amplifier-events-tailer.test.ts:289-307`, which fully drains a ~16 MiB append) breaks. 64 MiB = at most 4 read batches of mostly prefilter-rejected noise — bounded event-loop work — while the pathological WSL2 backlogs this guards against are 100s of MB (events files reach 1.1 GB). Normal live gaps are KBs, so the guard is a no-op in normal operation, exactly as the issue requires.
-3. **Skip semantics = attach-at-EOF parity:** jump `offset` to raw `size` (no newline alignment — same as `attach()` with `attachAt: 'eof'`; a torn line at the jump point fails the prefilter/JSON.parse later and counts as one skipped line), clear `partial`, clear `skippingOversizedLine`. Do NOT set `degraded` (the lane stays healthy), do NOT touch `schemaValidated` (the gate runs on the first post-jump record), do NOT change the `AmplifierTailerReadResult` shape (the integration's `pump()` treats ok+zero-records as a no-op, which is the desired "stay silent, live records take over" behavior — parity with the attach cap, which leaves the tracker idle). Missing activity signals are acceptable: `events.jsonl` is write-only observability output that Amplifier never reads back, so skip-to-tail can never lose data that matters (worst case: a missed turn-complete chime; the deadman force-read self-heals phase within its window).
-4. **Log at `warn`, plumbed from the integration.** The attach cap logs `warn` via the integration logger; the tailer's log slot today is `debug`-only AND production never passes a logger to the tailer at all (`amplifier-activity-integration.ts:336-340`). So: widen the tailer's `log` input type to `{ debug?; warn? }`, emit the skip at `warn?.()`, and pass `{ warn: log.warn }` through at the construction site. Event name `amplifier_tailer_backlog_skipped` with `{ component, event, filePath, backlogBytes, capBytes }` — same shape family as `amplifier_events_catchup_skipped`. One warn per skip occurrence (no latch): each trigger is a distinct multi-64-MiB anomaly worth a log line, and a single skip resolves the whole backlog so there is no per-line spam.
+1. **Guard lives inside `readAppended()`** (per the issue text: `amplifier-events-tailer.ts:148-154`). A call-site variant (in the integration's `pump()`) was considered and rejected: `offset` is tailer-private state mutated inside a serialized promise chain, so an outside `getOffset()` + stat is racy against in-flight reads, and there are three independent drivers (watcher, submit-grace force-read, deadman force-read) — one guard inside the tailer covers all of them atomically with the stat it already performs. (A second production tailer exists in the session-locator's `runProbe` (`session-locator.ts:528`), but its `cappedProbeFs` clamps stat to 64 KiB (`session-locator.ts:78,177-185`), so the guard can never fire there — no change needed at that site.)
+2. **Cap value: `64 MiB`** (`AMPLIFIER_TAILER_BACKLOG_MAX_BYTES = 64 * 1024 * 1024`), exported hard-coded const (house style — no env var; matches `AMPLIFIER_CATCHUP_MAX_BYTES`, `AMPLIFIER_TAILER_PARTIAL_MAX_BYTES`, `AMPLIFIER_TAILER_READ_BATCH_MAX_BYTES`). Why 64 MiB and not the attach cap's 4 MiB: the cap must stay STRICTLY GREATER than `AMPLIFIER_TAILER_READ_BATCH_MAX_BYTES` (16 MiB) or the multi-batch drain loop becomes dead code and the existing batch-boundary test (`amplifier-events-tailer.test.ts:289-307`, which fully drains a ~16 MiB append) breaks. 64 MiB = at most 4 read batches of mostly prefilter-rejected noise — bounded event-loop work (measured: 305–678 ms worst-case sync stall even with a 3.3 GiB pre-pressured heap) — while the pathological WSL2 backlogs this guards against are 100s of MB (74 real events files exceed 64 MiB; max 1.04 GiB). Normal live gaps are KBs-to-single-digit-MiB (measured worst across 3.7 GiB of real data: 9.05 MiB per 120 s deadman window), so the guard is a no-op in normal operation, exactly as the issue requires.
+3. **Skip semantics = attach-at-EOF parity:** jump `offset` to raw `size` (no newline alignment — same as `attach()` with `attachAt: 'eof'`; a torn line at the jump point fails the prefilter/JSON.parse later and counts as one skipped line), clear `partial`, clear `skippingOversizedLine`. Do NOT set `degraded` (the lane stays healthy), do NOT touch `schemaValidated` (the gate runs on the first post-jump record), do NOT change the `AmplifierTailerReadResult` shape (the integration's `pump()` treats ok+zero-records as a no-op, which is the desired "stay silent, live records take over" behavior — parity with the attach cap, which leaves the tracker idle). Missing activity signals are acceptable: `events.jsonl` is append-only observability output — Amplifier re-reads it only for fork slicing and resume cost restore, and the skip never mutates the file — so skip-to-tail cannot lose data that matters. Honest worst case: a skip that swallows the final `prompt:complete` leaves the pane `busy` until the next record or PTY exit (the deadman re-fires force-reads every 5 s sweep but never fabricates completion — consistent with the repo's existing never-fabricate policy; observability-only noise).
+4. **Log at `warn`, plumbed from the integration.** The attach cap logs `warn` via the integration logger; the tailer's log slot today is `debug`-only AND production never passes a logger to the tailer at all (`amplifier-activity-integration.ts:336-340`). So: widen the tailer's `log` input type to `{ debug?; warn? }`, emit the skip at `warn?.()`, and pass `{ warn: log.warn.bind(log) }` through at the construction site — the bind is load-bearing: the production logger is a raw pino instance (`index.ts:270`, `logger.ts:312`, pino 9.14.0) whose `warn` is `this`-dependent, and a detached call throws `TypeError: this[writeSym] is not a function` (verified empirically); test harnesses use plain `vi.fn()` and structurally cannot catch this. Event name `amplifier_tailer_backlog_skipped` with `{ component, event, filePath, backlogBytes, capBytes }` — same shape family as `amplifier_events_catchup_skipped`. One warn per skip occurrence (no latch): each trigger is a distinct multi-64-MiB anomaly worth a log line, and a single skip resolves the whole backlog so there is no per-line spam.
 5. **Test level:** unit tests against the tailer's injected fake fs prove the mechanism; one integration-level test drives the full watcher→pump→tailer→tracker path and proves the production-visible warn plus live recovery. This is the highest level of abstraction available for a server-internal guard rail — there is no user-visible UI surface for a 64 MiB backlog skip, so no e2e-browser test applies (and no `docs/index.html` change: not a user-facing feature).
+
+## Validated Findings (Stage-2 load-bearing validation — read before executing)
+
+Every load-bearing assumption of this plan was validated with evidence (ledger:
+`/home/dan/code/freshell/.worktrees/.the-usual-logs/tailer-backlog-cap/load-bearing-ledger.md`).
+Findings already folded into the tasks below; key facts an implementer must not "correct" back:
+
+1. **The tailer drain is NOT the confirmed cause of the production OOM (A1 falsified).** Draining the real 1.04 GiB backlog through the real tailer peaked at 26 MiB heap / 268 MiB RSS with ≤145 ms loop stalls; the production incident telemetry (3105 MiB heap, flat external memory, ~100 s loop starvation) is the inverse of the tailer-drain signature. The cap still lands — it is the kata's scoped deliverable and a legitimate bounded-work guard rail — but commit/PR/kata messages below make honest claims and leave the root-cause hunt open. Do not restore causal OOM claims.
+2. **`{ warn: log.warn }` without bind throws in production (A9 falsified).** The production logger is raw pino; Task 2 uses `log.warn.bind(log)`. Keep the bind.
+3. **Two production tailer construction sites exist (A8 falsified narrowly):** `amplifier-activity-integration.ts:336` (Task 2's target) and `session-locator.ts:528` (`runProbe`) — the latter is cap-immune because `cappedProbeFs` clamps stat to 64 KiB; no change there.
+4. **Cap sizing verified (A2/A3/A4/A14):** worst observed healthy write burst is 9.05 MiB per 120 s deadman window across 3.7 GiB of real data (≥7× margin); 74 real events files exceed 64 MiB (max 1.04 GiB); a worst-case 64 MiB drain stalls 305–678 ms and cannot OOM even at a 3.3 GiB pre-pressured heap; the existing :289-307 test forces cap > 16 MiB.
+5. **Skip safety verified (A5/A6/A7):** idle-reap reads only PTY-fed `lastActivityAt` (tracker phase is never an input); lane-suspect keys off submit-grace reversions, not offset-vs-size; pump() treats ok+empty as a strict no-op. Honest worst case: a skip swallowing the final `prompt:complete` leaves the pane busy until the next record or PTY exit.
+6. **Tooling (A13):** running the vitest command WITHOUT `--config` does NOT silently match zero tests — the repo's coordinator injects the server config but treats `run` as a positional filter and runs extra unrelated files. `--config` remains required. The server vitest config's globalSetup compiles `server/**` via tsc, so server source must always compile for tests to start (test files themselves are never typechecked).
 
 ---
 
@@ -100,7 +113,7 @@ Run:
 ```bash
 npm run test:vitest -- run test/unit/server/coding-cli/amplifier-events-tailer.test.ts --config config/vitest/vitest.server.config.ts
 ```
-Expected: FAIL. Without the cap the tailer drains the whole ~64 MiB in 64 KiB positional reads, so `expect(fsImpl.readCalls).toHaveLength(0)` fails with a length in the hundreds, and the `warn` assertion fails with 0 calls. (Vitest does not typecheck, so the not-yet-widened `log` type does not block the run.) If the test PASSES here, stop — something is wrong with the test.
+Expected: FAIL. Without the cap the tailer drains the whole ~64 MiB in 64 KiB positional reads, so `expect(fsImpl.readCalls).toHaveLength(0)` fails with a length over a thousand, and the `warn` assertion fails with 0 calls. (Vitest does not typecheck, so the not-yet-widened `log` type does not block the run.) If the test PASSES here, stop — something is wrong with the test.
 
 - [ ] **Step 3: Minimal implementation — constant, widened log type, guard**
 
@@ -111,13 +124,16 @@ In `server/coding-cli/amplifier-events-tailer.ts`, make three edits.
 ```ts
 /**
  * Cap on the live offset->EOF backlog a single read will drain (kata myap,
- * OOM fix 1). READ_BATCH_MAX_BYTES bounds one Buffer.concat; this bounds the
- * TOTAL drain: past it, the tailer skips to EOF and adopts state from the
- * tail -- the exact policy the integration already uses for attach catch-up
- * (AMPLIFIER_CATCHUP_MAX_BYTES). events.jsonl is write-only observability
- * output (Amplifier never reads it back), so the worst case is missed
- * activity signals, never data loss. Must stay strictly greater than
- * READ_BATCH_MAX_BYTES so multi-batch draining below the cap still happens.
+ * OOM fix 1 -- a bounded-work guard rail). READ_BATCH_MAX_BYTES bounds one
+ * Buffer.concat; this bounds the TOTAL drain: past it, the tailer skips to
+ * EOF and adopts state from the tail -- the exact policy the integration
+ * already uses for attach catch-up (AMPLIFIER_CATCHUP_MAX_BYTES). events.jsonl
+ * is append-only observability output (Amplifier re-reads it only for fork
+ * slicing / resume cost restore, and the skip never mutates the file), so the
+ * worst case is missed activity signals, never data loss. Must stay strictly
+ * greater than READ_BATCH_MAX_BYTES so multi-batch draining below the cap
+ * still happens, and far above AMPLIFIER_CATCHUP_MAX_BYTES (4 MiB) so a fresh
+ * attach's catch-up window can never trigger the live skip.
  */
 export const AMPLIFIER_TAILER_BACKLOG_MAX_BYTES = 64 * 1024 * 1024
 ```
@@ -142,9 +158,10 @@ to:
 ```ts
     if (size - offset > AMPLIFIER_TAILER_BACKLOG_MAX_BYTES) {
       // Live-drain cap (kata myap): a silently-dead watcher (WSL2 inotify)
-      // can leave 100s of MB between offset and EOF; draining it decodes
-      // every line to a JS string and OOMs the process. Skip to EOF and
-      // adopt state from the tail instead -- attach-cap parity.
+      // can leave 100s of MB between offset and EOF (real files reach 1 GiB);
+      // draining it all in one serialized read is unbounded work that stalls
+      // the event loop for the whole decode. Skip to EOF and adopt state from
+      // the tail instead -- attach-cap parity.
       const backlogBytes = size - offset
       offset = size
       input.log?.warn?.({
@@ -322,13 +339,18 @@ git commit -m "$(cat <<'EOF'
 fix(server): cap live backlog drain in amplifier events tailer (kata myap)
 
 A silently-dead chokidar watcher (WSL2 inotify) lets the events.jsonl
-offset->EOF gap grow to 100s of MB; the next read (watcher event or
-force-read) drained it all, decoding every line to a JS string and
-OOMing at the 4GB heap limit. readAppended() now skips to EOF and
-adopts state from the tail when the backlog exceeds 64MiB -- the same
-policy the integration already applies to attach catch-up. events.jsonl
-is write-only observability output, so the worst case is missed
-activity signals, never data loss.
+offset->EOF gap grow to 100s of MB (real files reach 1.04GiB); the next
+read (watcher event or force-read) drained it all in one serialized
+pass -- unbounded work with no total-bytes cap. readAppended() now
+skips to EOF and adopts state from the tail when the backlog exceeds
+64MiB -- the same policy the integration already applies to attach
+catch-up. Validation note: benchmarking the real 1GiB backlog through
+the tailer peaked at 26MiB heap (the prod OOM telemetry signature
+points elsewhere), so this is a bounded-work guard rail for the OOM
+family, not the confirmed root-cause fix. events.jsonl is append-only
+observability output (Amplifier re-reads it only for fork slicing /
+resume cost restore; the skip never mutates the file), so the worst
+case is missed activity signals, never data loss.
 
 🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
 
@@ -430,8 +452,11 @@ to:
         attachAt,
         ...(fsImpl ? { fsImpl } : {}),
         // Kata myap: surface tailer-level warns (live backlog skip) through
-        // the integration's production logger.
-        ...(log ? { log: { warn: log.warn } } : {}),
+        // the integration's production logger. bind() is load-bearing: the
+        // production logger is a raw pino instance whose warn is
+        // this-dependent -- a detached call throws TypeError at exactly the
+        // moment the guard fires (verified against pino 9.14.0).
+        ...(log ? { log: { warn: log.warn.bind(log) } } : {}),
       }),
 ```
 
@@ -456,7 +481,9 @@ fix(server): surface tailer backlog-skip warn through the integration logger (ka
 The tailer's log input was never wired in production, so the new
 amplifier_tailer_backlog_skipped warn (and any future tailer-level
 diagnostics) would be invisible. Pass the integration's warn logger
-through at tailer construction; integration test drives the full
+through at tailer construction, bound -- the production logger is raw
+pino, whose warn is this-dependent, and a detached call throws exactly
+when the guard fires. Integration test drives the full
 watcher->pump->tailer->tracker path and asserts the warn, the silent
 skip (no phase change, no completion, no degrade), and live recovery.
 
@@ -496,10 +523,11 @@ PR creation and merge were EXPLICITLY pre-approved by the user for this change �
 git push -u origin fix/tailer-backlog-cap
 gh pr create --base main --title "fix(server): cap live backlog drain in amplifier-events-tailer (skip-to-tail, kata myap)" --body "$(cat <<'EOF'
 ## Summary
-- OOM fix 1 (kata `myap`, P1, oom/perf): `readAppended()` in `server/coding-cli/amplifier-events-tailer.ts` drained the entire offset->EOF gap with no total-bytes cap; with a silently-dead WSL2 watcher the backlog reaches 100s of MB (events files hit 1.1GB) and a force-read drained it all at once, starving the event loop and OOMing at the 4GB heap limit (confirmed via perf_system heap telemetry: 1.5GB spike at 23:01 preceded by amplifier_events_lane_suspect at 22:56).
+- OOM fix 1 (kata `myap`, P1, oom/perf): `readAppended()` in `server/coding-cli/amplifier-events-tailer.ts` drained the entire offset->EOF gap with no total-bytes cap; with a silently-dead WSL2 watcher the backlog reaches 100s of MB (74 real events files exceed 64MiB; max 1.04GiB) and a single read then drained it all in one serialized pass.
+- Honesty note from load-bearing validation: benchmarking the real 1.04GiB backlog through the real tailer peaked at 26MiB heap / 268MiB RSS (no OOM), and the production incident telemetry (3.1GiB heap spike with flat external memory and ~100s event-loop starvation) does not match the tailer-drain signature — so this lands as a bounded-work guard rail for the OOM family (worst-case measured drain stall: 305-678ms per 16MiB batch), not the confirmed root-cause fix; the root-cause hunt stays open.
 - Guard rail, no-op in normal operation: if `size - offset > AMPLIFIER_TAILER_BACKLOG_MAX_BYTES` (64MiB), skip to EOF, warn once, adopt state from the tail — the exact policy already used for attach catch-up (`AMPLIFIER_CATCHUP_MAX_BYTES`). Covers all three live drivers (watcher event, submit-grace force-read, deadman force-read) since both `read()` and `forceRead()` funnel into `readAppended()`.
-- Semantically safe: `events.jsonl` is write-only observability output — Amplifier never reads it back (resume uses transcript.jsonl+metadata.json). Worst case is missed activity/turn-complete signals, never data loss.
-- Also plumbs the integration's `warn` logger into the tailer (it was never wired), making `amplifier_tailer_backlog_skipped` production-visible.
+- Semantically safe: `events.jsonl` is append-only observability output — Amplifier re-reads it only for fork slicing and resume cost restore, and the skip never mutates the file. Worst case is a missed activity/turn-complete signal (a skipped final `prompt:complete` leaves the pane busy until the next record or PTY exit), never data loss. Idle-reap is unaffected: it reads only PTY-fed `lastActivityAt`, never tracker phase.
+- Also plumbs the integration's `warn` logger into the tailer (it was never wired), bound with `log.warn.bind(log)` — the production logger is raw pino whose `warn` is `this`-dependent — making `amplifier_tailer_backlog_skipped` production-visible.
 - 64MiB (not the attach cap's 4MiB) keeps the cap strictly above `AMPLIFIER_TAILER_READ_BATCH_MAX_BYTES` (16MiB) so bounded multi-batch draining below the cap is preserved along with its existing test.
 
 ## Test plan
@@ -545,7 +573,7 @@ git -C /home/dan/code/freshell log --oneline -1
 Only if everything above is fully verified (merged, checks green). From the repo root, with `<merged-sha>` from Step 4:
 
 ```bash
-cd /home/dan/code/freshell && kata close myap --done --commit <merged-sha> --message "Live backlog drain in amplifier-events-tailer is now capped at AMPLIFIER_TAILER_BACKLOG_MAX_BYTES (64MiB): readAppended() skips to EOF, resets partial-line state, and warns (amplifier_tailer_backlog_skipped, now production-visible via the integration logger) instead of draining 100s-of-MB backlogs after silent WSL2 watcher death — attach-cap parity, no-op below the cap. TDD: 4 tailer unit tests + 1 integration test; full coordinated suite green; merged to main."
+cd /home/dan/code/freshell && kata close myap --done --commit <merged-sha> --message "Live backlog drain in amplifier-events-tailer is now capped at AMPLIFIER_TAILER_BACKLOG_MAX_BYTES (64MiB): readAppended() skips to EOF, resets partial-line state, and warns (amplifier_tailer_backlog_skipped, production-visible via the bound integration logger) instead of draining 100s-of-MB backlogs after silent WSL2 watcher death — attach-cap parity, no-op below the cap (measured worst healthy 120s write window: 9MiB). Honest scope note: benchmarking the real 1.04GiB backlog through the tailer peaked at 26MiB heap, and the prod OOM telemetry signature (3.1GiB heap, flat external, ~100s loop starvation) does not match the tailer drain — this cap is the kata's scoped deliverable and a bounded-work guard rail, but the OOM root-cause hunt should continue under the oom label. TDD: 4 tailer unit tests + 1 integration test; full coordinated suite green; merged to main."
 ```
 
 Expected: kata `myap` closed. Do NOT close it if any prior step is unverified.
@@ -568,4 +596,14 @@ Expected: kata `myap` closed. Do NOT close it if any prior step is unverified.
 
 **2. Placeholder scan:** No TBD/TODO/"handle edge cases"/"similar to Task N" — every code step shows complete code; every run step has the exact command and expected outcome.
 
-**3. Type consistency:** `AMPLIFIER_TAILER_BACKLOG_MAX_BYTES` is defined in Task 1(a) and imported with that exact name in Task 2 Step 1. The widened `log` type `{ debug?; warn? }` (Task 1(b)) accepts Task 2 Step 3's `{ warn: log.warn }` (both `(payload: object, message?: string) => void`). The guard's return `{ ok: true, records: [], skippedLines: 0, bytesConsumed: 0, offset }` matches the existing `AmplifierTailerReadResult` ok-variant exactly (no shape change). `resetLineState()` (Task 1 Step 10) is used only within the tailer file.
+**3. Type consistency:** `AMPLIFIER_TAILER_BACKLOG_MAX_BYTES` is defined in Task 1(a) and imported with that exact name in Task 2 Step 1. The widened `log` type `{ debug?; warn? }` (Task 1(b)) accepts Task 2 Step 3's `{ warn: log.warn.bind(log) }` (`bind` preserves the `(payload: object, message?: string) => void` signature). The guard's return `{ ok: true, records: [], skippedLines: 0, bytesConsumed: 0, offset }` matches the existing `AmplifierTailerReadResult` ok-variant exactly (no shape change). `resetLineState()` (Task 1 Step 10) is used only within the tailer file.
+
+## Self-Review (re-run after Stage-2 load-bearing validation)
+
+**1. Spec coverage:** unchanged — all issue requirements still mapped to tasks; validation strengthened the evidence behind each (cap floor via the real :289-307 test, no-op-below-cap via measured 9.05 MiB/120 s worst gap, skip safety via idle-reap/lane-suspect/pump inspection). The reframed goal/commit/PR/kata wording still delivers the kata's scoped deliverable (the cap) while removing falsified causal claims — an honest-messaging change, not a scope change.
+
+**1b. No silent deferrals:** the plan defers nothing new. The root-cause OOM hunt is explicitly declared open in the PR/kata messages (a transparent handoff, not a silent deferral — it was never this plan's scope; kata `myap` is "OOM fix 1: cap live backlog drain"). The `bind` fix is implemented in Task 2 Step 3, not deferred; the second construction site needs no change (cap-immune by `cappedProbeFs` stat clamp, documented in Design Decision 1).
+
+**2. Placeholder scan:** all edited steps still show complete code and exact commands with expected outcomes; no TBD/TODO introduced.
+
+**3. Type consistency:** `log.warn.bind(log)` matches the widened `{ warn?: (payload: object, message?: string) => void }` slot; Task 2's test still passes a plain `vi.fn()` via `setup()`'s `log: { warn }`, and `bind` on a `vi.fn` preserves mock recording, so the RED/GREEN expectations are unchanged. Every other interface hand-off (constant name, helpers, return shape) was verified against the real files by validators V5/V4 with zero mismatches.
