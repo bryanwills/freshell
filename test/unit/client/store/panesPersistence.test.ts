@@ -359,6 +359,71 @@ describe('Panes Persistence Integration', () => {
     expect(saved.panes.refreshRequestsByPane).toBeUndefined()
   })
 
+  it('round-trips a freshclaude durable identity: sessionRef survives, live placeholder and resumeSessionId are stripped', () => {
+    const DURABLE = '55555555-5555-4555-8555-555555555555'
+
+    // 1. Create a store (simulates initial page load)
+    const store1 = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+      },
+      middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
+    })
+
+    // 2. Add a tab
+    store1.dispatch(addTab({ mode: 'shell' }))
+    const tabId = store1.getState().tabs.tabs[0].id
+
+    // 3. Arrange: a fresh-agent leaf as the shipped FreshAgentView merge effect
+    //    (FreshAgentView.tsx:1798-1830) leaves it
+    store1.dispatch(initLayout({
+      tabId,
+      content: {
+        kind: 'fresh-agent',
+        provider: 'claude',
+        sessionType: 'freshclaude',
+        sessionId: 'fc-e2e-123',
+        createRequestId: 'req-1',
+        status: 'connected',
+        sessionRef: { provider: 'claude', sessionId: DURABLE },
+        resumeSessionId: DURABLE,
+      } as any,
+    }))
+
+    // 4. Act: flush persistence, then re-load panes state (same seam as the
+    //    'persists and restores panes across page refresh' test)
+    vi.runAllTimers()
+    const persistedTabs = loadPersistedTabs()
+    const persistedPanes = loadPersistedPanes()
+
+    const store2 = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+      },
+      middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
+    })
+
+    // Hydrate in same order as real app
+    if (persistedTabs?.tabs) {
+      store2.dispatch(hydrateTabs(persistedTabs.tabs))
+    }
+    if (persistedPanes) {
+      store2.dispatch(hydratePanes(persistedPanes))
+    }
+
+    // 5. Assert on the restored fresh-agent leaf content
+    const restoredLayout = store2.getState().panes.layouts[tabId]
+    expect(restoredLayout).toBeDefined()
+    expect(restoredLayout.type).toBe('leaf')
+    const restored = (restoredLayout as any).content
+    expect(restored.kind).toBe('fresh-agent')
+    expect(restored.sessionRef).toEqual({ provider: 'claude', sessionId: DURABLE })
+    expect(restored.sessionId).toBeUndefined() // live handle never persisted
+    expect(restored.resumeSessionId).toBeUndefined() // always stripped; re-derived from sessionRef at create time
+  })
+
   it('flushes pending writes on visibility change', () => {
     const store = configureStore({
       reducer: {
