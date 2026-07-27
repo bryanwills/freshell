@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
+  AMPLIFIER_TAILER_BACKLOG_MAX_BYTES,
   AMPLIFIER_TAILER_PARTIAL_MAX_BYTES,
   AMPLIFIER_TAILER_READ_BATCH_MAX_BYTES,
   createAmplifierEventsTailer,
@@ -316,5 +317,118 @@ describe('amplifier events tailer', () => {
 
     // Offset covers everything read so far (partial bytes live in the buffer).
     expect(tailer.getOffset()).toBe(Buffer.byteLength(first + partial))
+  })
+})
+
+describe('live backlog cap (skip-to-tail)', () => {
+  it('skips to EOF instead of draining a backlog beyond the cap; live records take over', async () => {
+    // OOM regression (kata myap): a silently-dead WSL2 watcher lets the
+    // backlog grow to 100s of MB; a force-read must never drain it all.
+    const noise = line('content_block:start')
+    const backlog = noise.repeat(
+      Math.ceil((AMPLIFIER_TAILER_BACKLOG_MAX_BYTES + 64 * 1024) / noise.length),
+    )
+    const fsImpl = createFakeFs(backlog)
+    const warn = vi.fn()
+    const tailer = createAmplifierEventsTailer({
+      filePath: '/fake/events.jsonl',
+      fsImpl,
+      attachAt: 'start',
+      log: { warn },
+    })
+    await tailer.attach()
+
+    const result = await tailer.read()
+    expect(okRecords(result)).toEqual([])
+    if (!result.ok) throw new Error('unreachable')
+    // State adopted from the tail: offset jumps to EOF without reading.
+    expect(result.offset).toBe(Buffer.byteLength(backlog))
+    expect(result.bytesConsumed).toBe(0)
+    expect(tailer.getOffset()).toBe(Buffer.byteLength(backlog))
+    // The whole point: NO positional reads, no bytes decoded.
+    expect(fsImpl.readCalls).toHaveLength(0)
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(warn.mock.calls[0][0]).toMatchObject({
+      component: 'amplifier-events-tailer',
+      event: 'amplifier_tailer_backlog_skipped',
+      filePath: '/fake/events.jsonl',
+      backlogBytes: Buffer.byteLength(backlog),
+      capBytes: AMPLIFIER_TAILER_BACKLOG_MAX_BYTES,
+    })
+
+    // Live records take over from the adopted tail; the lane never degraded.
+    fsImpl.append(line('prompt:submit'))
+    const second = await tailer.read()
+    expect(okRecords(second)).toEqual(['prompt:submit'])
+  })
+
+  it('drops a buffered partial line when skipping to tail', async () => {
+    // 40 bytes of an incomplete record (no newline yet) get buffered...
+    const partialHead = line('prompt:submit').slice(0, 40)
+    const fsImpl = createFakeFs(partialHead)
+    const tailer = createAmplifierEventsTailer({
+      filePath: '/fake/events.jsonl',
+      fsImpl,
+      attachAt: 'start',
+    })
+    await tailer.attach()
+    await tailer.read()
+    expect(tailer.getBufferedBytes()).toBe(40)
+
+    // ...then the backlog explodes past the cap: the skip must discard them.
+    fsImpl.append('x'.repeat(AMPLIFIER_TAILER_BACKLOG_MAX_BYTES + 1024) + '\n')
+    const skipped = await tailer.read()
+    expect(okRecords(skipped)).toEqual([])
+    expect(tailer.getBufferedBytes()).toBe(0)
+
+    // A fresh post-jump record parses cleanly (no stale-prefix corruption).
+    fsImpl.append(line('prompt:complete'))
+    expect(okRecords(await tailer.read())).toEqual(['prompt:complete'])
+  })
+
+  it('clears oversized-line skip mode when skipping to tail', async () => {
+    // Overflow the partial-line cap with a never-ending line: the tailer
+    // enters skippingOversizedLine mode (existing behavior).
+    const oversized = 'x'.repeat(AMPLIFIER_TAILER_PARTIAL_MAX_BYTES + 1024)
+    const fsImpl = createFakeFs(oversized)
+    const tailer = createAmplifierEventsTailer({
+      filePath: '/fake/events.jsonl',
+      fsImpl,
+      attachAt: 'start',
+    })
+    await tailer.attach()
+    await tailer.read()
+
+    // Backlog explodes past the cap while still mid-oversized-line.
+    fsImpl.append('y'.repeat(AMPLIFIER_TAILER_BACKLOG_MAX_BYTES + 1024))
+    await tailer.read()
+
+    // If the flag survived the jump, this whole record would be discarded up
+    // to its trailing newline and counted as a skipped line instead.
+    fsImpl.append(line('prompt:submit'))
+    const result = await tailer.read()
+    expect(okRecords(result)).toEqual(['prompt:submit'])
+    if (!result.ok) throw new Error('unreachable')
+    expect(result.skippedLines).toBe(0)
+  })
+
+  it('drains a just-below-cap backlog fully (the guard is a no-op below the cap)', async () => {
+    const noise = line('content_block:start')
+    const filler = noise.repeat(
+      Math.floor((AMPLIFIER_TAILER_BACKLOG_MAX_BYTES - 64 * 1024) / noise.length),
+    )
+    const fsImpl = createFakeFs(line('session:start') + filler + line('prompt:complete'))
+    const warn = vi.fn()
+    const tailer = createAmplifierEventsTailer({
+      filePath: '/fake/events.jsonl',
+      fsImpl,
+      attachAt: 'start',
+      log: { warn },
+    })
+    await tailer.attach()
+
+    const result = await tailer.read()
+    expect(okRecords(result)).toEqual(['session:start', 'prompt:complete'])
+    expect(warn).not.toHaveBeenCalled()
   })
 })

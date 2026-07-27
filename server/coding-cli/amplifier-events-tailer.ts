@@ -7,9 +7,10 @@
  * bytes via positional fd reads; buffers a partial trailing line until it is
  * completed; applies a cheap substring pre-filter before `JSON.parse` so the
  * ~450KB/turn of `content_block:*`/`tool:*` noise is skipped without parsing;
- * validates the schema once per file; `size < offset` means file reset —
- * degrade, never guess. Injected `fsImpl` for tests, imitating
- * `codex-app-server/durability-proof.ts`.
+ * validates the schema once per file; a live backlog beyond
+ * `AMPLIFIER_TAILER_BACKLOG_MAX_BYTES` is skipped, not drained (state adopts
+ * the tail); `size < offset` means file reset — degrade, never guess. Injected
+ * `fsImpl` for tests, imitating `codex-app-server/durability-proof.ts`.
  */
 
 import fsp from 'node:fs/promises'
@@ -35,6 +36,21 @@ export const AMPLIFIER_TAILER_PARTIAL_MAX_BYTES = 8 * 1024 * 1024
  * over batches until the stat'd size is consumed.
  */
 export const AMPLIFIER_TAILER_READ_BATCH_MAX_BYTES = 16 * 1024 * 1024
+
+/**
+ * Cap on the live offset->EOF backlog a single read will drain (kata myap,
+ * OOM fix 1 -- a bounded-work guard rail). READ_BATCH_MAX_BYTES bounds one
+ * Buffer.concat; this bounds the TOTAL drain: past it, the tailer skips to
+ * EOF and adopts state from the tail -- the exact policy the integration
+ * already uses for attach catch-up (AMPLIFIER_CATCHUP_MAX_BYTES). events.jsonl
+ * is append-only observability output (Amplifier re-reads it only for fork
+ * slicing / resume cost restore, and the skip never mutates the file), so the
+ * worst case is missed activity signals, never data loss. Must stay strictly
+ * greater than READ_BATCH_MAX_BYTES so multi-batch draining below the cap
+ * still happens, and far above AMPLIFIER_CATCHUP_MAX_BYTES (4 MiB) so a fresh
+ * attach's catch-up window can never trigger the live skip.
+ */
+export const AMPLIFIER_TAILER_BACKLOG_MAX_BYTES = 64 * 1024 * 1024
 
 /**
  * Lifecycle event-name prefixes the reducer cares about. Lines are checked
@@ -102,7 +118,10 @@ export function createAmplifierEventsTailer(input: {
   /** 'start' = fresh session (offset 0); 'eof' = resume attach (E7). */
   attachAt: 'start' | 'eof'
   fsImpl?: AmplifierTailerFs
-  log?: { debug?: (payload: object, message?: string) => void }
+  log?: {
+    debug?: (payload: object, message?: string) => void
+    warn?: (payload: object, message?: string) => void
+  }
 }): AmplifierEventsTailer {
   const fsImpl: AmplifierTailerFs = input.fsImpl ?? defaultFs()
   const filePath = input.filePath
@@ -125,6 +144,11 @@ export function createAmplifierEventsTailer(input: {
     return { ok: false, reason, message }
   }
 
+  const resetLineState = (): void => {
+    partial = Buffer.alloc(0)
+    skippingOversizedLine = false
+  }
+
   async function readAppended(): Promise<AmplifierTailerReadResult> {
     if (degraded) return { ok: false, ...degraded }
 
@@ -142,6 +166,25 @@ export function createAmplifierEventsTailer(input: {
       )
     }
     if (size === offset) {
+      return { ok: true, records: [], skippedLines: 0, bytesConsumed: 0, offset }
+    }
+
+    if (size - offset > AMPLIFIER_TAILER_BACKLOG_MAX_BYTES) {
+      // Live-drain cap (kata myap): a silently-dead watcher (WSL2 inotify)
+      // can leave 100s of MB between offset and EOF (real files reach 1 GiB);
+      // draining it all in one serialized read is unbounded work that stalls
+      // the event loop for the whole decode. Skip to EOF and adopt state from
+      // the tail instead -- attach-cap parity.
+      const backlogBytes = size - offset
+      offset = size
+      resetLineState()
+      input.log?.warn?.({
+        component: 'amplifier-events-tailer',
+        event: 'amplifier_tailer_backlog_skipped',
+        filePath,
+        backlogBytes,
+        capBytes: AMPLIFIER_TAILER_BACKLOG_MAX_BYTES,
+      }, 'Amplifier events backlog exceeded the live-drain cap; skipping to EOF (live records take over).')
       return { ok: true, records: [], skippedLines: 0, bytesConsumed: 0, offset }
     }
 
@@ -245,8 +288,7 @@ export function createAmplifierEventsTailer(input: {
         } else {
           offset = 0
         }
-        partial = Buffer.alloc(0)
-        skippingOversizedLine = false
+        resetLineState()
         return { ok: true, offset }
       })
     },
