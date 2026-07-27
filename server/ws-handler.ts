@@ -118,6 +118,7 @@ import {
   makeFreshAgentProviderErrorEvent,
   normalizeFreshAgentProviderEvent,
 } from './fresh-agent/sdk-events.js'
+import { FreshAgentLostSessionError } from './fresh-agent/runtime-manager.js'
 
 type WsHandlerConfig = {
   maxConnections: number
@@ -3574,6 +3575,10 @@ export class WsHandler {
             })
           }
         } catch (error) {
+          if (error instanceof FreshAgentLostSessionError) {
+            this.sendError(ws, { code: 'FRESH_AGENT_LOST_SESSION', message: errorMessage(error), requestId: m.requestId })
+            return
+          }
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: errorMessage(error), requestId: m.requestId })
         }
         return

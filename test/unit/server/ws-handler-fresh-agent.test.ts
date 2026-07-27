@@ -11,6 +11,7 @@ vi.mock('../../../server/config-store.js', () => ({
 
 import { WsHandler } from '../../../server/ws-handler.js'
 import { TerminalRegistry } from '../../../server/terminal-registry.js'
+import { FreshAgentLostSessionError } from '../../../server/fresh-agent/runtime-manager.js'
 import { configStore } from '../../../server/config-store.js'
 import { createDefaultServerSettings } from '../../../shared/settings.js'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
@@ -1175,6 +1176,75 @@ describe('WsHandler fresh-agent routing', () => {
       // Events dispatched through the NEW listener reach the client as freshAgent.event frames
       listeners.at(-1)!({ type: 'sdk.session.snapshot', sessionId: 'ses_9', status: 'running' })
       await vi.waitFor(() => expect(seenMessages.some((m) => m.type === 'freshAgent.event')).toBe(true))
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
+  it('propagates FRESH_AGENT_LOST_SESSION (with requestId) when the manager reports lost-session', async () => {
+    const runtimeManager = {
+      create: vi.fn().mockResolvedValue({ sessionId: 'ses_9', sessionType: 'freshopencode', runtimeProvider: 'opencode' }),
+      subscribe: vi.fn().mockReturnValue(() => undefined),
+      send: vi.fn().mockRejectedValue(new FreshAgentLostSessionError('Fresh-agent session freshopencode/opencode/ses_9 is not tracked')),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+    try {
+      const ws = await connectAndAuth(server)
+      const seenMessages: any[] = []
+      ws.on('message', (data) => { seenMessages.push(JSON.parse(data.toString())) })
+
+      // Authorize ses_9 via create (the file's canonical idiom) — NOT via attach.
+      ws.send(JSON.stringify({ type: 'freshAgent.create', requestId: 'req-1', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' }))
+      await vi.waitFor(() => expect(runtimeManager.create).toHaveBeenCalled())
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.send', requestId: 'r1', sessionId: 'ses_9',
+        sessionType: 'freshopencode', provider: 'opencode', cwd: '/w', text: 'hello',
+      }))
+      await vi.waitFor(() => {
+        const err = seenMessages.find((m) => m.type === 'error' && m.requestId === 'r1')
+        expect(err).toBeTruthy()
+        expect(err.code).toBe('FRESH_AGENT_LOST_SESSION')
+      })
+      expect(runtimeManager.send).toHaveBeenCalledTimes(1)
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
+  it('does not attach-retry inside the handler even for a cwd-bearing durable locator (client owns recovery)', async () => {
+    const runtimeManager = {
+      create: vi.fn().mockResolvedValue({ sessionId: 'ses_9', sessionType: 'freshopencode', runtimeProvider: 'opencode' }),
+      subscribe: vi.fn().mockReturnValue(() => undefined),
+      send: vi.fn().mockRejectedValue(new FreshAgentLostSessionError('Fresh-agent session freshopencode/opencode/ses_9 is not tracked')),
+      attach: vi.fn(),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+    try {
+      const ws = await connectAndAuth(server)
+      const seenMessages: any[] = []
+      ws.on('message', (data) => { seenMessages.push(JSON.parse(data.toString())) })
+
+      // Authorization comes from create — the client never sends freshAgent.attach in this test,
+      // so the attach spy is a pure detector for a server-side attach-retry.
+      ws.send(JSON.stringify({ type: 'freshAgent.create', requestId: 'req-1', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' }))
+      await vi.waitFor(() => expect(runtimeManager.create).toHaveBeenCalled())
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.send', requestId: 'r1', sessionId: 'ses_9',
+        sessionType: 'freshopencode', provider: 'opencode', cwd: '/w', text: 'hello',
+      }))
+      await vi.waitFor(() => {
+        const err = seenMessages.find((m) => m.type === 'error' && m.requestId === 'r1')
+        expect(err).toBeTruthy()
+        expect(err.code).toBe('FRESH_AGENT_LOST_SESSION')
+      })
+      expect(runtimeManager.attach).not.toHaveBeenCalled()   // no server-side retry: cwd-bearing recovery already ran inside manager.send
+      expect(runtimeManager.send).toHaveBeenCalledTimes(1)   // no blind retry loop
     } finally {
       handler.close()
       registry.shutdown()

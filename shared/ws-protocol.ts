@@ -33,6 +33,7 @@ export const ErrorCode = z.enum([
   'UNAUTHORIZED',
   'PROTOCOL_MISMATCH',
   'SESSION_RESERVED',
+  'FRESH_AGENT_LOST_SESSION',
 ])
 
 export type ErrorCode = z.infer<typeof ErrorCode>
