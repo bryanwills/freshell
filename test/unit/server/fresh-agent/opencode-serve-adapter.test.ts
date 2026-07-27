@@ -1469,7 +1469,34 @@ describe('interrupted-turn recovery (zrrj)', () => {
     expect(turnRecoveryAudits().some((e) => e.action === 'suppressed_already_recovered')).toBe(true)
   })
 
+  it('injects exactly one continuation when two restores race on the same session (no double-inject)', async () => {
+    // Multi-pane restore after a restart: two attaches of the same session land
+    // near-simultaneously. Without serializing the recovery passes, both hasRecovery
+    // reads resolve false before either recordRecovery lands (the store queues
+    // operations individually, with no atomic check-and-set) and BOTH inject —
+    // violating "at most ONE recovery per (session, message) ever".
+    observabilityMocks.recordFreshAgentObservabilityEvent.mockClear()
+    const store = makeTempRecoveryStore()
+    const manager = makeFakeManager()
+    manager.getSessionStatus.mockResolvedValue(undefined) // idle
+    manager.listMessages.mockResolvedValue(interruptedTranscript as any)
+    const adapter = makeAdapter(manager, { recoveryStore: store })
+
+    // Two schedule calls on the same state while the first pass is still in flight
+    // (its recovery-store reads are fs-async, so it cannot have finished yet).
+    await adapter.attach!({ sessionId: 'ses_int', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' })
+    await adapter.attach!({ sessionId: 'ses_int', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' })
+    await flushRecovery()
+
+    expect(manager.promptAsync).toHaveBeenCalledTimes(1)
+    const injected = turnRecoveryAudits().filter((e) => e.action === 'continuation_injected')
+    expect(injected).toHaveLength(1)
+    expect(turnRecoveryAudits().some((e) => e.action === 'suppressed_already_recovered')).toBe(true)
+    expect(await store.hasRecovery('ses_int', 'm2')).toBe(true)
+  })
+
   it('never recovers after an explicit user interrupt, across adapter instances', async () => {
+    observabilityMocks.recordFreshAgentObservabilityEvent.mockClear()
     const store = makeTempRecoveryStore()
     const manager = makeFakeManager()
     manager.getSessionStatus.mockResolvedValue(undefined)
@@ -1480,14 +1507,30 @@ describe('interrupted-turn recovery (zrrj)', () => {
     await adapter1.interrupt!('ses_int') // user stop
     expect(await store.hasInterrupt('ses_int')).toBe(true)
 
-    // Simulated restart: fresh adapter + manager sharing the durable store.
+    // Simulated restart: fresh adapter + manager sharing the durable store. The
+    // transcript now ends on a DIFFERENT interrupted assistant message (m9) — a
+    // fresh (session, message) pair with no ledger entry — so ledger suppression
+    // cannot mask the user-stop gate: only hasInterrupt can suppress this one.
     const manager2 = makeFakeManager()
     manager2.getSessionStatus.mockResolvedValue(undefined)
-    manager2.listMessages.mockResolvedValue(interruptedTranscript as any)
+    manager2.listMessages.mockResolvedValue({
+      messages: [
+        ...interruptedTranscript.messages,
+        { info: { id: 'm8', role: 'user', time: { created: OLD + 5 } }, parts: [] },
+        { info: { id: 'm9', role: 'assistant', time: { created: OLD + 10 } }, parts: [{ type: 'tool', state: { status: 'running' } }] },
+      ],
+      nextCursor: null,
+    } as any)
     const adapter2 = makeAdapter(manager2, { recoveryStore: store })
+    observabilityMocks.recordFreshAgentObservabilityEvent.mockClear()
     await adapter2.attach!({ sessionId: 'ses_int', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' })
     await flushRecovery()
     expect(manager2.promptAsync).not.toHaveBeenCalled()
+    // The suppression must come from the user-stop gate itself, not the ledger.
+    expect(turnRecoveryAudits().some((e) => e.action === 'suppressed_user_stop')).toBe(true)
+    expect(turnRecoveryAudits().some((e) => e.action === 'continuation_injected')).toBe(false)
+    // The gate fires before any ledger write: the fresh turn stays unburned.
+    expect(await store.hasRecovery('ses_int', 'm9')).toBe(false)
   })
 
   it('does not burn the recovery ledger on a no-cwd attach (route check precedes record)', async () => {

@@ -681,10 +681,21 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
   /** Fire-and-forget recovery kickoff after reconcileStatus on resume/attach. Only an
    * idle-reconciled restore is a candidate — a running session is being monitored by
    * armIdleRecovery; if that monitor later reports loss, the NEXT restore attempt will
-   * find the unfinished transcript and recover it here. */
+   * find the unfinished transcript and recover it here.
+   *
+   * Passes are CHAINED on the state, not fired in parallel: two near-simultaneous
+   * restores of the same session (multi-pane restore after a restart) must not both
+   * pass the `hasRecovery` gate before either `recordRecovery` lands — the store
+   * serializes operations individually but has no atomic check-and-set, so parallel
+   * passes could double-inject. Chaining guarantees the second pass's ledger read
+   * sees the first pass's record. The `.catch` keeps the chain rejection-safe
+   * (maybeRecoverInterruptedTurn never rejects by contract, but a poisoned chain
+   * would silently disable recovery forever). */
   function scheduleInterruptedTurnRecovery(state: OpencodeSessionState): void {
     if (state.status !== 'idle') return
-    state.pendingRecovery = maybeRecoverInterruptedTurn(state)
+    state.pendingRecovery = (state.pendingRecovery ?? Promise.resolve())
+      .catch(() => undefined)
+      .then(() => maybeRecoverInterruptedTurn(state))
   }
 
   async function assembleExport(
