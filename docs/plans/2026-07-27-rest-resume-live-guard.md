@@ -926,7 +926,7 @@ Closes the check-then-spawn race the D7 guard alone cannot (Design Decision 6): 
 - Consumes (all `pub` on `freshell-terminal` — verified during plan validation; mirror the WS call site at `crates/freshell-ws/src/terminal.rs:987-1215` for exact signatures):
   - `SessionLocator { provider, session_id }` and `SessionRefClaim::{Acquired, Held, ExpiredNeedsKill, BoundElsewhere}` (registry.rs:456-473; check the exact import path — `freshell_terminal::registry::...` or a crate-root re-export — before writing).
   - `TerminalRegistry::claim_session_ref(&SessionLocator, holder_create_request_id: &str, holder_conn: u64, now_ms: u64) -> SessionRefClaim` (registry.rs:1761-1767).
-  - `TerminalRegistry::{complete_session_ref_claim (:1913, atomic lease→binding, returns bool), fail_session_ref_claim (:1956), set_session_ref_lease_pid (:1890), force_release_after_confirmed_kill (:1997), pid_of (:2018), new_connection_id (:622)}` and `freshell_terminal::registry::pid_alive` (:437).
+  - `TerminalRegistry::{complete_session_ref_claim (:1913, atomic lease→binding, returns bool), fail_session_ref_claim (:1956), set_session_ref_lease_pid (:1890), force_release_after_confirmed_kill (:1997), pid_of (:2018), new_connection_id (:622), bound_terminal_for_session_ref (:2007, pub read of the sessionRef→terminalId bindings map — its doc-comment marks it a test probe; already used cross-crate by `freshell-ws/tests/session_ref_singleflight.rs`)}` and `freshell_terminal::registry::pid_alive` (:437).
 - Produces: REST resume spawns on the sessionRef rung are serialized by the registry lease; success records the sessionRef→terminalId binding, so later WS claims answer `BoundElsewhere` (adopt) instead of double-spawning.
 
 - [ ] **Step 1: Write the failing tests**
@@ -978,6 +978,13 @@ Add to the `terminal_tabs.rs` test module (reuse `LIVE_SESSION`, `recording_cli_
         let registry = state.terminal_registry.clone().unwrap();
         let router = app(state);
 
+        let locator = SessionLocator {
+            provider: "claude".into(),
+            session_id: LIVE_SESSION.into(),
+        };
+        // Precondition: nothing is bound before the spawn.
+        assert_eq!(registry.bound_terminal_for_session_ref(&locator), None);
+
         let (status, body) = post(
             router,
             "/api/tabs",
@@ -992,16 +999,19 @@ Add to the `terminal_tabs.rs` test module (reuse `LIVE_SESSION`, `recording_cli_
         assert_eq!(status, StatusCode::OK, "{body}");
         let tid = body["data"]["terminalId"].as_str().expect("terminalId").to_string();
 
-        // The REST spawn must have completed its claim into a binding: a later
-        // claim by anyone else answers BoundElsewhere{winner}, never a second spawn.
-        let locator = SessionLocator {
-            provider: "claude".into(),
-            session_id: LIVE_SESSION.into(),
-        };
-        match registry.claim_session_ref(&locator, "late-claimer", registry.new_connection_id(), test_now_ms()) {
-            SessionRefClaim::BoundElsewhere { terminal_id } => assert_eq!(terminal_id, tid),
-            other => panic!("expected BoundElsewhere, got {other:?}"),
-        }
+        // The REST spawn must have completed its claim into a sessionRef->terminalId
+        // binding. Observe the bindings map DIRECTLY via the pub test probe
+        // `bound_terminal_for_session_ref` (registry.rs:2007-2013; only
+        // complete_session_ref_claim writes that map). Do NOT probe this with a
+        // late claim_session_ref call: its row-join arm (registry.rs:1771-1773)
+        // answers BoundElsewhere from the Running row's resume_session_id stamp
+        // alone, so that probe passes even when no binding was ever recorded --
+        // it cannot distinguish completion from the D7 row-join.
+        assert_eq!(
+            registry.bound_terminal_for_session_ref(&locator),
+            Some(tid.clone()),
+            "REST resume spawn must complete its lease into a sessionRef binding"
+        );
 
         registry.kill(&tid);
     }
@@ -1015,7 +1025,7 @@ Add to the `terminal_tabs.rs` test module (reuse `LIVE_SESSION`, `recording_cli_
 cargo test -p freshell-freshagent --lib rest_create_resume_while_lease_held_is_refused_409
 cargo test -p freshell-freshagent --lib rest_create_resume_completes_claim_into_binding
 ```
-Expected red: the lease-held test gets **200** (no lease logic yet — spawn proceeds); the completion test fails on the claim result (**Acquired** instead of `BoundElsewhere`, because nothing recorded a binding).
+Expected red: the lease-held test gets **200** (no lease logic yet — spawn proceeds); the completion test fails on the binding probe (`bound_terminal_for_session_ref` returns **`None`** instead of `Some(tid)`, because nothing recorded a binding — the spawn's Running row stamps `resume_session_id`, which feeds the row-join arm of `claim_session_ref`, but only `complete_session_ref_claim` writes the bindings map the probe reads).
 
 - [ ] **Step 3: Implement the lease at the choke point**
 
