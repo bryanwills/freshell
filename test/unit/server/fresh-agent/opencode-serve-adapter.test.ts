@@ -29,6 +29,7 @@ vi.mock('../../../../server/fresh-agent/observability.js', async (importOriginal
 vi.mock('../../../../server/logger.js', () => ({ logger: loggerMocks.logger, freshAgentObservabilityLogger: loggerMocks.freshAgentObservabilityLogger }))
 
 import { createOpencodeFreshAgentAdapter } from '../../../../server/fresh-agent/adapters/opencode/adapter.js'
+import { OpencodeServeLostError } from '../../../../server/fresh-agent/adapters/opencode/serve-manager.js'
 import { FRESHOPENCODE_DEFAULT_MODEL } from '../../../../shared/fresh-agent-models.js'
 
 type FakeManager = ReturnType<typeof makeFakeManager>
@@ -155,7 +156,9 @@ describe('OpenCode serve adapter: create + send', () => {
     })
     expect(attached).toEqual({ sessionId: 'ses_real_1', sessionRef: { provider: 'opencode', sessionId: 'ses_real_1' } })
     expect(manager.subscribe).toHaveBeenCalledTimes(1)
-    expect(manager.subscribe).toHaveBeenCalledWith('ses_real_1', expect.any(Function))
+    // Third arg is the sidecar-loss handler (zrrj): serve stream binding registers
+    // an onLost listener alongside the event listener.
+    expect(manager.subscribe).toHaveBeenCalledWith('ses_real_1', expect.any(Function), expect.any(Function))
 
     // The in-flight send still completes with the correct result once idle resolves.
     idle.resolve()
@@ -588,6 +591,8 @@ describe('OpenCode serve adapter: create + send', () => {
   it('marks recovered durable sessions running only when OpenCode status is busy or retry', async () => {
     const manager = makeFakeManager()
     manager.getSessionStatus = vi.fn(async () => ({ type: 'busy' }))
+    // Keep the restore idle-recovery monitor (zrrj) pending so the session stays running.
+    manager.onceIdle = vi.fn(() => new Promise<void>(() => {}))
     const adapter = makeAdapter(manager)
 
     await adapter.attach?.({
@@ -613,6 +618,8 @@ describe('OpenCode serve adapter: create + send', () => {
     manager.getSessionStatus = vi.fn()
       .mockResolvedValueOnce({ type: 'busy' })
       .mockResolvedValueOnce({ nope: 'bad' })
+    // Keep the restore idle-recovery monitor (zrrj) pending so the first attach stays running.
+    manager.onceIdle = vi.fn(() => new Promise<void>(() => {}))
     const adapter = makeAdapter(manager)
 
     await adapter.attach?.({
@@ -732,6 +739,8 @@ describe('OpenCode serve adapter: create + send', () => {
   it('marks resumed durable sessions running when OpenCode reports retry', async () => {
     const manager = makeFakeManager()
     manager.getSessionStatus = vi.fn(async () => ({ type: 'retry' }))
+    // Keep the restore idle-recovery monitor (zrrj) pending so the session stays running.
+    manager.onceIdle = vi.fn(() => new Promise<void>(() => {}))
     const adapter = makeAdapter(manager)
 
     await adapter.resume?.({
@@ -1182,5 +1191,134 @@ describe('OpenCode serve adapter: status observability', () => {
     expect(running).toBeDefined()
     expect(running!.cwdHash).toBeDefined()
     expect(running!.cwdHash).not.toBe('/repo/work')
+  })
+})
+
+describe('restore reconciliation emits and monitors (zrrj)', () => {
+  it('emits a running session snapshot when attach reconciles a busy durable session', async () => {
+    // Ordering matters: attach registers the state via remember() BEFORE reconcile awaits
+    // getSessionStatus, so park the status read on a deferred, start attach, subscribe once
+    // the state is registered, THEN release the status read. The running emission must
+    // happen inside reconcile, DURING attach — an implementation that arms a monitor but
+    // never emits must FAIL here.
+    const manager = makeFakeManager()
+    const status = createDeferred<{ type: string } | undefined>()
+    manager.getSessionStatus = vi.fn(() => status.promise)
+    const adapter = makeAdapter(manager)
+    const events: any[] = []
+    const attaching = adapter.attach!({ sessionId: 'ses_live', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' })
+    await new Promise((r) => setImmediate(r)) // remember() has run; status read still parked
+    adapter.subscribe?.('ses_live', (ev) => events.push(ev))
+    status.resolve({ type: 'busy' })
+    await attaching
+    expect(events.some((e) => e.type === 'sdk.session.snapshot' && e.status === 'running')).toBe(true)
+  })
+
+  it('arms exactly one idle-recovery monitor per durable session and chimes on resolve', async () => {
+    const manager = makeFakeManager()
+    manager.getSessionStatus = vi.fn(async () => ({ type: 'busy' }))
+    const idle = createDeferred<void>()
+    manager.onceIdle = vi.fn(() => idle.promise)
+    const adapter = makeAdapter(manager)
+    const events: any[] = []
+    await adapter.attach!({ sessionId: 'ses_live', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' })
+    await adapter.attach!({ sessionId: 'ses_live', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' }) // second restore path
+    expect(manager.onceIdle).toHaveBeenCalledTimes(1) // exactly ONE monitor
+    adapter.subscribe?.('ses_live', (ev) => events.push(ev))
+    idle.resolve()
+    await new Promise((r) => setImmediate(r))
+    expect(events.some((e) => e.type === 'sdk.session.snapshot' && e.status === 'idle')).toBe(true)
+    expect(events.some((e) => e.type === 'sdk.turn.complete' && typeof e.at === 'number')).toBe(true)
+  })
+
+  it('emits idle + a structured interruption signal when the monitor rejects with sidecar loss', async () => {
+    const manager = makeFakeManager()
+    manager.getSessionStatus = vi.fn(async () => ({ type: 'busy' }))
+    const idle = createDeferred<void>()
+    manager.onceIdle = vi.fn(() => idle.promise)
+    const adapter = makeAdapter(manager)
+    const events: any[] = []
+    await adapter.attach!({ sessionId: 'ses_live', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' })
+    adapter.subscribe?.('ses_live', (ev) => events.push(ev))
+    idle.reject(new OpencodeServeLostError('ses_live'))
+    await new Promise((r) => setImmediate(r))
+    expect(events.some((e) => e.type === 'sdk.session.snapshot' && e.status === 'idle')).toBe(true)
+    expect(events.some((e) => e.type === 'sdk.error' && /interrupted/i.test(e.message))).toBe(true)
+    expect(events.some((e) => e.type === 'sdk.turn.complete')).toBe(false) // no chime on interruption
+  })
+
+  it('emits idle + a structured interruption signal when the monitor times out', async () => {
+    const manager = makeFakeManager()
+    manager.getSessionStatus = vi.fn(async () => ({ type: 'busy' }))
+    const idle = createDeferred<void>()
+    manager.onceIdle = vi.fn(() => idle.promise)
+    const adapter = makeAdapter(manager)
+    const events: any[] = []
+    await adapter.attach!({ sessionId: 'ses_live', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' })
+    adapter.subscribe?.('ses_live', (ev) => events.push(ev))
+    idle.reject(new Error('Timed out after 600000ms waiting for OpenCode session ses_live to go idle.'))
+    await new Promise((r) => setImmediate(r))
+    expect(events.some((e) => e.type === 'sdk.session.snapshot' && e.status === 'idle')).toBe(true)
+    expect(events.some((e) => e.type === 'sdk.error' && /interrupted/i.test(e.message))).toBe(true)
+    expect(events.some((e) => e.type === 'sdk.turn.complete')).toBe(false)
+  })
+
+  it('does not arm a monitor when reconcile finds the session idle/absent', async () => {
+    const manager = makeFakeManager()
+    manager.getSessionStatus = vi.fn(async () => undefined) // absent == idle
+    const adapter = makeAdapter(manager)
+    await adapter.attach!({ sessionId: 'ses_calm', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' })
+    expect(manager.onceIdle).not.toHaveBeenCalled()
+  })
+
+  it('disarms a cold monitor when a new user send starts (no double idle/chime)', async () => {
+    const manager = makeFakeManager()
+    manager.getSessionStatus = vi.fn(async () => ({ type: 'busy' }))
+    const monitorIdle = createDeferred<void>()
+    manager.onceIdle = vi.fn()
+      .mockReturnValueOnce(monitorIdle.promise) // the cold monitor's waiter
+      .mockResolvedValue(undefined) // the send path's own waiter
+    const adapter = makeAdapter(manager)
+    await adapter.attach!({ sessionId: 'ses_live', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' })
+    expect(manager.onceIdle).toHaveBeenCalledTimes(1)
+    const events: any[] = []
+    adapter.subscribe?.('ses_live', (ev) => events.push(ev))
+
+    await adapter.send?.('ses_live', { text: 'next turn' })
+    // The cancelled monitor resolving later must not add a second idle/chime for this turn.
+    monitorIdle.resolve()
+    await new Promise((r) => setImmediate(r))
+
+    const idles = events.filter((e) => e.type === 'sdk.session.snapshot' && e.status === 'idle')
+    const completions = events.filter((e) => e.type === 'sdk.turn.complete')
+    expect(idles).toHaveLength(1)
+    expect(completions).toHaveLength(1)
+  })
+
+  it('does not arm a monitor when an attach reconciles busy during an in-flight send (no double idle/chime)', async () => {
+    const sendIdle = createDeferred<void>()
+    const manager = makeFakeManager()
+    manager.getSessionStatus = vi.fn(async () => ({ type: 'busy' }))
+    manager.onceIdle = vi.fn(() => sendIdle.promise)
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'req-mid', sessionType: 'freshopencode', provider: 'opencode', cwd: '/repo' })
+    const events: any[] = []
+    adapter.subscribe?.('freshopencode-req-mid', (e) => events.push(e))
+
+    const sendPromise = adapter.send?.('freshopencode-req-mid', { text: 'go' })
+    await vi.waitFor(() => expect(manager.promptAsync).toHaveBeenCalled())
+
+    // A pane refresh/reveal attach arrives while the send path's own onceIdle owns the turn.
+    await adapter.attach!({ sessionId: 'ses_real_1', sessionType: 'freshopencode', provider: 'opencode', cwd: '/repo' })
+    expect(manager.onceIdle).toHaveBeenCalledTimes(1) // only the send path's waiter
+
+    sendIdle.resolve()
+    await sendPromise
+    await new Promise((r) => setImmediate(r))
+
+    const idles = events.filter((e) => e?.type === 'sdk.session.snapshot' && e.status === 'idle')
+    const completions = events.filter((e) => e?.type === 'sdk.turn.complete')
+    expect(idles).toHaveLength(1)
+    expect(completions).toHaveLength(1)
   })
 })

@@ -27,7 +27,7 @@ import {
   createWorkerHistoryReader,
   type OpencodeHistoryReader,
 } from './history-runner.js'
-import type { OpencodeServeManager } from './serve-manager.js'
+import { OpencodeServeLostError, type OpencodeServeManager } from './serve-manager.js'
 import { serveEventToSdk, splitOpencodeModel } from './serve-events.js'
 
 const OPENCODE_REAL_SESSION_ID = /^ses_/
@@ -116,6 +116,27 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
   const log = logger.child({ component: 'freshopencode-serve-adapter' })
   const sessions = new Map<string, OpencodeSessionState>()
 
+  /** Exactly one monitored idle-recovery per durable session key (kata zrrj).
+   * Factory-closure scope: the registry is per adapter instance, so tests get
+   * isolation by constructing a fresh adapter and a second adapter (simulated
+   * restart) cannot suppress or leak this instance's monitors. */
+  type IdleRecoveryMonitor = { promise: Promise<void>; cancelled: boolean }
+  const idleRecoveryMonitors = new Map<string, IdleRecoveryMonitor>()
+
+  /** Real ses_ ids with a user send currently in flight. armIdleRecovery must not arm
+   * while the send path's own onceIdle owns the turn (attach-mid-send double-fire guard). */
+  const sendsInFlight = new Set<string>()
+
+  /** Called by materializeOrSend before arming the send path's own onceIdle so a
+   * still-pending cold monitor cannot double-emit idle/chime for the new turn. */
+  function disarmIdleRecovery(realId: string): void {
+    const existing = idleRecoveryMonitors.get(realId)
+    if (existing) {
+      existing.cancelled = true
+      idleRecoveryMonitors.delete(realId)
+    }
+  }
+
   function remember(state: OpencodeSessionState) {
     sessions.set(state.placeholderId, state)
     if (state.realSessionId) sessions.set(state.realSessionId, state)
@@ -167,7 +188,13 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
   async function reconcileStatus(state: OpencodeSessionState): Promise<void> {
     const realId = state.realSessionId
     if (!realId) return
-    state.status = 'idle'
+    // Reconciliation resolves to idle unless the status map positively reports the
+    // session busy/retry. EMIT the transition (instead of mutating silently) so the
+    // client learns the restored status — but stay quiet on a fresh attach where the
+    // state is already idle, to avoid snapshot noise (kata zrrj).
+    const settleIdle = () => {
+      if (state.status !== 'idle') emitStatus(state, 'idle')
+    }
     const getSessionStatus = (serveManager as { getSessionStatus?: (sessionId: string, route?: { cwd?: string }) => Promise<{ type?: unknown } | undefined> }).getSessionStatus
     const logContext = {
       provider: 'opencode',
@@ -179,6 +206,7 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
         ...logContext,
         reason: 'missing_get_session_status',
       }, 'opencode status reconciliation skipped')
+      settleIdle()
       return
     }
     try {
@@ -187,27 +215,36 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       // so an idle session is absent (undefined). Treat a missing entry as idle —
       // consistent with the serve manager's onceIdle treatment of absence as idle —
       // rather than logging a false-positive malformed warning.
-      if (status == null) return
+      if (status == null) {
+        settleIdle()
+        return
+      }
       if (typeof status !== 'object' || Array.isArray(status) || typeof status.type !== 'string') {
         log.warn({
           ...logContext,
           reason: 'malformed_session_status',
           status,
         }, 'opencode status reconciliation received malformed status')
+        settleIdle()
         return
       }
       const type = status.type
       if (type === 'busy' || type === 'retry') {
-        state.status = 'running'
+        emitStatus(state, 'running')
+        // A restored running session needs a waiter or no idle/turn-complete ever
+        // arrives. armIdleRecovery dedupes against existing monitors AND against an
+        // in-flight send (whose own onceIdle owns the turn).
+        armIdleRecovery(state)
         return
       }
-      if (type === 'idle') return
+      settleIdle()
     } catch (err) {
       log.warn({
         ...logContext,
         err,
         reason: 'get_session_status_failed',
       }, 'opencode status reconciliation failed')
+      settleIdle()
     }
   }
 
@@ -284,30 +321,49 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
    * client first subscribed with. */
   function bindServeStream(state: OpencodeSessionState): void {
     if (state.unsubscribeServe || !state.realSessionId) return
-    state.unsubscribeServe = serveManager.subscribe(state.realSessionId, (parsed) => {
-      const mapped = serveEventToSdk(parsed, state.placeholderId)
-      if (mapped) {
-        if (mapped.type === 'sdk.error') {
-          // A turn error means the in-flight turn did not positively complete; the
-          // success path consults this when onceIdle later resolves on the post-error idle.
-          state.turnErrored = true
+    state.unsubscribeServe = serveManager.subscribe(
+      state.realSessionId,
+      (parsed) => {
+        const mapped = serveEventToSdk(parsed, state.placeholderId)
+        if (mapped) {
+          if (mapped.type === 'sdk.error') {
+            // A turn error means the in-flight turn did not positively complete; the
+            // success path consults this when onceIdle later resolves on the post-error idle.
+            state.turnErrored = true
+          }
+          if (mapped.type === 'sdk.session.snapshot') {
+            const status: 'running' | 'idle' = mapped.status === 'idle' ? 'idle' : 'running'
+            state.status = status
+            recordFreshAgentObservabilityEvent({
+              kind: 'fresh_agent_opencode_status_observed',
+              provider: 'opencode',
+              sessionIdHash: hashForLogs(state.realSessionId ?? state.placeholderId),
+              status,
+              source: 'sse',
+              opencodeEventKind: parsed.kind,
+              ...(state.cwd ? { cwdHash: hashForLogs(state.cwd) } : {}),
+            })
+          }
+          state.events.emit('event', mapped)
         }
-        if (mapped.type === 'sdk.session.snapshot') {
-          const status: 'running' | 'idle' = mapped.status === 'idle' ? 'idle' : 'running'
-          state.status = status
-          recordFreshAgentObservabilityEvent({
-            kind: 'fresh_agent_opencode_status_observed',
-            provider: 'opencode',
-            sessionIdHash: hashForLogs(state.realSessionId ?? state.placeholderId),
-            status,
-            source: 'sse',
-            opencodeEventKind: parsed.kind,
-            ...(state.cwd ? { cwdHash: hashForLogs(state.cwd) } : {}),
+      },
+      () => {
+        // Sidecar lost while this session shows running: never leave the pane busy.
+        // Idempotent with the idle-recovery monitor's own loss reaction — whichever runs
+        // first flips status to idle and the other no-ops on the status guard, so one
+        // loss yields exactly one structured interruption. (With survive-replacement
+        // emitters, this same subscription keeps receiving events from a replacement
+        // sidecar — no rebind needed.)
+        if (state.status === 'running') {
+          emitStatus(state, 'idle')
+          state.events.emit('event', {
+            type: 'sdk.error',
+            sessionId: state.placeholderId,
+            message: 'OpenCode turn interrupted: sidecar connection was lost while the turn was running.',
           })
         }
-        state.events.emit('event', mapped)
-      }
-    })
+      },
+    )
   }
 
   function emitStatus(state: OpencodeSessionState, status: 'running' | 'idle'): void {
@@ -321,6 +377,81 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       source: 'adapter',
       ...(state.cwd ? { cwdHash: hashForLogs(state.cwd) } : {}),
     })
+  }
+
+  /** Arm the restore idle-recovery monitor for a durable session reconciled as busy.
+   * Exactly one monitor per real ses_ id; no-op while a user send is in flight (its own
+   * onceIdle owns the turn). Resolve emits idle (+ chime unless the turn aborted/errored);
+   * reject (timeout / sidecar loss) emits idle + a structured interruption signal so the
+   * pane is never left busy forever. */
+  function armIdleRecovery(state: OpencodeSessionState): void {
+    const realId = state.realSessionId
+    if (!realId) return
+    if (idleRecoveryMonitors.has(realId) || sendsInFlight.has(realId)) {
+      // Second disjunct: attach-mid-send guard — the send path's own onceIdle owns this turn.
+      recordFreshAgentObservabilityEvent({
+        kind: 'fresh_agent_monitor',
+        provider: 'opencode',
+        sessionIdHash: hashForLogs(realId),
+        ...(state.cwd ? { cwdHash: hashForLogs(state.cwd) } : {}),
+        phase: 'duplicate_suppressed',
+      })
+      return
+    }
+    const route = cwdRoute(state.cwd)
+    const generation = typeof serveManager.currentGeneration === 'function' ? serveManager.currentGeneration() : undefined
+    const monitorEvent = (phase: 'armed' | 'resolved_idle' | 'timeout' | 'sidecar_lost') =>
+      recordFreshAgentObservabilityEvent({
+        kind: 'fresh_agent_monitor',
+        provider: 'opencode',
+        sessionIdHash: hashForLogs(realId),
+        ...(state.cwd ? { cwdHash: hashForLogs(state.cwd) } : {}),
+        phase,
+        ...(generation !== undefined ? { sidecarGeneration: generation } : {}),
+      })
+    monitorEvent('armed')
+    const monitor: IdleRecoveryMonitor = { promise: Promise.resolve(), cancelled: false }
+    // assumeActive: arming always follows a reconcile that OBSERVED busy, so seed the
+    // activity gate — without it, a turn that finished in the read->arm gap hangs to the
+    // 10-min timeout and emits a false "interrupted" (A4).
+    const idle = route
+      ? serveManager.onceIdle(realId, DEFAULT_TURN_TIMEOUT_MS, route, { assumeActive: true })
+      : serveManager.onceIdle(realId, DEFAULT_TURN_TIMEOUT_MS, undefined, { assumeActive: true })
+    monitor.promise = idle
+      .then(() => {
+        if (monitor.cancelled) return // disarmed by a newer user send — its own onceIdle owns this turn
+        emitStatus(state, 'idle')
+        monitorEvent('resolved_idle')
+        // Restored sessions have both flags undefined -> falsy -> chime allowed; the
+        // pre-restart error is unobservable and OpenCode reporting busy->idle is the
+        // best positive-completion signal available.
+        if (!state.turnAborted && !state.turnErrored) {
+          const completionAt = nextMonotonicTurnCompleteAt(state.lastTurnCompleteAt, Date.now())
+          state.lastTurnCompleteAt = completionAt
+          state.events.emit('event', { type: 'sdk.turn.complete', sessionId: state.placeholderId, at: completionAt })
+        }
+      })
+      .catch((error: unknown) => {
+        if (monitor.cancelled) return
+        const lost = error instanceof OpencodeServeLostError
+        monitorEvent(lost ? 'sidecar_lost' : 'timeout')
+        // Status guard makes the loss reaction idempotent with bindServeStream's onLost
+        // handler: whichever runs first flips status to idle; the other becomes a no-op,
+        // so one loss yields exactly one structured interruption emission.
+        if (state.status !== 'running') return
+        emitStatus(state, 'idle')
+        state.events.emit('event', {
+          type: 'sdk.error',
+          sessionId: state.placeholderId,
+          message: lost
+            ? 'OpenCode turn interrupted: sidecar connection was lost while the turn was running.'
+            : 'OpenCode turn interrupted: idle recovery timed out.',
+        })
+      })
+      .finally(() => {
+        if (idleRecoveryMonitors.get(realId) === monitor) idleRecoveryMonitors.delete(realId)
+      })
+    idleRecoveryMonitors.set(realId, monitor)
   }
 
   function emitMaterialized(state: OpencodeSessionState): void {
@@ -364,34 +495,46 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
 
       const realId = state.realSessionId!
       await ensureMutableRoute(state)
-      const idleRoute = cwdRoute(state.cwd)
-      const idle = idleRoute
-        ? serveManager.onceIdle(realId, turnTimeoutMs, idleRoute)
-        : serveManager.onceIdle(realId, turnTimeoutMs)
-      // If promptAsync fails and we leave via the catch(), `idle` may still
-      // reject later on its timeout timer. Attach a no-op handler now so that
-      // later rejection cannot become an unhandled rejection.
-      void idle.catch(() => {})
-      await promptAsyncForState(state, realId, {
-        parts: [{ type: 'text', text }],
-        ...(splitOpencodeModel(modelStr) ? { model: splitOpencodeModel(modelStr)! } : {}),
-        ...(effort ? { variant: effort } : {}),
-      })
-      await idle
-      state.model = modelStr ?? state.model
-      state.effort = effort
-      emitStatus(state, 'idle')
-      // Server-authoritative turn-complete edge for the GREEN/SOUND pipeline. onceIdle
-      // resolves on ANY idle — including the idle an interrupt's abort triggers or the idle
-      // that follows an errored turn — so a positive completion requires that the turn was
-      // neither interrupted nor errored. (The catch below for abort/interrupt/sidecar loss
-      // and the serve SSE idle relay also never chime.)
-      if (!state.turnAborted && !state.turnErrored) {
-        const completionAt = nextMonotonicTurnCompleteAt(state.lastTurnCompleteAt, Date.now())
-        state.lastTurnCompleteAt = completionAt
-        state.events.emit('event', { type: 'sdk.turn.complete', sessionId: state.placeholderId, at: completionAt })
+      // The user send owns this turn: cancel any still-pending restore idle-recovery
+      // monitor (it would otherwise resolve on THIS turn's idle and double-emit
+      // idle/chime), and flag the send so armIdleRecovery cannot arm a second waiter
+      // while we are parked on our own onceIdle (attach-mid-send).
+      disarmIdleRecovery(realId)
+      sendsInFlight.add(realId)
+      try {
+        const idleRoute = cwdRoute(state.cwd)
+        const idle = idleRoute
+          ? serveManager.onceIdle(realId, turnTimeoutMs, idleRoute)
+          : serveManager.onceIdle(realId, turnTimeoutMs)
+        // If promptAsync fails and we leave via the catch(), `idle` may still
+        // reject later on its timeout timer. Attach a no-op handler now so that
+        // later rejection cannot become an unhandled rejection.
+        void idle.catch(() => {})
+        await promptAsyncForState(state, realId, {
+          parts: [{ type: 'text', text }],
+          ...(splitOpencodeModel(modelStr) ? { model: splitOpencodeModel(modelStr)! } : {}),
+          ...(effort ? { variant: effort } : {}),
+        })
+        await idle
+        state.model = modelStr ?? state.model
+        state.effort = effort
+        emitStatus(state, 'idle')
+        // Server-authoritative turn-complete edge for the GREEN/SOUND pipeline. onceIdle
+        // resolves on ANY idle — including the idle an interrupt's abort triggers or the idle
+        // that follows an errored turn — so a positive completion requires that the turn was
+        // neither interrupted nor errored. (The catch below for abort/interrupt/sidecar loss
+        // and the serve SSE idle relay also never chime.)
+        if (!state.turnAborted && !state.turnErrored) {
+          const completionAt = nextMonotonicTurnCompleteAt(state.lastTurnCompleteAt, Date.now())
+          state.lastTurnCompleteAt = completionAt
+          state.events.emit('event', { type: 'sdk.turn.complete', sessionId: state.placeholderId, at: completionAt })
+        }
+        return sendResult(state.realSessionId)
+      } finally {
+        // The send's turn has settled either way; a later restore/attach may arm a
+        // monitor again.
+        sendsInFlight.delete(realId)
       }
-      return sendResult(state.realSessionId)
     } catch (error) {
       emitStatus(state, 'idle')
       throw error
@@ -585,6 +728,8 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       const state = requireState(sessionId)
       await ensureMutableRoute(state)
       try { state.unsubscribeServe?.() } catch { /* ignore */ }
+      // A killed session must not receive a late monitor idle/interruption emission.
+      if (state.realSessionId) disarmIdleRecovery(state.realSessionId)
       sessions.delete(state.placeholderId)
       if (state.realSessionId) sessions.delete(state.realSessionId)
       return true

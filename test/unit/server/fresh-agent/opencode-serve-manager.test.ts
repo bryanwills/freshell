@@ -679,6 +679,25 @@ describe('OpencodeServeManager fan-out', () => {
     await expect(manager.onceIdle('ses_a', 30)).rejects.toThrow(/idle/i)
   })
 
+  it('onceIdle with assumeActive resolves from status-map absence without prior observed activity (zrrj)', async () => {
+    // Arm-time activity seed (A4): the caller (adapter idle-recovery monitor) just OBSERVED
+    // the session busy via the status map, so its own observation counts as the first
+    // activity mark. A turn that completed in the read->arm gap must resolve in a couple of
+    // idle polls, NOT hang to the timeout and emit a false "interrupted".
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.endsWith('/global/health')) return jsonResponse({ healthy: true })
+      if (url.endsWith('/session/status')) return jsonResponse({}) // idle/absent throughout
+      return jsonResponse({})
+    })
+    const { manager } = makeManager({
+      fetchFn: fetchFn as any,
+      idlePollMs: 5,
+    })
+    await manager.ensureStarted()
+
+    await expect(manager.onceIdle('ses_done', 5_000, undefined, { assumeActive: true })).resolves.toBeUndefined()
+  })
+
   it('onceIdle ignores late message.updated events when the status map stays absent', async () => {
     let push!: (e: any) => void
     const fetchFn = vi.fn(async (url: string) => {

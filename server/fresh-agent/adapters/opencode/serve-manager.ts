@@ -493,20 +493,37 @@ export class OpencodeServeManager {
     this.emitterFor(parsed.sessionId).emit('event', parsed)
   }
 
-  subscribe(sessionId: string, listener: (event: ParsedServeEvent) => void): () => void {
+  subscribe(
+    sessionId: string,
+    listener: (event: ParsedServeEvent) => void,
+    onLost?: (err: OpencodeServeLostError) => void,
+  ): () => void {
     const emitter = this.emitterFor(sessionId)
     emitter.on('event', listener)
+    if (onLost) emitter.on('lost', onLost)
     return () => {
       emitter.off('event', listener)
+      if (onLost) emitter.off('lost', onLost)
       this.releaseEmitterIfIdle(sessionId, emitter)
     }
   }
 
-  onceIdle(sessionId: string, timeoutMs: number, route: ServeRoute = {}): Promise<void> {
+  onceIdle(
+    sessionId: string,
+    timeoutMs: number,
+    route: ServeRoute = {},
+    options?: { assumeActive?: boolean },
+  ): Promise<void> {
     return new Promise((resolve, reject) => {
       const emitter = this.emitterFor(sessionId)
       let settled = false
-      let observedActivity = false
+      // Arm-time activity seed (zrrj A4): a caller that just OBSERVED the session busy
+      // (e.g. the adapter's restore idle-recovery monitor arming right after reconcile)
+      // may treat its own observation as the first activity mark. Without the seed, a
+      // turn that completed in the read->arm gap hangs to the timeout and produces a
+      // false "interrupted". The send path keeps the default (unseeded) — its activity
+      // gate exists to avoid resolving before the prompt registers.
+      let observedActivity = options?.assumeActive === true
       let pollInFlight = false
       let idleStatusPolls = 0
       let warnedStatusFallbackFailure = false
