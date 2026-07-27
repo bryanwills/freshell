@@ -2739,6 +2739,23 @@ mod tests {
         });
     }
 
+    async fn create_shell_tab(router: Router) -> (String, String, String) {
+        let tmp = std::env::temp_dir();
+        let (status, body) = post(
+            router,
+            "/api/tabs",
+            json!({ "mode": "shell", "cwd": tmp.to_string_lossy() }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        (
+            body["data"]["tabId"].as_str().unwrap().to_string(),
+            body["data"]["paneId"].as_str().unwrap().to_string(),
+            body["data"]["terminalId"].as_str().unwrap().to_string(),
+        )
+    }
+
     #[tokio::test]
     async fn rest_create_resume_onto_live_session_is_refused_409_restore_unavailable() {
         let argv_file = unique_argv_file("d7-rest-live-refusal");
@@ -2854,6 +2871,152 @@ mod tests {
         assert_eq!(body["code"], json!("RESTORE_UNAVAILABLE"), "{body}");
 
         registry.kill("t-adopted");
+    }
+
+    #[tokio::test]
+    async fn rest_respawn_resume_onto_live_session_is_refused_409() {
+        let argv_file = unique_argv_file("d7-respawn-live-refusal");
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec("claude", &argv_file)]));
+        let registry = state.terminal_registry.clone().unwrap();
+        let router = app(state);
+        let (_tab_id, pane_id, shell_tid) = create_shell_tab(router.clone()).await;
+        forge_live_owner(&registry, "t-live-owner-respawn");
+
+        let (status, body) = post(
+            router,
+            &format!("/api/panes/{pane_id}/respawn"),
+            json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": { "provider": "claude", "sessionId": LIVE_SESSION },
+            }),
+            true,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], json!("RESTORE_UNAVAILABLE"), "{body}");
+
+        registry.kill("t-live-owner-respawn");
+        registry.kill(&shell_tid);
+    }
+
+    #[tokio::test]
+    async fn rest_respawn_resume_after_owner_exits_succeeds() {
+        let argv_file = unique_argv_file("d7-respawn-after-exit");
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec("claude", &argv_file)]));
+        let registry = state.terminal_registry.clone().unwrap();
+        let router = app(state);
+        let (_tab_id, pane_id, shell_tid) = create_shell_tab(router.clone()).await;
+        forge_live_owner(&registry, "t-exited-owner-respawn");
+        assert!(registry.finish_pty_exit("t-exited-owner-respawn", 0));
+
+        let (status, body) = post(
+            router,
+            &format!("/api/panes/{pane_id}/respawn"),
+            json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": { "provider": "claude", "sessionId": LIVE_SESSION },
+            }),
+            true,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let new_tid = body["data"]["terminalId"]
+            .as_str()
+            .expect("terminalId")
+            .to_string();
+        assert!(registry.is_running(&new_tid));
+
+        registry.kill(&new_tid);
+        registry.kill(&shell_tid);
+    }
+
+    /// No self-exemption: the pane's OWN still-running terminal counts as the
+    /// live owner. Respawning pane P (which detaches -- never kills -- its old
+    /// terminal) with the same sessionRef would make two live writers for S.
+    #[tokio::test]
+    async fn rest_respawn_same_pane_own_live_session_is_refused_409() {
+        let argv_file = unique_argv_file("d7-respawn-self-collision");
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec("claude", &argv_file)]));
+        let registry = state.terminal_registry.clone().unwrap();
+        let router = app(state);
+
+        // First create resumes S with no live owner -> 200; leaves a Running
+        // claude terminal whose row is stamped resume_session_id = S.
+        let (status, body) = post(
+            router.clone(),
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": { "provider": "claude", "sessionId": LIVE_SESSION },
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let pane_id = body["data"]["paneId"].as_str().expect("paneId").to_string();
+        let first_tid = body["data"]["terminalId"]
+            .as_str()
+            .expect("terminalId")
+            .to_string();
+        assert!(registry.is_running(&first_tid));
+
+        let (status, body) = post(
+            router,
+            &format!("/api/panes/{pane_id}/respawn"),
+            json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": { "provider": "claude", "sessionId": LIVE_SESSION },
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], json!("RESTORE_UNAVAILABLE"), "{body}");
+        assert!(
+            registry.is_running(&first_tid),
+            "old terminal untouched by refusal"
+        );
+
+        registry.kill(&first_tid);
+    }
+
+    #[tokio::test]
+    async fn rest_split_resume_onto_live_session_is_refused_409() {
+        let argv_file = unique_argv_file("d7-split-live-refusal");
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec("claude", &argv_file)]));
+        let registry = state.terminal_registry.clone().unwrap();
+        let router = app(state);
+        let (_tab_id, pane_id, shell_tid) = create_shell_tab(router.clone()).await;
+        forge_live_owner(&registry, "t-live-owner-split");
+
+        let (status, body) = post(
+            router,
+            &format!("/api/panes/{pane_id}/split"),
+            json!({
+                "direction": "vertical",
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": { "provider": "claude", "sessionId": LIVE_SESSION },
+            }),
+            true,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], json!("RESTORE_UNAVAILABLE"), "{body}");
+
+        registry.kill("t-live-owner-split");
+        registry.kill(&shell_tid);
     }
 
     #[tokio::test]
