@@ -49,6 +49,7 @@ use freshell_platform::{
     RealFileProbe, ShellType, SpawnSpec,
 };
 use freshell_protocol::{ServerMessage, SessionLocator, UiCommand};
+use freshell_terminal::registry::SessionRefClaim;
 
 use crate::{
     authorized, fail_json, fail_json_code, ok_json, text_plain, FreshAgentState, TabRecord,
@@ -553,6 +554,64 @@ fn codex_effective_resume_session_id(
         .map(|requested| plan_session_id.unwrap_or(requested).to_string())
 }
 
+/// RAII release of a D8 sessionRef lease claim on the REST rung (port of the
+/// WS path's `SessionRefLeaseGuard`, `crates/freshell-ws/src/terminal.rs`):
+/// on EVERY non-complete exit of [`spawn_terminal_pane`] between claim and
+/// completion -- pre-spawn error, `registry.create` failure, codex adopt
+/// failure, or axum cancelling the request future -- drop releases the lease
+/// via `fail_session_ref_claim` (a no-op once `complete_session_ref_claim`
+/// removed it). The winner path disarms and completes explicitly.
+struct RestSessionRefLease {
+    registry: freshell_terminal::TerminalRegistry,
+    locator: SessionLocator,
+    holder_create_request_id: String,
+    armed: bool,
+}
+
+impl RestSessionRefLease {
+    fn new(
+        registry: freshell_terminal::TerminalRegistry,
+        locator: SessionLocator,
+        holder_create_request_id: String,
+    ) -> Self {
+        Self {
+            registry,
+            locator,
+            holder_create_request_id,
+            armed: true,
+        }
+    }
+
+    /// Hand ownership of the release decision back to the caller (winner
+    /// bind or the revoked-lease kill path).
+    fn disarm(mut self) -> SessionLocator {
+        self.armed = false;
+        self.locator.clone()
+    }
+}
+
+impl Drop for RestSessionRefLease {
+    fn drop(&mut self) {
+        if self.armed {
+            self.registry
+                .fail_session_ref_claim(&self.locator, &self.holder_create_request_id);
+        }
+    }
+}
+
+/// Poll `kill(pid, 0)` for ESRCH for up to 500ms (the PTY's dedicated waiter
+/// thread reaps promptly -- `pty.rs` reader/waiter; same 20x25ms cadence as
+/// the WS path's `confirm_pid_dead_within_500ms`). `true` = death CONFIRMED.
+async fn confirm_pid_dead_within_500ms(pid: u32) -> bool {
+    for _ in 0..20u8 {
+        if !freshell_terminal::registry::pid_alive(pid) {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    !freshell_terminal::registry::pid_alive(pid)
+}
+
 /// The terminal-mode spawn pipeline (`router.ts:724-793` for create,
 /// `router.ts:1326-1369` for split -- the original reuses the SAME
 /// `resolveSpawnProviderSettings`/`registry.create` sequence for both routes, and this
@@ -652,6 +711,7 @@ pub(crate) async fn spawn_terminal_pane(
     // self-exemption for respawn: the old terminal is deliberately never
     // killed ("detach, don't kill"), so resuming its live session in a second
     // PTY would be exactly the two-writers corruption this guard forbids.
+    let mut session_ref_lease: Option<RestSessionRefLease> = None;
     if let Some(live_sid) = accepted_session_ref
         .as_ref()
         .map(|r| r.session_id.as_str())
@@ -673,6 +733,55 @@ pub(crate) async fn spawn_terminal_pane(
                 "RESTORE_UNAVAILABLE",
                 format!("Session {live_sid} is still running on the server."),
             ));
+        }
+
+        // D8 session-ref lease, REST rung (Design Decision 6) -- D7 above is
+        // check-then-spawn: two concurrent REST resumes (or REST x WS) could
+        // both pass it and spawn two JSONL writers for one session. Claim the
+        // registry's per-sessionRef lease (the same primitive the WS create
+        // path holds) BEFORE spawning; the RAII guard releases it on every
+        // error path between here and the post-create completion. Holder id
+        // is the already-minted create_request_id; holder_conn is a fresh
+        // registry connection id (collision-free with WS conn cleanup -- REST
+        // leases rely on RAII drop + the lease TTL, not conn-death cleanup).
+        let locator = SessionLocator {
+            provider: mode.clone(),
+            session_id: live_sid.to_string(),
+        };
+        match registry.claim_session_ref(
+            &locator,
+            &create_request_id,
+            registry.new_connection_id(),
+            now_ms().max(0) as u64,
+        ) {
+            SessionRefClaim::Acquired => {
+                session_ref_lease = Some(RestSessionRefLease::new(
+                    registry.clone(),
+                    locator,
+                    create_request_id.clone(),
+                ));
+            }
+            // Conservative v1 (Design Decision 6): every non-Acquired arm
+            // answers the same 409 envelope. Held = a claim is in flight;
+            // BoundElsewhere = a live winner exists (D7's own answer);
+            // ExpiredNeedsKill = crashed holder -- no kill-and-adopt logic on
+            // REST, the lease TTL is the backstop.
+            SessionRefClaim::Held { .. }
+            | SessionRefClaim::BoundElsewhere { .. }
+            | SessionRefClaim::ExpiredNeedsKill { .. } => {
+                tracing::warn!(
+                    target: "freshell_freshagent::terminal_tabs",
+                    mode = %mode,
+                    session_id = %live_sid,
+                    pane_id = %pane_id,
+                    "spawn_refused: sessionRef lease unavailable (D8, REST rung)"
+                );
+                return Err(fail_json_code(
+                    StatusCode::CONFLICT,
+                    "RESTORE_UNAVAILABLE",
+                    format!("Session {live_sid} is still running on the server."),
+                ));
+            }
         }
     }
 
@@ -957,6 +1066,19 @@ pub(crate) async fn spawn_terminal_pane(
         return Err(fail_json(StatusCode::BAD_REQUEST, message));
     }
 
+    // D8: arm the lease's TTL kill path -- record the just-spawned child's pid
+    // on the winner's lease immediately (its presence decides ExpiredNeedsKill
+    // vs revoke-and-hold-closed on expiry). Mirrors the WS create path.
+    if let Some(guard) = &session_ref_lease {
+        if let Some(pid) = registry.pid_of(&terminal_id) {
+            registry.set_session_ref_lease_pid(
+                &guard.locator,
+                &guard.holder_create_request_id,
+                pid,
+            );
+        }
+    }
+
     // DEV-0006 S4: adopt the managed codex launch for this terminal
     // (`adoptCodexLaunch` → `launch.codexPlan.sidecar.adopt({terminalId, generation: 0})`,
     // `router.ts:254,1591`) — ownership transfers from the planner to the terminal; the
@@ -993,6 +1115,53 @@ pub(crate) async fn spawn_terminal_pane(
         cwd.as_deref(),
         resume_session_id.as_deref(),
     );
+
+    // D8 winner bind (REST rung): record sessionRef->terminalId in the
+    // REGISTRY binding map (inside `complete_session_ref_claim` -- atomic with
+    // the lease release, then the duplicate alarm). A completed binding makes
+    // later WS claims answer BoundElsewhere (adopt) instead of double-spawning.
+    if let Some(guard) = session_ref_lease.take() {
+        let locator = guard.disarm();
+        if registry.complete_session_ref_claim(&locator, &create_request_id, &terminal_id) {
+            tracing::info!(
+                target: "freshell_freshagent::terminal_tabs",
+                terminal_id = %terminal_id,
+                provider = %locator.provider,
+                session_id = %locator.session_id,
+                "session_ref.winner_bound (REST rung)"
+            );
+        } else {
+            // Revoked while spawning (TTL expired on the then-pid-less lease):
+            // kill OUR OWN just-spawned child via the registry handle
+            // (group-kill discipline), confirm, and fail the create loudly --
+            // never leave an orphan running.
+            let pid = registry.pid_of(&terminal_id);
+            registry.kill(&terminal_id);
+            let confirmed = match pid {
+                Some(pid) => confirm_pid_dead_within_500ms(pid).await,
+                // No pid handle to probe: the registry kill removed the row;
+                // nothing is left to signal, so treat as confirmed.
+                None => true,
+            };
+            if confirmed {
+                registry.force_release_after_confirmed_kill(&locator);
+            } else {
+                tracing::error!(target: "invariant",
+                    terminal_id = %terminal_id,
+                    provider = %locator.provider,
+                    session_id = %locator.session_id,
+                    "session_ref_lease_revoked_child_kill_unconfirmed: holding lease closed (REST rung)");
+            }
+            return Err(fail_json_code(
+                StatusCode::CONFLICT,
+                "RESTORE_UNAVAILABLE",
+                format!(
+                    "Session {} is still running on the server.",
+                    locator.session_id
+                ),
+            ));
+        }
+    }
 
     let mut pane_content = json!({
         "kind": "terminal",
@@ -3017,6 +3186,105 @@ mod tests {
 
         registry.kill("t-live-owner-split");
         registry.kill(&shell_tid);
+    }
+
+    // ── D8 session-ref lease, REST rung (ks38) ──────────────────────────────
+
+    /// `claim_session_ref` takes a u64 wall-clock ms; reuse the module's
+    /// `now_ms()` (i64 `Date.now()` semantics) clamped exactly like the WS
+    /// claim site (`freshell-ws/src/terminal.rs`: `now_ms().max(0) as u64`).
+    fn test_now_ms() -> u64 {
+        now_ms().max(0) as u64
+    }
+
+    #[tokio::test]
+    async fn rest_create_resume_while_lease_held_is_refused_409() {
+        let argv_file = unique_argv_file("d8-lease-held-refusal");
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec("claude", &argv_file)]));
+        let registry = state.terminal_registry.clone().unwrap();
+        let router = app(state);
+
+        // A foreign holder (e.g. an in-flight WS create) holds the lease.
+        let locator = SessionLocator {
+            provider: "claude".into(),
+            session_id: LIVE_SESSION.into(),
+        };
+        assert!(matches!(
+            registry.claim_session_ref(
+                &locator,
+                "foreign-holder",
+                registry.new_connection_id(),
+                test_now_ms()
+            ),
+            SessionRefClaim::Acquired
+        ));
+
+        let (status, body) = post(
+            router,
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": { "provider": "claude", "sessionId": LIVE_SESSION },
+            }),
+            true,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], json!("RESTORE_UNAVAILABLE"), "{body}");
+
+        registry.fail_session_ref_claim(&locator, "foreign-holder");
+    }
+
+    #[tokio::test]
+    async fn rest_create_resume_completes_claim_into_binding() {
+        let argv_file = unique_argv_file("d8-lease-completion");
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec("claude", &argv_file)]));
+        let registry = state.terminal_registry.clone().unwrap();
+        let router = app(state);
+
+        let locator = SessionLocator {
+            provider: "claude".into(),
+            session_id: LIVE_SESSION.into(),
+        };
+        // Precondition: nothing is bound before the spawn.
+        assert_eq!(registry.bound_terminal_for_session_ref(&locator), None);
+
+        let (status, body) = post(
+            router,
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": { "provider": "claude", "sessionId": LIVE_SESSION },
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let tid = body["data"]["terminalId"]
+            .as_str()
+            .expect("terminalId")
+            .to_string();
+
+        // The REST spawn must have completed its claim into a sessionRef->terminalId
+        // binding. Observe the bindings map DIRECTLY via the pub test probe
+        // `bound_terminal_for_session_ref` (registry.rs:2007-2013; only
+        // complete_session_ref_claim writes that map). Do NOT probe this with a
+        // late claim_session_ref call: its row-join arm (registry.rs:1771-1773)
+        // answers BoundElsewhere from the Running row's resume_session_id stamp
+        // alone, so that probe passes even when no binding was ever recorded --
+        // it cannot distinguish completion from the D7 row-join.
+        assert_eq!(
+            registry.bound_terminal_for_session_ref(&locator),
+            Some(tid.clone()),
+            "REST resume spawn must complete its lease into a sessionRef binding"
+        );
+
+        registry.kill(&tid);
     }
 
     #[tokio::test]
