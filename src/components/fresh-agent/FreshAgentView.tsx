@@ -67,6 +67,11 @@ const BUSY_STATES = new Set(['running', 'compacting'])
 // server's create.failed carries no retry-after field by design).
 export const FRESH_AGENT_RESERVE_RETRY_WINDOW_MS = 30_000
 export const FRESH_AGENT_RESERVE_RETRY_FLOOR_MS = 1_000
+// Task 16 (zrrj): bounded re-poll when an idle snapshot is missing the
+// just-sent turn (server emitted idle before the durable transcript caught
+// up). Exported so tests assert the cap against the real constant.
+export const IDLE_INCOMPLETE_MAX_RETRIES = 5
+const IDLE_INCOMPLETE_RETRY_DELAY_MS = 1_000
 const SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS = new Set([
   'freshAgent.session.changed',
   'freshAgent.session.snapshot',
@@ -636,6 +641,11 @@ export function FreshAgentView({
   const [rateLimitedUntil, setRateLimitedUntil] = useState<number | null>(null)
   void rateLimitedUntil
   const rateLimitRetryTimerRef = useRef<number | null>(null)
+  // Task 16: idle-incomplete re-poll budget and pending retry timer (deduped:
+  // never a second timer while one counts down; cleared on unmount). The
+  // local echo is the loop's marker -- see applySnapshot.
+  const idleIncompleteRetryCountRef = useRef(0)
+  const idleIncompleteRetryTimerRef = useRef<number | null>(null)
   const [queuedMessages, setQueuedMessages] = useState<string[]>([])
   // Transient, self-clearing banner for action feedback (rewind, shell errors).
   const [notice, setNotice] = useState<string | null>(null)
@@ -837,6 +847,14 @@ export function FreshAgentView({
     if (rateLimitRetryTimerRef.current !== null) {
       window.clearTimeout(rateLimitRetryTimerRef.current)
       rateLimitRetryTimerRef.current = null
+    }
+  }, [])
+
+  // Task 16: never leak a pending idle-incomplete retry timer past unmount.
+  useEffect(() => () => {
+    if (idleIncompleteRetryTimerRef.current !== null) {
+      window.clearTimeout(idleIncompleteRetryTimerRef.current)
+      idleIncompleteRetryTimerRef.current = null
     }
   }, [])
 
@@ -1735,11 +1753,39 @@ export function FreshAgentView({
             previousTurns: previousSnapshot?.turns,
           })
         : false
+      // Task 16: 'accepted but not landed' -- the raw input predicate of the
+      // stale-echo clear, INDEPENDENT of the retry-exhaustion gate below.
+      const echoStillPending = echo
+        ? !landedEcho && shouldClearStaleLocalEcho(displaySnapshot, echo, echoPendingMetadata)
+        : false
+      // The echo is the idle-incomplete re-poll loop's marker: it may only be
+      // cleared as STALE once the bounded retry budget is exhausted. A landed
+      // echo still clears immediately.
       const staleEcho = echo
-        ? snapshotAccepted && shouldClearStaleLocalEcho(displaySnapshot, echo, echoPendingMetadata)
+        ? snapshotAccepted
+          && idleIncompleteRetryCountRef.current >= IDLE_INCOMPLETE_MAX_RETRIES
+          && shouldClearStaleLocalEcho(displaySnapshot, echo, echoPendingMetadata)
         : false
       if (echo) {
         if (landedEcho || staleEcho) setLocalEcho(null)
+      }
+      // Task 16 (zrrj): an idle snapshot that does not yet contain the
+      // just-sent turn means the durable transcript is lagging -- schedule a
+      // bounded re-poll instead of permanently going quiet.
+      if (
+        displaySnapshot.status === 'idle'
+        && echoStillPending
+        && idleIncompleteRetryCountRef.current < IDLE_INCOMPLETE_MAX_RETRIES
+      ) {
+        idleIncompleteRetryCountRef.current += 1
+        if (idleIncompleteRetryTimerRef.current === null) { // dedupe: one pending timer max
+          idleIncompleteRetryTimerRef.current = window.setTimeout(() => {
+            idleIncompleteRetryTimerRef.current = null
+            requestSnapshotRefresh('idle-incomplete')
+          }, IDLE_INCOMPLETE_RETRY_DELAY_MS)
+        }
+      } else if (!echoStillPending) {
+        idleIncompleteRetryCountRef.current = 0
       }
       const fresh = paneContentRef.current
       const nextStatus = (resolved.status as FreshAgentPaneContent['status']) ?? fresh.status
@@ -2081,6 +2127,8 @@ export function FreshAgentView({
     const current = paneContentRef.current
     if (!current.sessionId) return
     const requestId = nanoid()
+    // Task 16: a new send starts a fresh idle-incomplete re-poll budget.
+    idleIncompleteRetryCountRef.current = 0
     const routeCwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
     // Retain the exact outgoing text as the resend payload (Task 10): the
     // lost-session retry resends from this metadata, never from the echo.

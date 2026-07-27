@@ -6,7 +6,7 @@ import panesReducer from '@/store/panesSlice'
 import settingsReducer, { previewServerSettingsPatch, updateSettingsLocal } from '@/store/settingsSlice'
 import freshAgentReducer, { sessionInit, setSessionStatus, markSessionLost } from '@/store/freshAgentSlice'
 import tabsReducer from '@/store/tabsSlice'
-import { FreshAgentView } from '@/components/fresh-agent/FreshAgentView'
+import { FreshAgentView, IDLE_INCOMPLETE_MAX_RETRIES } from '@/components/fresh-agent/FreshAgentView'
 import { FreshAgentSettingsButton } from '@/components/fresh-agent/FreshAgentSettingsButton'
 import { initLayout, requestPaneRefresh, setActivePane, updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
 import { useAppSelector } from '@/store/hooks'
@@ -4557,23 +4557,28 @@ describe('FreshAgentView', () => {
         capabilities: { send: true, interrupt: true, fork: true },
         turns: [],
       })
-      .mockResolvedValueOnce({
-        sessionType: 'freshopencode',
-        provider: 'opencode',
-        threadId: 'ses_stale_echo',
-        status: 'idle',
-        summary: 'recovered',
-        capabilities: { send: true, interrupt: true, fork: true },
-        turns: [
-          {
-            id: 'turn-existing-assistant',
-            turnId: 'turn-existing-assistant',
-            role: 'assistant',
-            summary: 'Recovered idle snapshot',
-            items: [{ id: 'item-existing-assistant', kind: 'text', text: 'Recovered idle snapshot' }],
-          },
-        ],
-      })
+    // Task 16: every subsequent fetch returns a FRESH recovered snapshot that
+    // still lacks the submitted turn — acceptance is by object identity, so a
+    // shared instance would skip the stale-echo path for the wrong reason.
+    let recoveredRevision = 2
+    apiMock.getFreshAgentThreadSnapshot.mockImplementation(async () => ({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      threadId: 'ses_stale_echo',
+      status: 'idle',
+      summary: 'recovered',
+      revision: recoveredRevision++,
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [
+        {
+          id: 'turn-existing-assistant',
+          turnId: 'turn-existing-assistant',
+          role: 'assistant',
+          summary: 'Recovered idle snapshot',
+          items: [{ id: 'item-existing-assistant', kind: 'text', text: 'Recovered idle snapshot' }],
+        },
+      ],
+    }))
     store.dispatch(initLayout({
       tabId: 'tab-1',
       paneId: 'pane-1',
@@ -4633,9 +4638,92 @@ describe('FreshAgentView', () => {
     await waitFor(() => {
       expect(screen.getByText('Recovered idle snapshot')).toBeInTheDocument()
     })
-    expect(screen.queryByText('Orphan prompt')).not.toBeInTheDocument()
+    // Task 16 contract change: the echo is the idle-incomplete re-poll loop's
+    // marker, so the FIRST incomplete idle snapshot must NOT clear it...
+    expect(screen.getByText('Orphan prompt')).toBeInTheDocument()
+    // ...but once the bounded retry budget is exhausted, the stale echo
+    // clears exactly as before (real timers: 5 retries x 1s + settle).
+    await waitFor(() => {
+      expect(screen.queryByText('Orphan prompt')).not.toBeInTheDocument()
+    }, { timeout: 15_000 })
     expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined()
-  })
+  }, 25_000)
+
+  it('keeps re-polling (bounded) when an idle snapshot is missing the just-sent turn', async () => {
+    const store = createStore()
+    let wsHandler: ((message: any) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler) => {
+      wsHandler = handler
+      return () => {}
+    })
+    // HARNESS TRAP (fresh-eyes i3): return a FRESH snapshot object per fetch.
+    // Acceptance is by OBJECT IDENTITY (`snapshotAccepted = displaySnapshot
+    // !== previousSnapshot`; mergeSnapshotForDisplay does no content
+    // comparison). A shared mockResolvedValue(...) instance makes
+    // snapshotAccepted false, skips the stale-echo clear for the wrong
+    // reason, and lets a broken loop pass vacuously.
+    let rev = 1
+    apiMock.getFreshAgentThreadSnapshot.mockImplementation(
+      async () => freshopencodeSnapshot('unrelated earlier turn', rev++),
+    )
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-idle-incomplete',
+        sessionId: 'ses_late_change',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_late_change' },
+        resumeSessionId: 'ses_late_change',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+    })
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'question?' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    const send = sentFreshAgentMessages('freshAgent.send').at(-1)
+    const requestId = String(send?.requestId)
+    act(() => {
+      wsHandler?.({
+        type: 'freshAgent.send.accepted',
+        requestId,
+        sessionId: 'ses_late_change',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+      })
+    })
+
+    const calls = () => apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+    const before = calls()
+    // SUSTAINED loop — a single extra fetch must NOT satisfy this test:
+    await waitFor(() => expect(calls()).toBeGreaterThanOrEqual(before + 2), { timeout: 8_000 })
+    // ...and it runs to the cap...
+    await waitFor(
+      () => expect(calls()).toBeGreaterThanOrEqual(before + IDLE_INCOMPLETE_MAX_RETRIES),
+      { timeout: 10_000 },
+    )
+    // ...then the exhaustion pass clears the echo (the loop's marker)...
+    await waitFor(() => {
+      expect(screen.queryByText('question?')).not.toBeInTheDocument()
+    }, { timeout: 8_000 })
+    // ...and STOPS (bounded — no unbounded polling):
+    const atCap = calls()
+    await new Promise((r) => setTimeout(r, 1_500))
+    expect(calls()).toBe(atCap)
+  }, 25_000) // real timers (this suite uses none fake); 5 retries x 1s + settle needs a raised test timeout
 
   it('clears local echo as soon as a fresh snapshot contains the submitted text', async () => {
     const store = createStore()
