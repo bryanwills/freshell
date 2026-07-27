@@ -337,6 +337,12 @@ export function createAmplifierActivityIntegration(
         filePath: eventsPath,
         attachAt,
         ...(fsImpl ? { fsImpl } : {}),
+        // Kata myap: surface tailer-level warns (live backlog skip) through
+        // the integration's production logger. bind() is load-bearing: the
+        // production logger is a raw pino instance whose warn is
+        // this-dependent -- a detached call throws TypeError at exactly the
+        // moment the guard fires (verified against pino 9.14.0).
+        ...(log ? { log: { warn: log.warn.bind(log) } } : {}),
       }),
       reducerState: createAmplifierReducerState(),
       degraded: false,

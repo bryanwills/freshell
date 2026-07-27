@@ -12,6 +12,7 @@ import {
   type AmplifierEventsWatcher,
 } from '../../../../server/coding-cli/amplifier-activity-integration.js'
 import type { AmplifierTailerFs } from '../../../../server/coding-cli/amplifier-events-tailer.js'
+import { AMPLIFIER_TAILER_BACKLOG_MAX_BYTES } from '../../../../server/coding-cli/amplifier-events-tailer.js'
 
 const SCHEMA = '"schema": {"name": "amplifier.log", "ver": "1.0.0"}'
 
@@ -569,5 +570,46 @@ describe('amplifier activity integration', () => {
     bound(registry, { terminalId: 't2' })
     await flush()
     expect(watchers).toHaveLength(1)
+  })
+
+  it('caps a live backlog: one production-visible warn, skip to EOF, live records take over', async () => {
+    const { registry, tracker, completions, fsStore, watchers, warn } = setup()
+    fsStore.write(EVENTS_PATH, line('session:start', 1000))
+    bound(registry, { reason: 'association' })
+    await flush()
+    expect(tracker.getActivity('t1')?.phase).toBe('idle')
+    expect(warn).not.toHaveBeenCalled()
+
+    // The watcher went silent (WSL2) while the CLI kept writing; the next
+    // event sees a giant offset->EOF gap. Must skip, never drain (OOM).
+    fsStore.append(EVENTS_PATH, 'x'.repeat(AMPLIFIER_TAILER_BACKLOG_MAX_BYTES + 1024) + '\n')
+    watchers[0].fire('change', EVENTS_PATH)
+    await flush()
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(warn.mock.calls[0][0]).toMatchObject({
+      component: 'amplifier-events-tailer',
+      event: 'amplifier_tailer_backlog_skipped',
+      filePath: EVENTS_PATH,
+      capBytes: AMPLIFIER_TAILER_BACKLOG_MAX_BYTES,
+    })
+    // The skip is silent toward the tracker: no phase change, no completion,
+    // no degrade (attach-cap parity).
+    expect(tracker.getActivity('t1')?.phase).toBe('idle')
+    expect(completions).toHaveLength(0)
+    expect(watchers[0].closed).toBe(false)
+
+    // Live records take over from the adopted tail.
+    fsStore.append(EVENTS_PATH, line('prompt:submit', 9000))
+    watchers[0].fire('change', EVENTS_PATH)
+    await flush()
+    expect(tracker.getActivity('t1')?.phase).toBe('busy')
+
+    fsStore.append(EVENTS_PATH, line('prompt:complete', 10000))
+    watchers[0].fire('change', EVENTS_PATH)
+    await flush()
+    expect(tracker.getActivity('t1')?.phase).toBe('idle')
+    expect(completions).toHaveLength(1)
+    // Still exactly one warn: the skip logged once, recovery logged nothing.
+    expect(warn).toHaveBeenCalledTimes(1)
   })
 })
