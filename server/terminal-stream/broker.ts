@@ -39,6 +39,7 @@ import {
   TERMINAL_BACKGROUND_BUFFERED_PAUSE_BYTES,
   TERMINAL_BACKGROUND_RETRY_FLUSH_MS,
   TERMINAL_STREAM_BATCH_MAX_BYTES,
+  TERMINAL_STREAM_FOREGROUND_PAUSE_BUFFERED_BYTES,
   TERMINAL_STREAM_RETRY_FLUSH_MS,
   TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES,
   TERMINAL_WS_CATASTROPHIC_STALL_MS,
@@ -856,12 +857,15 @@ export class TerminalStreamBroker {
       return
     }
 
+    // Every attachment pauses at its buffered-amount threshold: background at
+    // 512 KiB, foreground at 1 MiB — below WsHandler's 2 MiB drop+close(4008)
+    // kill line, so terminal output self-throttles before lifecycle messages
+    // (freshAgent.*, session updates) start dying on the shared socket. (zrrj)
     const wsBuffered = readWebSocketBufferedAmount(ws)
-    if (
-      attachment.priority === 'background'
-      && typeof wsBuffered === 'number'
-      && wsBuffered > TERMINAL_BACKGROUND_BUFFERED_PAUSE_BYTES
-    ) {
+    const pauseBufferedBytes = attachment.priority === 'background'
+      ? TERMINAL_BACKGROUND_BUFFERED_PAUSE_BYTES
+      : TERMINAL_STREAM_FOREGROUND_PAUSE_BUFFERED_BYTES
+    if (typeof wsBuffered === 'number' && wsBuffered > pauseBufferedBytes) {
       if (this.hasPendingAttachmentOutput(attachment)) {
         this.scheduleFlush(terminalId, attachment, TERMINAL_BACKGROUND_RETRY_FLUSH_MS)
       }

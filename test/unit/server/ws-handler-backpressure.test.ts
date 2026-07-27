@@ -1,6 +1,5 @@
 // @vitest-environment node
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest'
-import { EventEmitter } from 'events'
 import http from 'http'
 import WebSocket from 'ws'
 import { WsHandler } from '../../../server/ws-handler'
@@ -11,6 +10,7 @@ import {
   TERMINAL_STREAM_ATTACH_REQUEST_ID_RESERVE_VALUE,
 } from '../../../server/terminal-stream/serialized-budget'
 import { MAX_REALTIME_MESSAGE_BYTES } from '../../../shared/read-models.js'
+import { createMockWs, FakeBrokerRegistry, structuredLogsFrom } from '../../helpers/ws-backpressure'
 
 const loggerMocks = vi.hoisted(() => {
   const logger = {
@@ -39,70 +39,10 @@ vi.mock('node-pty', () => ({
 
 const TEST_AUTH_TOKEN = 'testtoken-testtoken'
 
-/** Create a mock WebSocket that extends EventEmitter (like real ws WebSockets) */
-function createMockWs(overrides: Record<string, unknown> = {}) {
-  const ws = new EventEmitter() as EventEmitter & {
-    bufferedAmount: number
-    readyState: number
-    send: ReturnType<typeof vi.fn>
-    close: ReturnType<typeof vi.fn>
-    connectionId?: string
-    sessionUpdateGeneration?: number
-  }
-  ws.bufferedAmount = 0
-  ws.readyState = WebSocket.OPEN
-  ws.send = vi.fn()
-  ws.close = vi.fn()
-  Object.assign(ws, overrides)
-  return ws
-}
-
-function structuredLogs(level: 'debug' | 'info' | 'warn' | 'error', event: string) {
-  return loggerMocks.logger[level].mock.calls
-    .map(([payload]) => payload)
-    .filter((payload): payload is Record<string, unknown> => (
-      !!payload
-      && typeof payload === 'object'
-      && (payload as { event?: unknown }).event === event
-    ))
-}
-
-class FakeBrokerRegistry extends EventEmitter {
-  private records = new Map<string, { terminalId: string; mode: string; buffer: { snapshot: () => string } }>()
-  private replayRingMaxChars: number | undefined
-
-  createTerminal(terminalId: string, mode = 'shell') {
-    this.records.set(terminalId, {
-      terminalId,
-      mode,
-      buffer: { snapshot: () => '' },
-    })
-  }
-
-  attach(terminalId: string) {
-    return this.records.get(terminalId) ?? null
-  }
-
-  resize(_terminalId: string, _cols: number, _rows: number) {
-    return true
-  }
-
-  detach(_terminalId: string) {
-    return true
-  }
-
-  setReplayRingMaxBytes(next: number | undefined) {
-    this.replayRingMaxChars = next
-  }
-
-  getReplayRingMaxChars() {
-    return this.replayRingMaxChars
-  }
-
-  get(terminalId: string) {
-    return this.records.get(terminalId)
-  }
-}
+// createMockWs and FakeBrokerRegistry are shared with
+// ws-handler-fresh-agent-backpressure.test.ts via test/helpers/ws-backpressure.ts.
+const structuredLogs = (level: 'debug' | 'info' | 'warn' | 'error', event: string) =>
+  structuredLogsFrom(loggerMocks.logger, level, event)
 
 let originalAuthToken: string | undefined
 let originalTerminalClientQueueMaxBytes: string | undefined

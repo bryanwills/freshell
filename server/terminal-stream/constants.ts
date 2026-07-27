@@ -29,3 +29,11 @@ export const TERMINAL_BACKGROUND_RETRY_FLUSH_MS = Math.max(
   1,
   Number(process.env.TERMINAL_BACKGROUND_RETRY_FLUSH_MS || 100),
 )
+
+/**
+ * Foreground attachments pause flushing when the socket has this much
+ * unflushed data. MUST stay below WsHandler's maxWsBufferedAmount (2 MiB)
+ * kill line: terminal output must self-throttle before lifecycle messages
+ * (freshAgent.*, session updates) start being dropped with a 4008 close. (zrrj)
+ */
+export const TERMINAL_STREAM_FOREGROUND_PAUSE_BUFFERED_BYTES = 1 * 1024 * 1024
