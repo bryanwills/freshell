@@ -107,6 +107,27 @@ type OpencodeSessionState = {
   pendingRecovery?: Promise<void>
 }
 
+/** Content-free per-session summary served by the read-only incident endpoint
+ * (kata zrrj). Identity is reported ONLY as hashForLogs() hashes — never raw
+ * session ids, cwds, prompts, or OpenCode payloads. */
+export type OpencodeInspectedSession = {
+  sessionIdHash: string
+  status: string
+  hasRealSession: boolean
+  cwdHash?: string
+  monitorArmed: boolean
+  turnAborted?: boolean
+  turnErrored?: boolean
+  lastTurnCompleteAt?: number
+}
+
+/** The sessions map and the idle-recovery monitor registry live in the factory
+ * closure, so incident inspection must be an adapter-INSTANCE method — hence the
+ * intersection type instead of a module-level export. */
+export type OpencodeFreshAgentAdapter = FreshAgentRuntimeAdapter & {
+  inspectSessions(): OpencodeInspectedSession[]
+}
+
 type CreateOpencodeFreshAgentAdapterOptions = {
   serveManager: OpencodeServeManager
   /** Retained ONLY for legacy `freshopencode-*` placeholder resume. */
@@ -157,7 +178,7 @@ async function defaultValidateCwd(cwd: string): Promise<void> {
   if (!info.isDirectory()) throw new Error(`OpenCode cwd is not a directory: ${cwd}`)
 }
 
-export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgentAdapterOptions): FreshAgentRuntimeAdapter {
+export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgentAdapterOptions): OpencodeFreshAgentAdapter {
   const serveManager = options.serveManager
   const recoveryStore = options.recoveryStore ?? getFreshAgentRecoveryStore()
   const turnTimeoutMs = options.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS
@@ -901,6 +922,30 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
 
     sessionStateGeneration(sessionId) {
       return sessions.get(sessionId)?.stateGeneration
+    },
+
+    /** Read-only incident inspection (kata zrrj): a content-free summary of every
+     * tracked session state. The sessions map aliases each state under both its
+     * placeholder and real id, so states are deduped by object identity. Pure map
+     * walk; mutates nothing. */
+    inspectSessions(): OpencodeInspectedSession[] {
+      const seen = new Set<OpencodeSessionState>()
+      const summaries: OpencodeInspectedSession[] = []
+      for (const state of sessions.values()) {
+        if (seen.has(state)) continue
+        seen.add(state)
+        summaries.push({
+          sessionIdHash: hashForLogs(state.realSessionId ?? state.placeholderId),
+          status: state.status,
+          hasRealSession: Boolean(state.realSessionId),
+          ...(state.cwd ? { cwdHash: hashForLogs(state.cwd) } : {}),
+          monitorArmed: state.realSessionId ? idleRecoveryMonitors.has(state.realSessionId) : false,
+          ...(state.turnAborted !== undefined ? { turnAborted: state.turnAborted } : {}),
+          ...(state.turnErrored !== undefined ? { turnErrored: state.turnErrored } : {}),
+          ...(state.lastTurnCompleteAt !== undefined ? { lastTurnCompleteAt: state.lastTurnCompleteAt } : {}),
+        })
+      }
+      return summaries
     },
 
     async send(sessionId, input) {

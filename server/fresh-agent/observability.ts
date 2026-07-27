@@ -1,12 +1,11 @@
-import { createHash } from 'node:crypto'
 import type { Request, Response, NextFunction } from 'express'
 import { freshAgentObservabilityLogger } from '../logger.js'
+import { hashForLogs } from './log-hash.js'
 
-const HASH_LENGTH = 12
-
-export function hashForLogs(value: string): string {
-  return createHash('sha256').update(value).digest('hex').slice(0, HASH_LENGTH)
-}
+// Re-exported so existing `import { hashForLogs } from './observability.js'`
+// call sites keep working; the implementation lives in the logger-free leaf
+// module log-hash.ts (see its doc comment).
+export { hashForLogs }
 
 export type FreshAgentObservabilityEvent =
   | {

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import { FreshAgentRuntimeManager } from '../../../../server/fresh-agent/runtime-manager.js'
 import { createFreshAgentProviderRegistry } from '../../../../server/fresh-agent/provider-registry.js'
+import { hashForLogs } from '../../../../server/fresh-agent/observability.js'
 
 function createDeferred<T>() {
   let resolve!: (value: T) => void
@@ -885,5 +886,70 @@ describe('FreshAgentRuntimeManager', () => {
       threadId: 'codex-session-1',
     })).rejects.toThrow('uses codex, not claude')
     expect(codexAdapter.getSnapshot).not.toHaveBeenCalled()
+  })
+
+  describe('inspectState: read-only incident summary (zrrj)', () => {
+    it('reports hashed, content-free tracked sessions and pending recovery count', async () => {
+      const opencodeAdapter = {
+        create: vi.fn().mockResolvedValue({ sessionId: 'ses_real_1' }),
+      }
+      const registry = createFreshAgentProviderRegistry([
+        {
+          sessionType: 'freshopencode',
+          runtimeProvider: 'opencode',
+          adapter: opencodeAdapter as any,
+        },
+      ])
+      const manager = new FreshAgentRuntimeManager({ registry })
+      await manager.create({
+        requestId: 'req-1',
+        sessionType: 'freshopencode',
+        cwd: '/w',
+      })
+
+      const state = manager.inspectState()
+
+      expect(state).toEqual({
+        sessions: [{
+          key: `freshopencode:opencode:${hashForLogs('ses_real_1')}`,
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          sessionIdHash: hashForLogs('ses_real_1'),
+          cwdHash: hashForLogs('/w'),
+        }],
+        pendingRecoveries: 0,
+      })
+      // Content-free: neither the raw ses_ id nor the raw cwd may appear anywhere,
+      // including inside the session key.
+      const json = JSON.stringify(state)
+      expect(json).not.toContain('ses_')
+      expect(json).not.toContain('/w')
+    })
+
+    it('flags provider-owned no-route durable sessions as providerOwned', async () => {
+      const opencodeAdapter = {
+        create: vi.fn().mockResolvedValue({ sessionId: 'ses_real_2' }),
+      }
+      const registry = createFreshAgentProviderRegistry([
+        {
+          sessionType: 'freshopencode',
+          runtimeProvider: 'opencode',
+          adapter: opencodeAdapter as any,
+        },
+      ])
+      const manager = new FreshAgentRuntimeManager({ registry })
+      await manager.create({
+        requestId: 'req-2',
+        sessionType: 'freshopencode',
+      })
+
+      const state = manager.inspectState()
+
+      expect(state.sessions).toEqual([expect.objectContaining({
+        sessionIdHash: hashForLogs('ses_real_2'),
+        providerOwned: true,
+      })])
+      expect(state.sessions[0]).not.toHaveProperty('cwdHash')
+    })
   })
 })

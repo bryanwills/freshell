@@ -72,6 +72,7 @@ import { createSettingsRouter } from './settings-router.js'
 import { createPerfRouter } from './perf-router.js'
 import { createAiRouter } from './ai-router.js'
 import { createDebugRouter } from './debug-router.js'
+import { createFreshAgentIncidentRouter } from './fresh-agent/incident-router.js'
 import { LayoutStore } from './agent-api/layout-store.js'
 import { createAgentApiRouter } from './agent-api/router.js'
 import { ExtensionManager } from './extension-manager.js'
@@ -784,6 +785,19 @@ async function main() {
     codingCliIndexer,
     tabsRegistryStore,
     registry,
+  }))
+
+  // --- API: fresh-agent incident inspection (kata zrrj) ---
+  // Read-only, content-free (hashed identity only). Mounted after httpAuthMiddleware
+  // so it stays token-protected, and it shares the global /api rate limit
+  // (createApiRateLimiter, 300/60s) like every other API route — acceptable because
+  // this endpoint is polled manually by a human during incidents.
+  app.use('/api/debug/fresh-agent', createFreshAgentIncidentRouter({
+    runtimeManager: freshAgentRuntimeManager,
+    opencode: {
+      inspectSessions: () => opencodeFreshAgentAdapter.inspectSessions(),
+      describeSidecar: () => opencodeServeManager.describeSidecar(),
+    },
   }))
 
   // --- API: server-info ---

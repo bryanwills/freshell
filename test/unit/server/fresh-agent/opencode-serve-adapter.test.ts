@@ -33,6 +33,7 @@ vi.mock('../../../../server/logger.js', () => ({ logger: loggerMocks.logger, fre
 
 import { createOpencodeFreshAgentAdapter } from '../../../../server/fresh-agent/adapters/opencode/adapter.js'
 import { OpencodeServeLostError } from '../../../../server/fresh-agent/adapters/opencode/serve-manager.js'
+import { hashForLogs } from '../../../../server/fresh-agent/observability.js'
 import { FreshAgentRecoveryStore } from '../../../../server/fresh-agent/recovery-store.js'
 import { FRESHOPENCODE_DEFAULT_MODEL } from '../../../../shared/fresh-agent-models.js'
 
@@ -1674,5 +1675,74 @@ describe('interrupted-turn recovery (zrrj)', () => {
     expect(await store.hasInterrupt('ses_int')).toBe(true)
     await adapter.send!('ses_int', { text: 'user follow-up' })
     expect(await store.hasInterrupt('ses_int')).toBe(false)
+  })
+})
+
+describe('inspectSessions: read-only incident summary (zrrj)', () => {
+  it('reports a hashed, content-free summary for a running session with an armed monitor', async () => {
+    const manager = makeFakeManager()
+    manager.getSessionStatus = vi.fn(async () => ({ type: 'busy' }))
+    // Keep the restore idle-recovery monitor pending so it stays armed.
+    manager.onceIdle = vi.fn(() => new Promise<void>(() => {}))
+    const adapter = makeAdapter(manager)
+    await adapter.attach!({ sessionId: 'ses_live', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' })
+
+    const result = adapter.inspectSessions()
+
+    expect(result).toEqual([{
+      sessionIdHash: hashForLogs('ses_live'),
+      status: 'running',
+      hasRealSession: true,
+      cwdHash: hashForLogs('/w'),
+      monitorArmed: true,
+    }])
+    // Content-free: neither the raw ses_ id nor the raw cwd may appear anywhere.
+    const json = JSON.stringify(result)
+    expect(json).not.toContain('ses_')
+    expect(json).not.toContain('/w')
+  })
+
+  it('dedupes placeholder/real aliases and reports turn flags after a completed send', async () => {
+    const manager = makeFakeManager()
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'req-inspect', sessionType: 'freshopencode', provider: 'opencode', cwd: '/repo' })
+    await adapter.send!('freshopencode-req-inspect', { text: 'secret user prompt' })
+
+    const result = adapter.inspectSessions()
+
+    // The state is remembered under BOTH the placeholder and the real ses_ id —
+    // the summary must report the underlying state exactly once.
+    expect(result).toHaveLength(1)
+    expect(result[0]).toMatchObject({
+      sessionIdHash: hashForLogs('ses_real_1'),
+      status: 'idle',
+      hasRealSession: true,
+      monitorArmed: false,
+      turnAborted: false,
+      turnErrored: false,
+    })
+    expect(typeof result[0].lastTurnCompleteAt).toBe('number')
+    // No message text and no raw identity leaks into the summary.
+    const json = JSON.stringify(result)
+    expect(json).not.toContain('secret user prompt')
+    expect(json).not.toContain('ses_')
+    expect(json).not.toContain('/repo')
+  })
+
+  it('reports an unmaterialized placeholder with hasRealSession false', async () => {
+    const manager = makeFakeManager()
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'req-cold', sessionType: 'freshopencode', provider: 'opencode', cwd: '/repo' })
+
+    const result = adapter.inspectSessions()
+
+    expect(result).toEqual([{
+      sessionIdHash: hashForLogs('freshopencode-req-cold'),
+      status: 'idle',
+      hasRealSession: false,
+      cwdHash: hashForLogs('/repo'),
+      monitorArmed: false,
+    }])
+    expect(JSON.stringify(result)).not.toContain('freshopencode-req-cold')
   })
 })

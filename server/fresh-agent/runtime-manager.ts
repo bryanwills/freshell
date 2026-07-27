@@ -12,6 +12,7 @@ import {
   FreshAgentTurnPageSchema,
   type FreshAgentRequestId,
 } from '../../shared/fresh-agent-contract.js'
+import { hashForLogs } from './log-hash.js'
 import type { FreshAgentProviderRegistry } from './provider-registry.js'
 import type {
   FreshAgentCreateRequest,
@@ -128,6 +129,40 @@ export class FreshAgentRuntimeManager {
       runtimeProvider: registration.runtimeProvider,
       sessionRef: created.sessionRef,
     }
+  }
+
+  /**
+   * Read-only incident inspection (kata zrrj): a content-free summary of every
+   * tracked session plus the count of in-flight freshopencode recovery attaches.
+   * Identity is reported ONLY as hashForLogs() hashes — including inside `key`,
+   * which is rebuilt with the hashed session id so the raw id never leaves the
+   * process. Pure map walk; mutates nothing.
+   */
+  inspectState(): {
+    sessions: Array<{
+      key: string
+      sessionType: string
+      provider: string
+      sessionIdHash: string
+      cwdHash?: string
+      providerOwned?: boolean
+    }>
+    pendingRecoveries: number
+  } {
+    const sessions = [...this.sessions.entries()].map(([key, record]) => {
+      const prefix = `${record.sessionType}:${record.runtimeProvider}:`
+      const sessionId = key.startsWith(prefix) ? key.slice(prefix.length) : key
+      const sessionIdHash = hashForLogs(sessionId)
+      return {
+        key: `${record.sessionType}:${record.runtimeProvider}:${sessionIdHash}`,
+        sessionType: record.sessionType,
+        provider: record.runtimeProvider,
+        sessionIdHash,
+        ...(record.freshOpenCodeRouteCwd ? { cwdHash: hashForLogs(record.freshOpenCodeRouteCwd) } : {}),
+        ...(record.freshOpenCodeProviderOwnedNoRoute ? { providerOwned: true } : {}),
+      }
+    })
+    return { sessions, pendingRecoveries: this.freshOpencodeRecoveries.size }
   }
 
   async attach(input: FreshAgentSessionLocator): Promise<FreshAgentCreateResult> {
