@@ -5,9 +5,9 @@
 > quality review after each task. Steps use checkbox (`- [ ]`) syntax
 > for tracking.
 
-**Goal:** Enforce the D7 live-session guard (already present on the WS `terminal.create` path) on the REST spawn pipeline (`POST /api/tabs`, `POST /api/panes/:id/split`, `POST /api/panes/:id/respawn`, and the in-process tabs-sync restore caller), refusing with HTTP 409 `RESTORE_UNAVAILABLE` any resume onto a `(mode, sessionId)` that a currently-Running terminal already owns — via a shared helper, not a copy. Fixes kata **ks38**.
+**Goal:** Enforce the D7 live-session guard (already present on the WS `terminal.create` path) on the REST spawn pipeline (`POST /api/tabs`, `POST /api/panes/:id/split`, `POST /api/panes/:id/respawn`), refusing with HTTP 409 `RESTORE_UNAVAILABLE` any resume onto a `(mode, sessionId)` that a currently-Running terminal already owns — via a shared helper, not a copy — and serializing the sessionRef-rung spawn with the same D8 per-sessionRef registry lease the WS path holds. Fixes kata **ks38**.
 
-**Architecture:** Extract the D7 liveness join (identity-registry arm + registry-row arm) into a shared predicate `TerminalRegistry::live_session_owner(...)` in `freshell-terminal` (the lowest common ancestor crate — both `freshell-ws` and `freshell-freshagent` depend on it). The identity arm crosses the crate boundary through a new object-safe trait `SessionIdentityLookup` (implemented by `freshell-ws`'s `TerminalIdentityRegistry`, injected into `FreshAgentState` by `freshell-server` — the same seam pattern as the existing `PaneIdentitySink`). The WS guard is refactored to call the shared predicate; the REST spawn pipeline gains the guard at its single choke point in `spawn_terminal_pane`, covering all four REST callers at once.
+**Architecture:** Extract the D7 liveness join (identity-registry arm + registry-row arm) into a shared predicate `TerminalRegistry::live_session_owner(...)` in `freshell-terminal` (the lowest common ancestor crate — both `freshell-ws` and `freshell-freshagent` depend on it). The identity arm crosses the crate boundary through a new object-safe trait `SessionIdentityLookup` (implemented by `freshell-ws`'s `TerminalIdentityRegistry`, injected into `FreshAgentState` by `freshell-server` — the same seam pattern as the existing `PaneIdentitySink`). The WS guard is refactored to call the shared predicate; the REST spawn pipeline gains the guard at its single choke point in `spawn_terminal_pane`, covering all three REST callers at once (validation note: the formerly-cited fourth caller, the in-process tabs-sync restore driver, was deleted by commit `2ed6b948` — `POST /api/tabs-sync/restore` no longer exists, and `create_terminal_or_content_tab_deferred` is dead code; do not reference either). On the same sessionRef rung, the choke point additionally claims the registry's D8 per-sessionRef lease (`TerminalRegistry::claim_session_ref`) before spawning and completes it into a binding on success, so REST resumes are serialized against concurrent WS/REST claims rather than merely checked (see Design Decision 6 and Task 5).
 
 **Tech Stack:** Rust (cargo workspace at repo root, `crates/*`), axum, tokio; tests are inline `#[cfg(test)]` modules using `tower::util::ServiceExt::oneshot` and the registry's headless-terminal seam.
 
@@ -35,6 +35,7 @@
 3. **No respawn self-exemption:** `respawn_pane` deliberately never kills the pane's old terminal ("detach, don't kill", pane_ops.rs:688-693). If the old terminal is still Running and owns session S, respawning with `sessionRef` S would create a second live JSONL writer for S — the exact corruption the doctrine forbids. The guard therefore refuses uniformly (matching WS semantics, which have no self-exemption); a respawn-resume is only allowed once the owner has exited. A test pins this.
 4. **Guard scope mirrors WS exactly:** fires only on the `sessionRef` rung — i.e. when `derive_resume_identity` produced an `accepted_session_ref` (provider already validated == mode) whose non-empty `session_id` equals the derived `resume_session_id`. The legacy bare-`resumeSessionId` rung keeps its existing behavior, same as WS.
 5. **Known parity note (not a gap):** like the WS guard, this covers terminal-PTY duplication only. Fresh-agent in-process sessions (freshclaude/freshcodex/freshopencode) are tracked elsewhere and are out of scope for D7 on both paths — this is parity with the WS guard, which the kata asks us to mirror.
+6. **D8 lease at the REST choke point (added by load-bearing validation):** the WS create path does not merely check-then-spawn — on its production-normal rung it holds the registry's per-sessionRef lease before spawning (`claim_session_ref`, registry.rs:1761-1767; RAII release via `fail_session_ref_claim`, ws/terminal.rs:987-1027), and the shipped client sends `capabilities.paneReconcileV1: true` unconditionally (src/lib/ws-client.ts:360), so the leased rung IS production WS behavior. A REST guard without the lease would re-open defect D8 (duplicate-JSONL-writer race) for concurrent REST×REST and REST×WS resumes. Task 5 therefore claims the lease on the same sessionRef rung before spawning and completes it into a binding on success (`complete_session_ref_claim`). Conservative v1 REST semantics: `Held`, `BoundElsewhere`, and `ExpiredNeedsKill` all answer the same 409 `RESTORE_UNAVAILABLE` envelope (no kill-and-adopt logic on REST; the 20s lease TTL is the crash backstop; a crashed holder can therefore stall a sid for ≤20s — accepted, upgradeable later to the WS kill-and-confirm port at ws/terminal.rs:1037-1053).
 
 ## File Structure
 
@@ -44,7 +45,7 @@
 | `crates/freshell-ws/src/identity.rs` | `impl SessionIdentityLookup for TerminalIdentityRegistry` + unit test |
 | `crates/freshell-ws/src/terminal.rs` | Refactor D7 guard block (lines ~1357-1410) to call the shared predicate |
 | `crates/freshell-freshagent/src/lib.rs` | Add `fail_json_code` helper; add `session_identity` field + `with_session_identity` builder to `FreshAgentState` |
-| `crates/freshell-freshagent/src/terminal_tabs.rs` | Insert the guard in `spawn_terminal_pane` (after line 637); add router tests |
+| `crates/freshell-freshagent/src/terminal_tabs.rs` | Insert the guard + D8 sessionRef lease in `spawn_terminal_pane` (after line 637); add router tests |
 | `crates/freshell-server/src/main.rs` | Wire the identity registry into `FreshAgentState` via `with_session_identity` |
 | `crates/freshell-freshagent/Cargo.toml` | Only if `tracing` is not already a dependency: add `tracing.workspace = true` |
 
@@ -336,7 +337,7 @@ impl freshell_terminal::registry::SessionIdentityLookup for TerminalIdentityRegi
 }
 ```
 
-If `TerminalIdentityRegistry` does not already derive `Debug` (the trait requires it), add `Debug` to its `#[derive(...)]` — it is a thin `Arc<RwLock<HashMap<..>>>` wrapper, so the derive is mechanical.
+`TerminalIdentityRegistry` currently derives only `Clone, Default` (identity.rs:51) — add `Debug` to that derive list (the trait requires it; `TerminalIdentity` already derives `Debug`, so the derive is mechanical). Verified against source during plan validation.
 
 - [ ] **Step 4: Run to verify it passes**
 
@@ -639,8 +640,8 @@ In `crates/freshell-freshagent/src/terminal_tabs.rs`, in `spawn_terminal_pane`, 
     // while the original live PTY owns <sid> (one-JSONL-writer doctrine).
     // Placement: before any side effect (no PTY, no MCP write, no port alloc,
     // no codex plan), so refusal needs zero rollback. This is the single choke
-    // point for POST /api/tabs, /api/panes/:id/split, /api/panes/:id/respawn,
-    // and the tabs-sync restore caller. Scoped to the sessionRef rung exactly
+    // point for POST /api/tabs, /api/panes/:id/split, and /api/panes/:id/respawn
+    // (every spawn_terminal_pane caller). Scoped to the sessionRef rung exactly
     // like WS (`accepted_session_ref` already implies provider == mode); the
     // legacy bare-resumeSessionId rung keeps its existing behavior. No
     // self-exemption for respawn: the old terminal is deliberately never
@@ -878,7 +879,7 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
     }
 ```
 
-If `create_shell_tab` does not exist in `terminal_tabs.rs`'s test module (it is documented as duplicated there from `pane_ops.rs:1007`; verify), copy the exact helper from `pane_ops.rs:1007-1017` into this module rather than reworking the tests.
+If `create_shell_tab` does not exist in `terminal_tabs.rs`'s test module (it is documented as duplicated there from `pane_ops.rs:1007`; verify), copy the exact helper from `pane_ops.rs:1007-1021` into this module rather than reworking the tests (copy the WHOLE fn — validation found the function runs to :1021).
 
 - [ ] **Step 2: Run the tests**
 
@@ -886,7 +887,7 @@ If `create_shell_tab` does not exist in `terminal_tabs.rs`'s test module (it is 
 cargo test -p freshell-freshagent --lib rest_respawn
 cargo test -p freshell-freshagent --lib rest_split_resume_onto_live_session_is_refused_409
 ```
-Expected: **all PASS immediately** — that is the point: they prove the Task 3 choke point already covers the respawn and split routes (the kata's explicit "also check respawn" requirement). If ANY of these fails, the choke-point assumption is wrong (a route bypasses `spawn_terminal_pane`); STOP and fix the guard placement in Task 3's code, then re-run — do not weaken the tests.
+Expected: **all PASS immediately** — that is the point: they prove the Task 3 choke point already covers the respawn and split routes (a deliberate superset of ks38 — the kata's text names the create path; respawn/split coverage is this plan's hardening, not a kata quote). If ANY of these fails, the choke-point assumption is wrong (a route bypasses `spawn_terminal_pane`); STOP and fix the guard placement in Task 3's code, then re-run — do not weaken the tests.
 
 - [ ] **Step 3: Run the whole crate**
 
@@ -914,11 +915,183 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 
 ---
 
-### Task 5: Full-workspace verification (the CI gate, locally)
+### Task 5: D8 session-ref lease at the REST choke point
+
+Closes the check-then-spawn race the D7 guard alone cannot (Design Decision 6): two concurrent REST resumes on the same `(mode, sessionId)` — or a REST resume racing a WS create — could both pass the D7 check and spawn two writers. The WS path already serializes this with the registry's per-sessionRef lease; REST adopts the same primitive at the same choke point.
+
+**Files:**
+- Modify: `crates/freshell-freshagent/src/terminal_tabs.rs` (lease claim + RAII release in `spawn_terminal_pane`, immediately after Task 3's D7 guard, same sessionRef-rung scope; tests in the same `#[cfg(test)]` module)
+
+**Interfaces:**
+- Consumes (all `pub` on `freshell-terminal` — verified during plan validation; mirror the WS call site at `crates/freshell-ws/src/terminal.rs:987-1215` for exact signatures):
+  - `SessionLocator { provider, session_id }` and `SessionRefClaim::{Acquired, Held, ExpiredNeedsKill, BoundElsewhere}` (registry.rs:456-473; check the exact import path — `freshell_terminal::registry::...` or a crate-root re-export — before writing).
+  - `TerminalRegistry::claim_session_ref(&SessionLocator, holder_create_request_id: &str, holder_conn: u64, now_ms: u64) -> SessionRefClaim` (registry.rs:1761-1767).
+  - `TerminalRegistry::{complete_session_ref_claim (:1913, atomic lease→binding, returns bool), fail_session_ref_claim (:1956), set_session_ref_lease_pid (:1890), force_release_after_confirmed_kill (:1997), pid_of (:2018), new_connection_id (:622)}` and `freshell_terminal::registry::pid_alive` (:437).
+- Produces: REST resume spawns on the sessionRef rung are serialized by the registry lease; success records the sessionRef→terminalId binding, so later WS claims answer `BoundElsewhere` (adopt) instead of double-spawning.
+
+- [ ] **Step 1: Write the failing tests**
+
+Add to the `terminal_tabs.rs` test module (reuse `LIVE_SESSION`, `recording_cli_spec`, `unique_argv_file`, `post`, `app`, `state_with_registry` from Tasks 3-4). Compute `now_ms` from `std::time::{SystemTime, UNIX_EPOCH}` (or reuse the crate's existing now-ms helper if one exists — check how the WS claim site gets it).
+
+```rust
+    #[tokio::test]
+    async fn rest_create_resume_while_lease_held_is_refused_409() {
+        let argv_file = unique_argv_file("d8-lease-held-refusal");
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec("claude", &argv_file)]));
+        let registry = state.terminal_registry.clone().unwrap();
+        let router = app(state);
+
+        // A foreign holder (e.g. an in-flight WS create) holds the lease.
+        let locator = SessionLocator {
+            provider: "claude".into(),
+            session_id: LIVE_SESSION.into(),
+        };
+        assert!(matches!(
+            registry.claim_session_ref(&locator, "foreign-holder", registry.new_connection_id(), test_now_ms()),
+            SessionRefClaim::Acquired
+        ));
+
+        let (status, body) = post(
+            router,
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": { "provider": "claude", "sessionId": LIVE_SESSION },
+            }),
+            true,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], json!("RESTORE_UNAVAILABLE"), "{body}");
+
+        registry.fail_session_ref_claim(&locator, "foreign-holder");
+    }
+
+    #[tokio::test]
+    async fn rest_create_resume_completes_claim_into_binding() {
+        let argv_file = unique_argv_file("d8-lease-completion");
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec("claude", &argv_file)]));
+        let registry = state.terminal_registry.clone().unwrap();
+        let router = app(state);
+
+        let (status, body) = post(
+            router,
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": { "provider": "claude", "sessionId": LIVE_SESSION },
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let tid = body["data"]["terminalId"].as_str().expect("terminalId").to_string();
+
+        // The REST spawn must have completed its claim into a binding: a later
+        // claim by anyone else answers BoundElsewhere{winner}, never a second spawn.
+        let locator = SessionLocator {
+            provider: "claude".into(),
+            session_id: LIVE_SESSION.into(),
+        };
+        match registry.claim_session_ref(&locator, "late-claimer", registry.new_connection_id(), test_now_ms()) {
+            SessionRefClaim::BoundElsewhere { terminal_id } => assert_eq!(terminal_id, tid),
+            other => panic!("expected BoundElsewhere, got {other:?}"),
+        }
+
+        registry.kill(&tid);
+    }
+```
+
+(Adjust names/paths to the real API surface if the compiler disagrees — the semantics above are the contract; the WS call site is the reference implementation.)
+
+- [ ] **Step 2: Run to verify they fail**
+
+```bash
+cargo test -p freshell-freshagent --lib rest_create_resume_while_lease_held_is_refused_409
+cargo test -p freshell-freshagent --lib rest_create_resume_completes_claim_into_binding
+```
+Expected red: the lease-held test gets **200** (no lease logic yet — spawn proceeds); the completion test fails on the claim result (**Acquired** instead of `BoundElsewhere`, because nothing recorded a binding).
+
+- [ ] **Step 3: Implement the lease at the choke point**
+
+In `spawn_terminal_pane`, immediately after Task 3's D7 guard block (same `accepted_session_ref`/`live_sid` rung — legacy bare-`resumeSessionId` stays lease-free, matching WS's legacy rung):
+
+1. Add a small RAII guard type near `spawn_terminal_pane` (direct port of `SessionRefLeaseGuard`, ws/terminal.rs:993-1017 — ~20 lines): holds a `TerminalRegistry` clone (cheap handle), the `SessionLocator`, the holder id, and an `armed: bool`; `Drop` calls `fail_session_ref_claim` when still armed; `disarm()` for the winner path.
+2. Claim, using the already-minted `create_request_id` (terminal_tabs.rs:617-622) as holder id and a fresh `registry.new_connection_id()` as `holder_conn` (collision-free with WS conn cleanup; REST leases rely on RAII drop + the 20s TTL instead of conn-death cleanup):
+
+```rust
+    let mut session_ref_lease = None;
+    if let Some(live_sid) = /* same rung condition as the D7 guard */ {
+        let locator = SessionLocator { provider: mode.clone(), session_id: live_sid.to_string() };
+        match registry.claim_session_ref(&locator, &create_request_id, registry.new_connection_id(), now_ms()) {
+            SessionRefClaim::Acquired => {
+                session_ref_lease = Some(RestSessionRefLease::new(registry.clone(), locator, create_request_id.clone()));
+            }
+            // Conservative v1 (Design Decision 6): every non-Acquired arm answers the
+            // same 409 envelope. Held = a claim is in flight; BoundElsewhere = a live
+            // winner exists (D7's own answer); ExpiredNeedsKill = crashed holder — no
+            // kill logic on REST, the 20s TTL is the backstop.
+            SessionRefClaim::Held { .. }
+            | SessionRefClaim::BoundElsewhere { .. }
+            | SessionRefClaim::ExpiredNeedsKill { .. } => {
+                tracing::warn!(/* mode, session_id, pane_id */ "spawn_refused: sessionRef lease unavailable (D8, REST rung)");
+                return Err(fail_json_code(
+                    StatusCode::CONFLICT,
+                    "RESTORE_UNAVAILABLE",
+                    format!("Session {live_sid} is still running on the server."),
+                ));
+            }
+        }
+    }
+```
+
+3. After `registry.create(...)` succeeds (terminal_id known, ~:884-888): if `session_ref_lease` is `Some`, set the lease pid (`registry.pid_of(&terminal_id)` → `set_session_ref_lease_pid`), then `complete_session_ref_claim(&locator, &holder_id, &terminal_id)`. On `true`: `disarm()` the guard (the binding now owns the record). On `false` (lease revoked mid-spawn): kill our own child (`registry.kill(&terminal_id)`, confirm via `pid_alive` polling — WS does 20×25ms — then `force_release_after_confirmed_kill`) and return the 409 envelope; never leave the orphan running.
+4. Every error return between claim and completion needs no special handling — the Drop guard releases the lease (including the existing `registry.create` rollback arm at :889-918 and axum cancelling the request future).
+
+- [ ] **Step 4: Run to verify green, then the crate**
+
+```bash
+cargo test -p freshell-freshagent --lib rest_create_resume_while_lease_held
+cargo test -p freshell-freshagent --lib rest_create_resume_completes_claim_into_binding
+cargo test -p freshell-freshagent --lib
+```
+Expected: both new tests pass; the whole crate stays green (Tasks 3-4's tests included — the D7 guard fires before the lease, so live-owner refusals are unchanged; single-create resume tests acquire and complete the lease invisibly).
+
+Also re-run the WS suites (the lease is shared state — prove no cross-path regression):
+```bash
+cargo test -p freshell-ws
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/freshell-freshagent/src/terminal_tabs.rs
+git commit -m "fix(freshagent): serialize REST sessionRef resumes with the D8 session-ref lease
+
+The REST choke point now claims the registry's per-sessionRef lease
+(claim_session_ref) after the D7 guard and completes it into a binding
+on success, closing the REST-x-REST / REST-x-WS duplicate-writer race
+the check-then-spawn guard alone leaves open. Conservative arms:
+Held/BoundElsewhere/ExpiredNeedsKill all answer 409 RESTORE_UNAVAILABLE;
+RAII release on every failure path. Part of ks38.
+
+🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
+
+Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"
+```
+
+---
+
+### Task 6: Full-workspace verification (the CI gate, locally)
 
 **Files:** none expected (fix-ups only if a check fails).
 
-**Interfaces:** consumes everything above; produces the verified state Task 6 lands.
+**Interfaces:** consumes everything above; produces the verified state Task 7 lands.
 
 - [ ] **Step 1: Run the full Rust suite**
 
@@ -950,9 +1123,9 @@ If nothing changed, skip this step (do not create an empty commit).
 
 ---
 
-### Task 6: Land — PR, merge, fast-forward main, close kata ks38
+### Task 7: Land — PR, merge, fast-forward main, close kata ks38
 
-The user has **explicitly pre-approved** PR creation and self-merge for this change. Do NOT run this task unless Tasks 1-5 are complete and green.
+The user has **explicitly pre-approved** PR creation and self-merge for this change. Do NOT run this task unless Tasks 1-6 are complete and green.
 
 **Files:** none (git/gh/kata operations only).
 
@@ -967,12 +1140,13 @@ git push -u origin fix/rest-resume-live-guard
 
 ```bash
 gh pr create --base main --title "fix(freshagent): enforce the D7 live-session guard on the REST spawn pipeline (ks38)" --body "$(cat <<'EOF'
-Fixes kata ks38 (P1): REST POST /api/tabs (and /api/panes/:id/split, /api/panes/:id/respawn, tabs-sync restore) could spawn a second `<cli> --resume <sid>` while a Running terminal already owned that session -- the two-JSONL-writers corruption the WS terminal.create D7 guard already refuses.
+Fixes kata ks38 (P1): REST POST /api/tabs (and /api/panes/:id/split, /api/panes/:id/respawn) could spawn a second `<cli> --resume <sid>` while a Running terminal already owned that session -- the two-JSONL-writers corruption the WS terminal.create D7 guard already refuses.
 
 - Shared predicate `TerminalRegistry::live_session_owner` in freshell-terminal (identity arm via new `SessionIdentityLookup` seam + registry-row arm); WS guard refactored to call it (no copy).
 - REST spawn choke point (`spawn_terminal_pane`) refuses with `409 {code: RESTORE_UNAVAILABLE, message: "Session <sid> is still running on the server."}` before any side effect.
 - Identity registry injected into `FreshAgentState` from freshell-server (freshagent cannot depend on freshell-ws), so the REST guard runs the same two-store join as WS (d9b71f50 parity).
 - No respawn self-exemption: the pane's own detached-but-running predecessor counts as the live owner.
+- D8 parity: the REST choke point also claims the same per-sessionRef lease the WS create path holds (`claim_session_ref`) before spawning and completes it into a binding on success, closing the REST-x-REST / REST-x-WS duplicate-writer race -- conservative arms (Held/BoundElsewhere/ExpiredNeedsKill) all answer 409.
 - Tests: registry predicate units, identity-arm unit through the real TerminalIdentityRegistry, and router tests pinning 409-on-live / 200-after-exit across create, respawn, and split. Rust tests are not in CI; `cargo test --workspace`, `cargo fmt --all --check`, and `cargo clippy --workspace --all-targets -- -D warnings` all pass locally.
 
 🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
@@ -1004,5 +1178,5 @@ Only with everything verified and merged. From the repo root, with `<merged-sha>
 
 ```bash
 cd /home/dan/code/freshell
-kata close ks38 --done --message "REST spawn pipeline (POST /api/tabs, /api/panes/:id/split, /api/panes/:id/respawn, tabs-sync restore) now enforces the D7 live-session guard via the shared TerminalRegistry::live_session_owner predicate (identity arm injected through the new SessionIdentityLookup seam + registry-row arm), refusing resume onto a live (mode, sessionId) with 409 RESTORE_UNAVAILABLE before any side effect; WS guard refactored onto the same predicate; tests pin 409-on-live, 200-after-exit, and the no-self-exemption respawn case." --commit <merged-sha>
+kata close ks38 --done --message "REST spawn pipeline (POST /api/tabs, /api/panes/:id/split, /api/panes/:id/respawn) now enforces the D7 live-session guard via the shared TerminalRegistry::live_session_owner predicate (identity arm injected through the new SessionIdentityLookup seam + registry-row arm), refusing resume onto a live (mode, sessionId) with 409 RESTORE_UNAVAILABLE before any side effect; sessionRef-rung spawns additionally claim the D8 per-sessionRef lease (claim_session_ref) and complete it into a binding, closing the REST-x-REST / REST-x-WS duplicate-writer race; WS guard refactored onto the same predicate; tests pin 409-on-live, 200-after-exit, the no-self-exemption respawn case, and the lease-held/claim-completion contract." --commit <merged-sha>
 ```
