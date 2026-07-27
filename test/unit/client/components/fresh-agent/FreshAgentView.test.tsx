@@ -2781,6 +2781,119 @@ describe('FreshAgentView', () => {
     expect(store.getState().freshAgent.sessions[`freshcodex:codex:${sessionId}`]?.status).toBe('running')
   })
 
+  it('clears stale opencode busy state from a live-reconciled idle HTTP snapshot', async () => {
+    const store = createStore()
+    const sessionId = 'ses_1'
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      threadId: sessionId,
+      sessionId,
+      status: 'idle',
+      revision: 210,
+      latestTurnId: null,
+      capabilities: { send: true, interrupt: true, fork: true },
+      tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0 },
+      turns: [],
+      pendingApprovals: [],
+      pendingQuestions: [],
+      extensions: { opencode: { statusFromLiveState: true } },
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        sessionId,
+        sessionRef: { provider: 'opencode', sessionId },
+        resumeSessionId: sessionId,
+        createRequestId: 'req-freshopencode-stale-running',
+        status: 'running',
+        initialCwd: '/home/dan/code/freshell',
+      },
+    }))
+    store.dispatch(setSessionStatus({
+      sessionId,
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      status: 'running',
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(store.getState().freshAgent.sessions[`freshopencode:opencode:${sessionId}`]?.status).toBe('idle')
+    })
+    expect(getFreshAgentPaneContent(store).status).toBe('idle')
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith(
+      'freshopencode',
+      'opencode',
+      sessionId,
+      expect.objectContaining({ cwd: '/home/dan/code/freshell' }),
+    )
+  })
+
+  it('does NOT clear opencode busy state from an idle snapshot that is not live-reconciled', async () => {
+    const store = createStore()
+    const sessionId = 'ses_1'
+    // Restore-window default idle: untracked (adapter liveState?.status ?? 'idle')
+    // or mid-reconcile -- the snapshot carries no statusFromLiveState marker.
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      threadId: sessionId,
+      sessionId,
+      status: 'idle',
+      revision: 211,
+      latestTurnId: null,
+      capabilities: { send: true, interrupt: true, fork: true },
+      tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0 },
+      turns: [],
+      pendingApprovals: [],
+      pendingQuestions: [],
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        sessionId,
+        sessionRef: { provider: 'opencode', sessionId },
+        resumeSessionId: sessionId,
+        createRequestId: 'req-freshopencode-not-live-reconciled',
+        status: 'running',
+        initialCwd: '/home/dan/code/freshell',
+      },
+    }))
+    store.dispatch(setSessionStatus({
+      sessionId,
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      status: 'running',
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    // The pane content still adopts the snapshot status (pre-existing behavior);
+    // waiting on it proves the snapshot was fully applied before we assert.
+    await waitFor(() => {
+      expect(getFreshAgentPaneContent(store).status).toBe('idle')
+    })
+    expect(store.getState().freshAgent.sessions[`freshopencode:opencode:${sessionId}`]?.status).toBe('running')
+  })
+
   it('preserves loaded transcript history when a submit refresh returns only the in-flight turn', async () => {
     const store = createStore()
     let onMessage: ((message: Record<string, unknown>) => void) | undefined

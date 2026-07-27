@@ -1659,11 +1659,20 @@ export function FreshAgentView({
       const wouldRegressStatus = sessionStatus
         ? isStatusRegression(currentSessionStatus, sessionStatus)
         : false
+      const opencodeStatusFromLiveState =
+        (next as { extensions?: { opencode?: { statusFromLiveState?: unknown } } })
+          .extensions?.opencode?.statusFromLiveState === true
+      const canAdoptSnapshotStatus =
+        (provider === 'codex' && requestSessionType === 'freshcodex')
+        || (provider === 'opencode' && requestSessionType === 'freshopencode'
+          // busy (running) may always be adopted; idle (busy-CLEARING) only when
+          // live-reconciled -- otherwise the restore-window idle default (untracked
+          // or mid-reconcile adapter state) would clear a genuinely running turn.
+          && (snapshotIsBusy || opencodeStatusFromLiveState))
       if (
         sessionStatus
         && nextSessionId
-        && provider === 'codex'
-        && requestSessionType === 'freshcodex'
+        && canAdoptSnapshotStatus
         && !wouldRegressStatus
         && (
           snapshotIsBusy
