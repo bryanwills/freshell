@@ -13,8 +13,12 @@ const loggerMocks = vi.hoisted(() => {
     debug: vi.fn(),
     error: vi.fn(),
   }
+  const freshAgentObservabilityLogger = {
+    info: vi.fn(),
+    warn: vi.fn(),
+  }
   logger.child.mockReturnValue(logger)
-  return { logger }
+  return { logger, freshAgentObservabilityLogger }
 })
 
 vi.mock('../../../../server/fresh-agent/observability.js', async (importOriginal) => {
@@ -22,7 +26,7 @@ vi.mock('../../../../server/fresh-agent/observability.js', async (importOriginal
   return { ...actual, recordFreshAgentObservabilityEvent: observabilityMocks.recordFreshAgentObservabilityEvent }
 })
 
-vi.mock('../../../../server/logger.js', () => ({ logger: loggerMocks.logger }))
+vi.mock('../../../../server/logger.js', () => ({ logger: loggerMocks.logger, freshAgentObservabilityLogger: loggerMocks.freshAgentObservabilityLogger }))
 
 import { createOpencodeFreshAgentAdapter } from '../../../../server/fresh-agent/adapters/opencode/adapter.js'
 import { FRESHOPENCODE_DEFAULT_MODEL } from '../../../../shared/fresh-agent-models.js'
