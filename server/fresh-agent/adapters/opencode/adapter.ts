@@ -32,12 +32,23 @@ import {
   createWorkerHistoryReader,
   type OpencodeHistoryReader,
 } from './history-runner.js'
-import { OpencodeServeLostError, type OpencodeServeManager } from './serve-manager.js'
+import { OpencodeServeLostError, type OpencodeServeManager, type OpencodeServeMessage } from './serve-manager.js'
 import { serveEventToSdk, splitOpencodeModel } from './serve-events.js'
 
 const OPENCODE_REAL_SESSION_ID = /^ses_/
 const OPENCODE_PLACEHOLDER_SESSION_ID = /^freshopencode-/
 const DEFAULT_TURN_TIMEOUT_MS = 600_000
+
+/** Transcript-settle freshness proof (kata zrrj): after onceIdle resolves, the final
+ * assistant message must be provably queryable on the REST read path before the adapter
+ * declares the turn complete — `session.idle` carries no ordering guarantee relative to
+ * message persistence, so the client's post-idle snapshot could otherwise miss the answer. */
+const TRANSCRIPT_SETTLE_POLL_MS = 150
+const TRANSCRIPT_SETTLE_MAX_POLLS = 10 // ~1.5 s worst case
+const TRANSCRIPT_SETTLE_PAGE_LIMIT = 20
+const CLOCK_SKEW_MS = 5_000
+
+const defaultSettleSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 
 /** Freshell-OWNED continuation instruction for a recovered interrupted turn. Never echoes
  * user text; safe to hardcode. It appears in the transcript as a user-role message — that
@@ -108,6 +119,24 @@ type CreateOpencodeFreshAgentAdapterOptions = {
   /** Durable interrupt-intent + recovery ledger (kata zrrj). Tests inject a store on a
    * temp file; production defaults to the process-wide singleton. */
   recoveryStore?: FreshAgentRecoveryStore
+  /** Sleep between transcript-settle polls (kata zrrj). Tests inject a no-op so the
+   * poll budget drains in microtasks; production defaults to a real setTimeout sleep. */
+  settleSleep?: (ms: number) => Promise<void>
+}
+
+/** True when the page contains an assistant message created at/after `sentAtMs`
+ * (minus clock skew) whose `time.completed` is finite — i.e. the final answer is
+ * visible AND complete on the REST read path. */
+function hasSettledAssistantMessage(messages: OpencodeServeMessage[], sentAtMs: number): boolean {
+  return messages.some((message) => {
+    const info = message?.info
+    if (!info || typeof info !== 'object') return false
+    if (info.role !== 'assistant') return false
+    const time = info.time
+    if (!time || typeof time !== 'object') return false
+    if (!Number.isFinite(time.completed)) return false
+    return typeof time.created === 'number' && time.created >= sentAtMs - CLOCK_SKEW_MS
+  })
 }
 
 function makePlaceholderId(requestId: string): string {
@@ -132,6 +161,7 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
   const serveManager = options.serveManager
   const recoveryStore = options.recoveryStore ?? getFreshAgentRecoveryStore()
   const turnTimeoutMs = options.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS
+  const settleSleep = options.settleSleep ?? defaultSettleSleep
   const validateCwd = options.validateCwd ?? defaultValidateCwd
   const canonicalizePath = options.canonicalizePath ?? realpath
   const dbPath = options.dbPath ?? path.join(options.dataHome ?? defaultOpencodeDataHome(), 'opencode.db')
@@ -409,6 +439,41 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
     })
   }
 
+  /**
+   * After idle, verify the final assistant message is queryable via the REST
+   * read path before declaring the turn complete (kata zrrj freshness contract).
+   * Returns true when settled; false when polling exhausted (idle is still
+   * emitted — the turn is not stranded — but the client re-poll covers the gap).
+   *
+   * Settled means: the newest page of `listMessages` contains an assistant message
+   * created at/after `sentAtMs` (minus CLOCK_SKEW_MS) with a finite `time.completed`.
+   * `sentAtMs = 0` accepts ANY completed assistant message (restore monitor path,
+   * where the pre-restart send time is unknowable).
+   */
+  async function awaitTranscriptSettled(state: OpencodeSessionState, sentAtMs: number): Promise<boolean> {
+    const realId = state.realSessionId
+    if (!realId) return true
+    const route = cwdRoute(state.cwd)
+    for (let attempt = 0; attempt <= TRANSCRIPT_SETTLE_MAX_POLLS; attempt++) {
+      if (attempt > 0) await settleSleep(TRANSCRIPT_SETTLE_POLL_MS)
+      try {
+        const page = route
+          ? await serveManager.listMessages(realId, { limit: TRANSCRIPT_SETTLE_PAGE_LIMIT }, route)
+          : await serveManager.listMessages(realId, { limit: TRANSCRIPT_SETTLE_PAGE_LIMIT })
+        if (hasSettledAssistantMessage(page.messages, sentAtMs)) return true
+      } catch {
+        // A transient read failure counts as an unsettled poll; the budget bounds it.
+      }
+    }
+    log.warn({
+      provider: 'opencode',
+      sessionIdHash: hashForLogs(realId),
+      ...(state.cwd ? { cwdHash: hashForLogs(state.cwd) } : {}),
+      polls: TRANSCRIPT_SETTLE_MAX_POLLS + 1,
+    }, 'transcript did not settle after idle')
+    return false
+  }
+
   /** Arm the restore idle-recovery monitor for a durable session reconciled as busy.
    * Exactly one monitor per real ses_ id; no-op while a user send is in flight (its own
    * onceIdle owns the turn). Resolve emits idle (+ chime unless the turn aborted/errored);
@@ -448,8 +513,13 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       ? serveManager.onceIdle(realId, DEFAULT_TURN_TIMEOUT_MS, route, { assumeActive: true })
       : serveManager.onceIdle(realId, DEFAULT_TURN_TIMEOUT_MS, undefined, { assumeActive: true })
     monitor.promise = idle
-      .then(() => {
+      .then(async () => {
         if (monitor.cancelled) return // disarmed by a newer user send — its own onceIdle owns this turn
+        // Freshness proof (kata zrrj): before declaring the recovered turn complete, prove
+        // the REST read path can serve a completed assistant message. sentAtMs = 0: the
+        // pre-restart send time is unknowable, so ANY completed assistant message settles.
+        await awaitTranscriptSettled(state, 0)
+        if (monitor.cancelled) return // a user send may have disarmed us while settling
         emitStatus(state, 'idle')
         monitorEvent('resolved_idle')
         // Restored sessions have both flags undefined -> falsy -> chime allowed; the
@@ -551,12 +621,19 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
         // reject later on its timeout timer. Attach a no-op handler now so that
         // later rejection cannot become an unhandled rejection.
         void idle.catch(() => {})
+        // Freshness anchor (kata zrrj): the settle proof below accepts only assistant
+        // messages created at/after this send (minus clock skew).
+        const sentAtMs = Date.now()
         await promptAsyncForState(state, realId, {
           parts: [{ type: 'text', text }],
           ...(splitOpencodeModel(modelStr) ? { model: splitOpencodeModel(modelStr)! } : {}),
           ...(effort ? { variant: effort } : {}),
         })
         await idle
+        // Prove the final assistant message is queryable via the REST read path BEFORE
+        // emitting idle/turn-complete — session.idle does not sequence behind message
+        // persistence, so the client's post-idle snapshot could otherwise miss the answer.
+        await awaitTranscriptSettled(state, sentAtMs)
         state.model = modelStr ?? state.model
         state.effort = effort
         emitStatus(state, 'idle')

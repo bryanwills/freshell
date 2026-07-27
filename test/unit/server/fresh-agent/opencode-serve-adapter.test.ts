@@ -107,6 +107,11 @@ function makeAdapter(manager: FakeManager, overrides: Partial<Parameters<typeof 
     // Every test adapter gets an isolated recovery store by default so no test can
     // read or write the real user-level recovery file.
     recoveryStore: makeTempRecoveryStore(),
+    // Transcript-settle polls (zrrj Task 15): default the injected sleep to a no-op so
+    // tests using the never-settling default listMessages fixture exhaust the poll
+    // budget in pure microtasks instead of ~1.5 s of real timers. The PRODUCTION
+    // default stays the real setTimeout sleep; explicit per-test overrides still win.
+    settleSleep: async () => {},
     ...overrides,
   })
 }
@@ -1340,6 +1345,95 @@ describe('restore reconciliation emits and monitors (zrrj)', () => {
     const completions = events.filter((e) => e?.type === 'sdk.turn.complete')
     expect(idles).toHaveLength(1)
     expect(completions).toHaveLength(1)
+  })
+})
+
+describe('idle freshness (zrrj)', () => {
+  it('withholds idle and turn-complete until the final assistant message is queryable', async () => {
+    const now = Date.now()
+    const manager = makeFakeManager()
+    const idle = createDeferred<void>()
+    manager.onceIdle = vi.fn(() => idle.promise)
+    // First two polls: transcript still missing the final answer; third poll: it appears.
+    const unfinished = {
+      // user messages never carry time.completed (verified live, V2)
+      messages: [{ info: { id: 'm1', role: 'user', time: { created: now } }, parts: [] }],
+      nextCursor: null,
+    }
+    const finished = {
+      messages: [
+        ...unfinished.messages,
+        { info: { id: 'm2', role: 'assistant', time: { created: now, completed: now } }, parts: [] },
+      ],
+      nextCursor: null,
+    }
+    const events: any[] = []
+    // Each poll records whether idle had (wrongly) already been emitted before it ran.
+    const idleAlreadyEmittedAtPoll: boolean[] = []
+    manager.listMessages.mockImplementation(async () => {
+      idleAlreadyEmittedAtPoll.push(events.some((e) => e?.type === 'sdk.session.snapshot' && e.status === 'idle'))
+      return (idleAlreadyEmittedAtPoll.length >= 3 ? finished : unfinished) as any
+    })
+    const adapter = makeAdapter(manager, { settleSleep: async () => {} }) // injected no-op sleep
+    await adapter.create({ requestId: 'fresh-1', sessionType: 'freshopencode', provider: 'opencode' })
+    adapter.subscribe?.('freshopencode-fresh-1', (e) => events.push(e))
+    const sendPromise = adapter.send!('freshopencode-fresh-1', { text: 'q' })
+    idle.resolve()
+    await sendPromise
+    expect(manager.listMessages).toHaveBeenCalledTimes(3)
+    expect(idleAlreadyEmittedAtPoll).toEqual([false, false, false]) // idle withheld through every poll
+    const idleIndex = events.findIndex((e) => e?.type === 'sdk.session.snapshot' && e.status === 'idle')
+    const completeIndex = events.findIndex((e) => e?.type === 'sdk.turn.complete')
+    expect(idleIndex).toBeGreaterThanOrEqual(0)
+    expect(completeIndex).toBeGreaterThan(idleIndex - 1) // both emitted, after settling
+  })
+
+  it('gives up after the poll budget but still emits idle (never strands the pane busy)', async () => {
+    loggerMocks.logger.warn.mockClear()
+    const manager = makeFakeManager()
+    const idle = createDeferred<void>()
+    manager.onceIdle = vi.fn(() => idle.promise)
+    // Default listMessages fixture ({ messages: [] }) never settles.
+    const adapter = makeAdapter(manager, { settleSleep: async () => {} })
+    await adapter.create({ requestId: 'fresh-2', sessionType: 'freshopencode', provider: 'opencode' })
+    const events: any[] = []
+    adapter.subscribe?.('freshopencode-fresh-2', (e) => events.push(e))
+    const sendPromise = adapter.send!('freshopencode-fresh-2', { text: 'q' })
+    idle.resolve()
+    await sendPromise
+    expect(manager.listMessages.mock.calls.length).toBeGreaterThanOrEqual(2) // bounded polling actually happened
+    expect(manager.listMessages.mock.calls.length).toBeLessThanOrEqual(11) // 1 + max 10 polls
+    expect(events.some((e) => e?.type === 'sdk.session.snapshot' && e.status === 'idle')).toBe(true)
+    // Exhaustion degrades to the pre-task behavior (idle + chime) rather than stranding the turn.
+    expect(events.some((e) => e?.type === 'sdk.turn.complete')).toBe(true)
+    const warnCall = loggerMocks.logger.warn.mock.calls.find((call) => call[1] === 'transcript did not settle after idle')
+    expect(warnCall).toBeDefined()
+    expect(JSON.stringify(warnCall![0])).not.toContain('ses_real_1') // hashed identity only
+  })
+
+  it('monitor-resolve path proves the transcript (any completed assistant message) before emitting idle', async () => {
+    const manager = makeFakeManager()
+    manager.getSessionStatus = vi.fn(async () => ({ type: 'busy' }))
+    const idle = createDeferred<void>()
+    manager.onceIdle = vi.fn(() => idle.promise)
+    const events: any[] = []
+    const idleAlreadyEmittedAtPoll: boolean[] = []
+    manager.listMessages.mockImplementation(async () => {
+      idleAlreadyEmittedAtPoll.push(events.some((e) => e?.type === 'sdk.session.snapshot' && e.status === 'idle'))
+      // First poll: not yet queryable; second poll: an OLD completed assistant message —
+      // the monitor path passes sentAtMs = 0, so ANY completed assistant message settles.
+      return (idleAlreadyEmittedAtPoll.length >= 2
+        ? { messages: [{ info: { id: 'a1', role: 'assistant', time: { created: 1, completed: 2 } }, parts: [] }], nextCursor: null }
+        : { messages: [], nextCursor: null }) as any
+    })
+    const adapter = makeAdapter(manager)
+    await adapter.attach!({ sessionId: 'ses_live', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' })
+    adapter.subscribe?.('ses_live', (ev) => events.push(ev))
+    idle.resolve()
+    await vi.waitFor(() => expect(events.some((e) => e?.type === 'sdk.session.snapshot' && e.status === 'idle')).toBe(true))
+    expect(manager.listMessages).toHaveBeenCalledTimes(2)
+    expect(idleAlreadyEmittedAtPoll).toEqual([false, false]) // idle withheld until the transcript proved queryable
+    expect(events.some((e) => e?.type === 'sdk.turn.complete')).toBe(true)
   })
 })
 
