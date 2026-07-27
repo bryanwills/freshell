@@ -8,7 +8,7 @@ import os from 'os'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import cookieParser from 'cookie-parser'
-import rateLimit from 'express-rate-limit'
+import { createApiRateLimiter } from './rate-limit.js'
 import chokidar from 'chokidar'
 import { logger, resolveRuntimeLogLevel, setLogLevel } from './logger.js'
 import { requestLogger } from './request-logger.js'
@@ -201,15 +201,7 @@ async function main() {
   app.use('/api/fresh-agent/threads', createFreshAgentSnapshotRateLimitMiddleware())
 
   // Basic rate limiting for /api
-  app.use(
-    '/api',
-    rateLimit({
-      windowMs: 60_000,
-      max: 300,
-      standardHeaders: true,
-      legacyHeaders: false,
-    }),
-  )
+  app.use('/api', createApiRateLimiter())
 
   app.use(cookieParser())
   app.use('/api', httpAuthMiddleware)
