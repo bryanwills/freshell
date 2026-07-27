@@ -17,6 +17,10 @@ const DEFAULT_SESSION_LIFECYCLE_LOG_FILE = 'session-lifecycle'
 const DEFAULT_SESSION_LIFECYCLE_LOG_SUFFIX = '.jsonl'
 const DEFAULT_SESSION_LIFECYCLE_LOG_SIZE: SizeString = '10M'
 const DEFAULT_SESSION_LIFECYCLE_LOG_MAX_FILES = 10
+const DEFAULT_FRESH_AGENT_LOG_FILE = 'fresh-agent'
+const DEFAULT_FRESH_AGENT_LOG_SUFFIX = '.jsonl'
+const DEFAULT_FRESH_AGENT_LOG_SIZE: SizeString = '10M'
+const DEFAULT_FRESH_AGENT_LOG_MAX_FILES = 10
 export const DEFAULT_NON_DEBUG_LOG_LEVEL: LevelWithSilent = 'warn'
 const DEFAULT_CONSOLE_LOG_LEVEL: LevelWithSilent = 'error'
 const SOURCE_ENTRY_MATCHERS = [/(^|\/)server\/index\.ts$/i, /(^|\/)server\/index\.js$/i]
@@ -122,6 +126,25 @@ export function resolveSessionLifecycleLogPath(
   )
 }
 
+export function resolveFreshAgentObservabilityLogPath(
+  envVars: NodeJS.ProcessEnv = process.env,
+  homeDir: string = getFreshellHomeDir(envVars),
+  argv: string[] = process.argv,
+): string | null {
+  const explicitPath = envVars.LOG_FRESH_AGENT_PATH?.trim()
+  if (explicitPath) return path.resolve(explicitPath)
+  if (isTestRuntime(envVars)) return null
+
+  const logDirOverride = envVars.FRESHELL_LOG_DIR?.trim()
+  const logDir = logDirOverride ? path.resolve(logDirOverride) : path.join(homeDir, '.freshell', 'logs')
+  const mode = resolveDebugLogMode(envVars, argv)
+  const instance = resolveDebugInstanceTag(envVars)
+  return path.join(
+    logDir,
+    `${DEFAULT_FRESH_AGENT_LOG_FILE}.${mode}.${instance}${DEFAULT_FRESH_AGENT_LOG_SUFFIX}`,
+  )
+}
+
 function normalizeLogMode(value: string | undefined): LogMode | undefined {
   const normalized = value?.trim().toLowerCase()
   if (normalized === 'development' || normalized === 'dev') return 'development'
@@ -207,12 +230,28 @@ export function createDebugFileStream(filePath: string, options: DebugFileStream
   return createStream(path.basename(filePath), { path: dir, size, maxFiles })
 }
 
+type DedicatedFileLoggerOptions = {
+  filePath: string
+  level?: LevelWithSilent
+  size?: SizeString
+  maxFiles?: number
+}
+
+export function createDedicatedFileLogger(options: DedicatedFileLoggerOptions) {
+  const stream = createDebugFileStream(options.filePath, {
+    size: options.size,
+    maxFiles: options.maxFiles,
+  })
+  return pino(createPinoOptions({ level: options.level ?? 'info' }), stream)
+}
+
 export function createSessionLifecycleLogger(filePath: string) {
-  const stream = createDebugFileStream(filePath, {
+  return createDedicatedFileLogger({
+    filePath,
+    level: 'info',
     size: DEFAULT_SESSION_LIFECYCLE_LOG_SIZE,
     maxFiles: DEFAULT_SESSION_LIFECYCLE_LOG_MAX_FILES,
   })
-  return pino(createPinoOptions({ level: 'info' }), stream)
 }
 
 export function resolveRuntimeLogLevel(debugLoggingEnabled: boolean): LevelWithSilent {
@@ -315,6 +354,21 @@ const sessionLifecycleLogPath = resolveSessionLifecycleLogPath()
 export const sessionLifecycleLogger = sessionLifecycleLogPath
   ? createSessionLifecycleLogger(sessionLifecycleLogPath)
   : logger.child({ component: 'session-lifecycle-disabled' })
+
+// Always-on fresh-agent observability logger. Pinned at level 'info' so its
+// rows stay visible in production, where the main logger sits at 'warn' with
+// the Debug toggle off. In test runtimes (no resolved path) it must be truly
+// silent, so the fallback is a dedicated silent pino instance rather than a
+// child of the main logger.
+const freshAgentObservabilityLogPath = resolveFreshAgentObservabilityLogPath()
+export const freshAgentObservabilityLogger = freshAgentObservabilityLogPath
+  ? createDedicatedFileLogger({
+      filePath: freshAgentObservabilityLogPath,
+      level: 'info',
+      size: DEFAULT_FRESH_AGENT_LOG_SIZE,
+      maxFiles: DEFAULT_FRESH_AGENT_LOG_MAX_FILES,
+    })
+  : pino(createPinoOptions({ level: 'silent' }))
 
 export function setLogLevel(nextLevel: LevelWithSilent): void {
   logger.level = nextLevel

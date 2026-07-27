@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import type { Request, Response, NextFunction } from 'express'
-import { logger } from '../logger.js'
+import { freshAgentObservabilityLogger } from '../logger.js'
 
 const HASH_LENGTH = 12
 
@@ -30,6 +30,7 @@ export type FreshAgentObservabilityEvent =
     lastTurnIdHash?: string
     revision?: number
     cwdHash?: string
+    trigger?: string
   }
   | {
     kind: 'fresh_agent_snapshot_rate_limited'
@@ -39,11 +40,96 @@ export type FreshAgentObservabilityEvent =
     httpStatus: 429
     route: string
     cwdHash?: string
+    retryAfterSeconds?: number
+    trigger?: string
+  }
+  | {
+    kind: 'fresh_agent_send'
+    sessionType: string
+    provider: string
+    sessionIdHash: string
+    cwdHash?: string
+    requestId?: string
+    outcome: 'accepted' | 'failed'
+    errorCode?: string
+    durationMs?: number
+  }
+  | {
+    kind: 'fresh_agent_interrupt'
+    sessionType: string
+    provider: string
+    sessionIdHash: string
+    cwdHash?: string
+    outcome: 'ok' | 'failed'
+    errorCode?: string
+  }
+  | {
+    kind: 'fresh_agent_attach'
+    sessionType: string
+    provider: string
+    sessionIdHash: string
+    cwdHash?: string
+    outcome: 'ok' | 'failed'
+    errorCode?: string
+    recovered?: boolean
+  }
+  | {
+    kind: 'fresh_agent_materialized'
+    sessionType: string
+    provider: string
+    previousSessionIdHash: string
+    sessionIdHash: string
+    cwdHash?: string
+  }
+  | {
+    kind: 'fresh_agent_monitor'
+    provider: 'opencode'
+    sessionIdHash: string
+    cwdHash?: string
+    phase: 'armed' | 'resolved_idle' | 'timeout' | 'sidecar_lost' | 'duplicate_suppressed'
+    sidecarGeneration?: number
+  }
+  | {
+    kind: 'fresh_agent_sidecar'
+    provider: 'opencode'
+    phase: 'started' | 'exited' | 'discarded'
+    generation: number
+    pid?: number
+    baseUrl?: string
+    reason?: string
+    code?: number | null
+    signal?: string | null
+  }
+  | {
+    kind: 'fresh_agent_snapshot_failed'
+    sessionType: string
+    provider: string
+    threadIdHash?: string
+    httpStatus: number
+    code?: string
+    durationMs?: number
+    trigger?: string
+    cwdHash?: string
+  }
+  | {
+    kind: 'fresh_agent_turn_recovery'
+    provider: 'opencode'
+    sessionIdHash: string
+    cwdHash?: string
+    action:
+      | 'continuation_injected'
+      | 'suppressed_user_stop'
+      | 'suppressed_user_followup'
+      | 'suppressed_already_recovered'
+      | 'suppressed_low_confidence'
+      | 'suppressed_no_route'
+    reason: string
+    messageIdHash?: string
   }
 
-type FreshAgentObservabilitySink = Pick<typeof logger, 'info' | 'warn'>
+type FreshAgentObservabilitySink = Pick<typeof freshAgentObservabilityLogger, 'info' | 'warn'>
 
-const defaultSink: FreshAgentObservabilitySink = logger
+const defaultSink: FreshAgentObservabilitySink = freshAgentObservabilityLogger
 let sink: FreshAgentObservabilitySink = defaultSink
 
 export function __setFreshAgentObservabilitySinkForTest(next: FreshAgentObservabilitySink): void {
@@ -51,63 +137,53 @@ export function __setFreshAgentObservabilitySinkForTest(next: FreshAgentObservab
 }
 
 function buildPayload(event: FreshAgentObservabilityEvent): Record<string, unknown> {
-  const base = { event: event.kind, component: 'fresh-agent-observability' }
-  switch (event.kind) {
-    case 'fresh_agent_opencode_status_observed':
-      return {
-        ...base,
-        provider: event.provider,
-        sessionIdHash: event.sessionIdHash,
-        status: event.status,
-        source: event.source,
-        ...(event.opencodeEventKind ? { opencodeEventKind: event.opencodeEventKind } : {}),
-        ...(event.cwdHash ? { cwdHash: event.cwdHash } : {}),
-      }
-    case 'fresh_agent_snapshot_served':
-      return {
-        ...base,
-        sessionType: event.sessionType,
-        provider: event.provider,
-        threadIdHash: event.threadIdHash,
-        httpStatus: event.httpStatus,
-        durationMs: event.durationMs,
-        ...(event.payloadBytes !== undefined ? { payloadBytes: event.payloadBytes } : {}),
-        turnCount: event.turnCount,
-        ...(event.lastTurnIdHash ? { lastTurnIdHash: event.lastTurnIdHash } : {}),
-        ...(event.revision !== undefined ? { revision: event.revision } : {}),
-        ...(event.cwdHash ? { cwdHash: event.cwdHash } : {}),
-      }
-    case 'fresh_agent_snapshot_rate_limited':
-      return {
-        ...base,
-        sessionType: event.sessionType,
-        provider: event.provider,
-        ...(event.threadIdHash ? { threadIdHash: event.threadIdHash } : {}),
-        httpStatus: event.httpStatus,
-        route: event.route,
-        ...(event.cwdHash ? { cwdHash: event.cwdHash } : {}),
-      }
+  const { kind, ...fields } = event
+  const payload: Record<string, unknown> = { event: kind, component: 'fresh-agent-observability' }
+  for (const [key, value] of Object.entries(fields)) {
+    if (value !== undefined) payload[key] = value
   }
+  return payload
+}
+
+const WARN_KINDS = new Set<FreshAgentObservabilityEvent['kind']>([
+  'fresh_agent_snapshot_rate_limited',
+  'fresh_agent_snapshot_failed',
+])
+
+function isWarnEvent(event: FreshAgentObservabilityEvent): boolean {
+  if (WARN_KINDS.has(event.kind)) return true
+  if (event.kind === 'fresh_agent_sidecar') return event.phase !== 'started'
+  if (event.kind === 'fresh_agent_monitor') return event.phase === 'timeout' || event.phase === 'sidecar_lost'
+  return false
 }
 
 export function recordFreshAgentObservabilityEvent(event: FreshAgentObservabilityEvent): void {
   const payload = buildPayload(event)
-  if (event.kind === 'fresh_agent_snapshot_rate_limited') {
+  if (isWarnEvent(event)) {
     sink.warn(payload, event.kind)
   } else {
     sink.info(payload, event.kind)
   }
 }
 
-const SNAPSHOT_PATH_PATTERN = /^\/([^/]+)\/([^/]+)\/([^/]+)$/
+// Matches all three thread routes relative to the mount point:
+//   /:sessionType/:provider/:threadId
+//   /:sessionType/:provider/:threadId/turns
+//   /:sessionType/:provider/:threadId/turns/:turnId
+const SNAPSHOT_PATH_PATTERN = /^\/([^/]+)\/([^/]+)\/([^/]+)(?:\/turns(?:\/[^/]+)?)?$/
+
+const MAX_TRIGGER_LENGTH = 32
 
 export function createFreshAgentSnapshotRateLimitMiddleware() {
   return (req: Request, res: Response, next: NextFunction) => {
     const match = SNAPSHOT_PATH_PATTERN.exec(req.path)
     if (match) {
       const [, sessionType, provider, threadId] = match
+      const trigger =
+        typeof req.query.trigger === 'string' ? req.query.trigger.slice(0, MAX_TRIGGER_LENGTH) : undefined
       res.on('finish', () => {
         if (res.statusCode === 429) {
+          const retryAfterSeconds = Number(res.getHeader('Retry-After')) || undefined
           recordFreshAgentObservabilityEvent({
             kind: 'fresh_agent_snapshot_rate_limited',
             sessionType,
@@ -115,6 +191,8 @@ export function createFreshAgentSnapshotRateLimitMiddleware() {
             threadIdHash: hashForLogs(threadId),
             httpStatus: 429,
             route: `/fresh-agent/threads/${sessionType}/${provider}/:threadId`,
+            ...(retryAfterSeconds !== undefined ? { retryAfterSeconds } : {}),
+            ...(trigger ? { trigger } : {}),
           })
         }
       })
