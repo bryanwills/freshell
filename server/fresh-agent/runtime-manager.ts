@@ -212,6 +212,15 @@ export class FreshAgentRuntimeManager {
     return await record.adapter.subscribe(locator.sessionId, listener)
   }
 
+  /** Synchronous passthrough to the adapter's state-generation lookup (when
+   * implemented). Lets subscribers detect adapter-state recreation and rebind. */
+  sessionStateGeneration(locator: FreshAgentSessionLocator): number | undefined {
+    const record = this.sessions.get(this.key(locator))
+    const adapter = record?.adapter
+      ?? this.options.registry.resolveBySessionType(locator.sessionType)?.adapter
+    return adapter?.sessionStateGeneration?.(locator.sessionId)
+  }
+
   async send(
     locator: FreshAgentSessionLocator,
     input: { requestId?: string; text: string; images?: FreshAgentInputImage[]; settings?: FreshAgentCreateRequest },

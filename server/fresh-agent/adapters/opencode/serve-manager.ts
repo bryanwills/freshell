@@ -4,6 +4,7 @@ import { EventEmitter } from 'node:events'
 import type pino from 'pino'
 import { allocateLocalhostPort, type LoopbackServerEndpoint } from '../../../local-port.js'
 import { logger } from '../../../logger.js'
+import { recordFreshAgentObservabilityEvent } from '../../observability.js'
 import { parseServeEvent, type ParsedServeEvent } from './serve-events.js'
 
 type OpencodeServeLogger = Pick<pino.Logger, 'warn' | 'error' | 'debug' | 'info'>
@@ -110,6 +111,8 @@ export class OpencodeServeManager {
   private startPromise: Promise<RunningServe> | undefined
   private startAbort: AbortController | undefined
   private shutdownRequested = false
+  /** Monotonic sidecar identity; bumped on every successful start(). 0 before first start. */
+  private generation = 0
 
   constructor(options: OpencodeServeManagerOptions = {}) {
     this.env = options.env ?? process.env
@@ -123,11 +126,42 @@ export class OpencodeServeManager {
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
   }
 
+  currentGeneration(): number {
+    return this.generation
+  }
+
+  describeSidecar(): { generation: number; pid?: number; baseUrl: string; ownershipId: string } | undefined {
+    if (!this.running) return undefined
+    return {
+      generation: this.generation,
+      pid: this.running.child.pid ?? undefined,
+      baseUrl: this.running.baseUrl,
+      ownershipId: this.running.ownershipId,
+    }
+  }
+
+  /**
+   * Survive-replacement (zrrj): emitters stay in the map so listeners keep
+   * receiving events once a replacement sidecar starts dispatching. Waiters
+   * observe the loss via the 'lost' event, which carries the dead sidecar's
+   * generation as a second argument (existing single-arg consumers unaffected).
+   */
   private emitLostForAllSessions(): void {
-    const emitters = Array.from(this.sessionEmitters.entries())
-    this.sessionEmitters.clear()
-    for (const [sessionId, emitter] of emitters) {
-      emitter.emit('lost', new OpencodeServeLostError(sessionId))
+    const generation = this.generation
+    for (const [sessionId, emitter] of Array.from(this.sessionEmitters.entries())) {
+      emitter.emit('lost', new OpencodeServeLostError(sessionId), { generation })
+    }
+  }
+
+  /** Emitters are created lazily and retained across sidecar replacement; GC an
+   * entry once nothing is listening so the map cannot grow without bound. */
+  private releaseEmitterIfIdle(sessionId: string, emitter: EventEmitter): void {
+    if (
+      emitter.listenerCount('event') === 0
+      && emitter.listenerCount('lost') === 0
+      && this.sessionEmitters.get(sessionId) === emitter
+    ) {
+      this.sessionEmitters.delete(sessionId)
     }
   }
 
@@ -137,6 +171,15 @@ export class OpencodeServeManager {
     this.running = undefined
     this.startPromise = undefined
     try { running.stopEventStream() } catch { /* ignore */ }
+    recordFreshAgentObservabilityEvent({
+      kind: 'fresh_agent_sidecar',
+      provider: 'opencode',
+      phase: 'discarded',
+      generation: this.generation,
+      pid: running.child.pid ?? undefined,
+      baseUrl: running.baseUrl,
+      reason,
+    })
     this.emitLostForAllSessions()
     this.log.warn({ reason }, 'discarding opencode serve sidecar')
     void killOwnedProcesses(running.child, running.ownershipId, this.log)
@@ -224,6 +267,16 @@ export class OpencodeServeManager {
           this.running = undefined
           this.startPromise = undefined
           try { running.stopEventStream() } catch { /* ignore */ }
+          recordFreshAgentObservabilityEvent({
+            kind: 'fresh_agent_sidecar',
+            provider: 'opencode',
+            phase: 'exited',
+            generation: this.generation,
+            pid: child.pid ?? undefined,
+            baseUrl: running.baseUrl,
+            code,
+            signal,
+          })
           void killOwnedProcesses(running.child, running.ownershipId, this.log)
           this.emitLostForAllSessions()
         }
@@ -250,6 +303,15 @@ export class OpencodeServeManager {
         stopEventStream,
       }
       this.running = running
+      this.generation += 1
+      recordFreshAgentObservabilityEvent({
+        kind: 'fresh_agent_sidecar',
+        provider: 'opencode',
+        phase: 'started',
+        generation: this.generation,
+        pid: child.pid ?? undefined,
+        baseUrl,
+      })
       return running
     } catch (err) {
       if (child) this.stopChild(child)
@@ -434,7 +496,10 @@ export class OpencodeServeManager {
   subscribe(sessionId: string, listener: (event: ParsedServeEvent) => void): () => void {
     const emitter = this.emitterFor(sessionId)
     emitter.on('event', listener)
-    return () => emitter.off('event', listener)
+    return () => {
+      emitter.off('event', listener)
+      this.releaseEmitterIfIdle(sessionId, emitter)
+    }
   }
 
   onceIdle(sessionId: string, timeoutMs: number, route: ServeRoute = {}): Promise<void> {
@@ -451,6 +516,7 @@ export class OpencodeServeManager {
         clearInterval(pollTimer)
         emitter.off('event', handler)
         emitter.off('lost', onLost)
+        this.releaseEmitterIfIdle(sessionId, emitter)
       }
       const finish = () => {
         if (settled) return

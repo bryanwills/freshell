@@ -34,8 +34,20 @@ const OPENCODE_REAL_SESSION_ID = /^ses_/
 const OPENCODE_PLACEHOLDER_SESSION_ID = /^freshopencode-/
 const DEFAULT_TURN_TIMEOUT_MS = 600_000
 
+/** Module-scope monotonic counter for OpencodeSessionState identity. Holds no
+ * per-instance state; every newly constructed state gets the next value. */
+let stateGenerationCounter = 0
+
+function nextStateGeneration(): number {
+  return ++stateGenerationCounter
+}
+
 type OpencodeSessionState = {
   placeholderId: string
+  /** Monotonic identity of this state object (and its EventEmitter). Consumers
+   * (ws-handler) compare generations to detect state recreation and rebind
+   * their subscriptions to the new emitter. */
+  stateGeneration: number
   realSessionId?: string
   cwd?: string
   routeValidatedCwd?: string
@@ -424,6 +436,7 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       const normalized = normalizeOpencodeInput(input)
       const state: OpencodeSessionState = {
         placeholderId: makePlaceholderId(String(input.requestId)),
+        stateGeneration: nextStateGeneration(),
         cwd: normalized.cwd,
         model: normalized.model,
         effort: normalized.effort,
@@ -442,8 +455,8 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       if (isPlaceholderOpencodeSessionId(sessionId)) {
         const real = await resolveLegacyPlaceholder(legacyReader(), normalized, sessionId)
         const state: OpencodeSessionState = {
-          placeholderId: sessionId, realSessionId: real, cwd: normalized.cwd, model: normalized.model,
-          effort: normalized.effort, status: 'idle', events: new EventEmitter(), sendQueue: Promise.resolve(),
+          placeholderId: sessionId, stateGeneration: nextStateGeneration(), realSessionId: real, cwd: normalized.cwd,
+          model: normalized.model, effort: normalized.effort, status: 'idle', events: new EventEmitter(), sendQueue: Promise.resolve(),
         }
         remember(state)
         bindServeStream(state)
@@ -454,8 +467,8 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
         throw new FreshAgentLostSessionError(`OpenCode session ${sessionId} is not a durable OpenCode session.`)
       }
       const state: OpencodeSessionState = {
-        placeholderId: sessionId, realSessionId: sessionId, cwd: normalized.cwd, model: normalized.model,
-        effort: normalized.effort, status: 'idle', events: new EventEmitter(), sendQueue: Promise.resolve(),
+        placeholderId: sessionId, stateGeneration: nextStateGeneration(), realSessionId: sessionId, cwd: normalized.cwd,
+        model: normalized.model, effort: normalized.effort, status: 'idle', events: new EventEmitter(), sendQueue: Promise.resolve(),
       }
       remember(state)
       bindServeStream(state)
@@ -483,6 +496,7 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       }
       const state: OpencodeSessionState = {
         placeholderId: locator.sessionId,
+        stateGeneration: nextStateGeneration(),
         realSessionId: locator.sessionId,
         cwd: locator.cwd,
         status: 'idle',
@@ -502,6 +516,10 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       const handler = (event: unknown) => listener(event)
       state.events.on('event', handler)
       return () => state.events.off('event', handler)
+    },
+
+    sessionStateGeneration(sessionId) {
+      return sessions.get(sessionId)?.stateGeneration
     },
 
     async send(sessionId, input) {
@@ -548,6 +566,7 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       const child = await forkForState(state)
       const childState: OpencodeSessionState = {
         placeholderId: child.id,
+        stateGeneration: nextStateGeneration(),
         realSessionId: child.id,
         cwd: child.directory ?? state.cwd,
         providerCreatedInThisAdapter: true,

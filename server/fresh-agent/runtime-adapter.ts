@@ -60,6 +60,10 @@ export interface FreshAgentRuntimeAdapter {
   resume?(input: FreshAgentCreateRequest): Promise<{ sessionId: string; sessionRef?: { provider: string; sessionId: string } }>
   attach?(locator: FreshAgentSessionLocator): Promise<{ sessionId: string; sessionRef?: { provider: string; sessionId: string } }> | { sessionId: string; sessionRef?: { provider: string; sessionId: string } }
   subscribe?(sessionId: string, listener: (message: unknown) => void): Promise<() => void> | (() => void)
+  /** Monotonic identity of the adapter state backing a session's event emitter.
+   * Consumers compare generations across calls to detect state recreation (a new
+   * emitter) and rebind subscriptions. Undefined when the session is unknown. */
+  sessionStateGeneration?(sessionId: string): number | undefined
   send?(sessionId: string, input: { requestId?: string; text: string; images?: FreshAgentInputImage[]; settings?: FreshAgentCreateRequest }): Promise<FreshAgentSendResult> | FreshAgentSendResult
   interrupt?(sessionId: string): Promise<void> | void
   compact?(sessionId: string, input?: { instructions?: string }): Promise<void> | void

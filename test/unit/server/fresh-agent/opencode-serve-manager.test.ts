@@ -4,6 +4,8 @@ import { ReadableStream } from 'node:stream/web'
 import { describe, expect, it, vi } from 'vitest'
 import { parseServeEvent as parseEvt } from '../../../../server/fresh-agent/adapters/opencode/serve-events.js'
 import { OpencodeServeManager, OpencodeServeLostError } from '../../../../server/fresh-agent/adapters/opencode/serve-manager.js'
+import { __setFreshAgentObservabilitySinkForTest } from '../../../../server/fresh-agent/observability.js'
+import { freshAgentObservabilityLogger } from '../../../../server/logger.js'
 
 function fakeChild() {
   const child = new EventEmitter() as any
@@ -893,7 +895,7 @@ describe('OpencodeServeManager fan-out', () => {
     expect(seen.map((e) => e.kind)).toEqual(['session.idle'])
   })
 
-  it('cleans up the event stream and session emitters when the child exits unexpectedly', async () => {
+  it('cleans up the event stream but retains subscribed session emitters when the child exits unexpectedly', async () => {
     const child = fakeChild()
     const stopStream = vi.fn()
     const spawnFn = vi.fn(() => child)
@@ -913,7 +915,9 @@ describe('OpencodeServeManager fan-out', () => {
     child.emit('close', 1)
     expect(stopStream).toHaveBeenCalled()
     expect(child.kill).toHaveBeenCalled()
-    expect((manager as any).sessionEmitters.size).toBe(0)
+    // Survive-replacement (zrrj): the emitter stays in the map so the live
+    // subscription keeps receiving events from a replacement sidecar.
+    expect((manager as any).sessionEmitters.has('ses_child')).toBe(true)
     expect((manager as any).running).toBeUndefined()
   })
 
@@ -958,7 +962,7 @@ describe('OpencodeServeManager fan-out', () => {
     expect(seen.map((e) => e.kind)).toEqual(['session.idle'])
   })
 
-  it('request timeout emits lost event and cleans up session emitters', async () => {
+  it('request timeout emits lost event and retains subscribed session emitters for replacement', async () => {
     let messageSignal: AbortSignal | undefined
     const fetchFn = vi.fn(async (url: string, init: any) => {
       if (url.endsWith('/global/health')) return jsonResponse({ healthy: true })
@@ -984,7 +988,9 @@ describe('OpencodeServeManager fan-out', () => {
     expect(child.kill).toHaveBeenCalled()
     expect(lostHandler).toHaveBeenCalledTimes(1)
     expect(lostHandler.mock.calls[0][0]).toBeInstanceOf(OpencodeServeLostError)
-    expect((manager as any).sessionEmitters.has('ses_project')).toBe(false)
+    // Survive-replacement (zrrj): the subscription is still attached, so the
+    // emitter must remain for the replacement sidecar to dispatch into.
+    expect((manager as any).sessionEmitters.has('ses_project')).toBe(true)
   })
 
   it('request timeout rejects pending onceIdle with OpencodeServeLostError', async () => {
@@ -1008,6 +1014,94 @@ describe('OpencodeServeManager fan-out', () => {
 
     await expect(idle).rejects.toThrow(/opencode serve sidecar was lost/)
     expect((manager as any).sessionEmitters.has('ses_project')).toBe(false)
+  })
+})
+
+describe('sidecar replacement resilience (zrrj)', () => {
+  // fakeChild.kill() queues the 'close' emit on a microtask; flush it so the
+  // manager's close handler runs (discarding the dead sidecar) before we act.
+  const flushClose = () => new Promise((r) => setTimeout(r, 0))
+
+  it('keeps session subscriptions alive across sidecar replacement', async () => {
+    const { manager, child } = makeManager()
+    const seen: unknown[] = []
+    manager.subscribe('ses_1', (ev) => seen.push(ev))
+    await manager.ensureStarted()
+    // Kill the sidecar -> replacement on next call, then dispatch an event as
+    // the REPLACEMENT sidecar would.
+    child.kill()
+    await flushClose()
+    await manager.ensureStarted()
+    ;(manager as any).dispatchEvent({ kind: 'session.idle', sessionId: 'ses_1', properties: {}, raw: {} })
+    expect(seen).toHaveLength(1)
+  })
+
+  it('still emits lost to onceIdle waiters when the sidecar dies', async () => {
+    const { manager, child } = makeManager()
+    await manager.ensureStarted()
+    const idle = manager.onceIdle('ses_1', 5_000)
+    child.kill()
+    await expect(idle).rejects.toBeInstanceOf(OpencodeServeLostError)
+  })
+
+  it("emits 'lost' carrying the generation of the dead sidecar", async () => {
+    const { manager, child } = makeManager()
+    await manager.ensureStarted()
+    const lostHandler = vi.fn()
+    ;(manager as any).emitterFor('ses_1').on('lost', lostHandler)
+    child.kill()
+    await flushClose()
+    expect(lostHandler).toHaveBeenCalledTimes(1)
+    expect(lostHandler).toHaveBeenCalledWith(expect.any(OpencodeServeLostError), { generation: 1 })
+  })
+
+  it('increments generation per start and exposes pid/baseUrl via describeSidecar', async () => {
+    const { manager, child } = makeManager()
+    expect(manager.currentGeneration()).toBe(0)
+    expect(manager.describeSidecar()).toBeUndefined()
+    await manager.ensureStarted()
+    expect(manager.currentGeneration()).toBe(1)
+    const desc = manager.describeSidecar()
+    expect(desc).toMatchObject({
+      generation: 1,
+      pid: 4242,
+      baseUrl: expect.stringContaining('http://127.0.0.1:'),
+      ownershipId: expect.any(String),
+    })
+    child.kill()
+    await flushClose()
+    expect(manager.describeSidecar()).toBeUndefined()
+    await manager.ensureStarted()
+    expect(manager.currentGeneration()).toBe(2)
+    expect(manager.describeSidecar()).toMatchObject({ generation: 2 })
+  })
+
+  it('records fresh_agent_sidecar observability rows for started, exited, and discarded phases', async () => {
+    const infoSpy = vi.fn()
+    const warnSpy = vi.fn()
+    __setFreshAgentObservabilitySinkForTest({ info: infoSpy, warn: warnSpy })
+    try {
+      const { manager, child } = makeManager()
+      await manager.ensureStarted()
+      expect(infoSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ event: 'fresh_agent_sidecar', phase: 'started', generation: 1, pid: 4242, baseUrl: 'http://127.0.0.1:47999' }),
+        'fresh_agent_sidecar',
+      )
+      child.kill()
+      await new Promise((r) => setTimeout(r, 0))
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ event: 'fresh_agent_sidecar', phase: 'exited', generation: 1 }),
+        'fresh_agent_sidecar',
+      )
+      await manager.ensureStarted()
+      ;(manager as any).discardRunning('request_timeout')
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ event: 'fresh_agent_sidecar', phase: 'discarded', generation: 2, reason: 'request_timeout' }),
+        'fresh_agent_sidecar',
+      )
+    } finally {
+      __setFreshAgentObservabilitySinkForTest(freshAgentObservabilityLogger)
+    }
   })
 })
 

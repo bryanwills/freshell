@@ -1143,4 +1143,42 @@ describe('WsHandler fresh-agent routing', () => {
       await new Promise<void>((resolve) => server.close(() => resolve()))
     }
   })
+
+  it('rebinds the freshAgent subscription when the adapter state generation changes (zrrj)', async () => {
+    let stateGeneration = 1
+    const listeners: Array<(ev: unknown) => void> = []
+    const off = vi.fn()
+    const runtimeManager = {
+      attach: vi.fn().mockResolvedValue({ sessionId: 'ses_9', sessionType: 'freshopencode', runtimeProvider: 'opencode' }),
+      subscribe: vi.fn((_locator: unknown, listener: (ev: unknown) => void) => {
+        listeners.push(listener)
+        return off
+      }),
+      sessionStateGeneration: vi.fn(() => stateGeneration),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+    try {
+      const ws = await connectAndAuth(server)
+      const seenMessages: any[] = []
+      ws.on('message', (data) => { seenMessages.push(JSON.parse(data.toString())) })
+
+      // First attach subscribes. No ack frame exists for attach — wait on the stub call.
+      ws.send(JSON.stringify({ type: 'freshAgent.attach', sessionId: 'ses_9', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' }))
+      await vi.waitFor(() => expect(runtimeManager.subscribe).toHaveBeenCalledTimes(1))
+
+      // Simulate adapter-state recreation: new generation, new emitter (a NEW listener registration is required)
+      stateGeneration = 2
+      ws.send(JSON.stringify({ type: 'freshAgent.attach', sessionId: 'ses_9', sessionType: 'freshopencode', provider: 'opencode', cwd: '/w' }))
+      await vi.waitFor(() => expect(runtimeManager.subscribe).toHaveBeenCalledTimes(2))
+      expect(off).toHaveBeenCalledTimes(1) // the stale subscription was cancelled before rebinding
+
+      // Events dispatched through the NEW listener reach the client as freshAgent.event frames
+      listeners.at(-1)!({ type: 'sdk.session.snapshot', sessionId: 'ses_9', status: 'running' })
+      await vi.waitFor(() => expect(seenMessages.some((m) => m.type === 'freshAgent.event')).toBe(true))
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
 })

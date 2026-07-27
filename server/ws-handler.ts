@@ -138,6 +138,9 @@ type FreshAgentRuntimeManagerLike = {
   create: (input: any) => Promise<any>
   attach: (input: any) => any
   subscribe?: (locator: any, listener: (message: unknown) => void) => Promise<() => void> | (() => void)
+  /** Optional synchronous adapter-state generation lookup; when present, a changed
+   * generation means the state's emitter was recreated and subscriptions must rebind. */
+  sessionStateGeneration?: (locator: any) => number | undefined
   send?: (locator: any, input: any) => Promise<FreshAgentSendResult> | FreshAgentSendResult
   interrupt?: (locator: any) => Promise<void> | void
   compact?: (locator: any, input?: { instructions?: string }) => Promise<void> | void
@@ -176,6 +179,8 @@ type FreshAgentSubscriptionEntry = {
   locator: FreshAgentLocator
   off?: () => void
   pending?: Promise<void>
+  /** Adapter-state generation observed when the subscription bound (managers that expose it). */
+  stateGeneration?: number
 }
 
 type FreshAgentAuthorizationEntry = FreshAgentLocator
@@ -1507,7 +1512,16 @@ export class WsHandler {
       if (this.hasFreshAgentRoute(locator)) {
         existing.locator = { ...locator }
       }
-      return
+      // Generation-aware rebind (zrrj): when the manager exposes adapter-state
+      // generations and the current generation differs from the one we bound to,
+      // the adapter state (and its emitter) was recreated — our listener is
+      // orphaned on the dead emitter. Cancel the stale subscription and fall
+      // through to rebind. Managers without generations keep the no-op behavior.
+      const currentGeneration = manager.sessionStateGeneration?.(locator)
+      if (typeof currentGeneration !== 'number' || currentGeneration === existing.stateGeneration) {
+        return
+      }
+      this.cancelFreshAgentSubscription(state, existing.locator)
     }
 
     const entry: FreshAgentSubscriptionEntry = { active: true, locator: { ...locator } }
@@ -1541,16 +1555,24 @@ export class WsHandler {
               this.logFreshAgentSubscriptionOffError(locator, error)
             }
           }
-          state.freshAgentSubscriptions.delete(key)
+          // A rebind may have replaced this key with a fresh entry; only remove our own.
+          if (state.freshAgentSubscriptions.get(key) === entry) {
+            state.freshAgentSubscriptions.delete(key)
+          }
           return
         }
+        // Record the adapter-state generation the subscription actually bound to
+        // (read after subscribe so recovery-triggered state recreation is captured).
+        entry.stateGeneration = manager.sessionStateGeneration?.(locator)
         if (off) {
           entry.off = off
         }
       })
       .catch((error) => {
         entry.pending = undefined
-        state.freshAgentSubscriptions.delete(key)
+        if (state.freshAgentSubscriptions.get(key) === entry) {
+          state.freshAgentSubscriptions.delete(key)
+        }
         if (entry.active) {
           this.sendFreshAgentSubscriptionError(ws, locator, error)
         }
