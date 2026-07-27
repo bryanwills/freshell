@@ -20,6 +20,10 @@ const loggerMock = vi.hoisted(() => ({
   error: vi.fn(),
   child: vi.fn(),
 }))
+const freshAgentObservabilityLoggerMock = vi.hoisted(() => ({
+  info: vi.fn(),
+  warn: vi.fn(),
+}))
 const DEFAULT_CONFIG_SNAPSHOT = vi.hoisted(() => ({
   version: 1,
   settings: {},
@@ -32,6 +36,7 @@ loggerMock.child.mockReturnValue(loggerMock)
 vi.mock('../../server/logger', () => ({
   logger: loggerMock,
   sessionLifecycleLogger: loggerMock,
+  freshAgentObservabilityLogger: freshAgentObservabilityLoggerMock,
 }))
 
 vi.mock('../../server/config-store', () => ({

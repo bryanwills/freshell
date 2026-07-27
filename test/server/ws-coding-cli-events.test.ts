@@ -34,8 +34,12 @@ vi.mock('../../server/logger', () => {
     fatal: vi.fn(),
     child: vi.fn(),
   }
+  const freshAgentObservabilityLogger = {
+    info: vi.fn(),
+    warn: vi.fn(),
+  }
   logger.child.mockReturnValue(logger)
-  return { logger, sessionLifecycleLogger: logger }
+  return { logger, sessionLifecycleLogger: logger, freshAgentObservabilityLogger }
 })
 
 vi.mock('../../server/config-store', () => ({

@@ -104,6 +104,10 @@ const mockLogger = vi.hoisted(() => {
 vi.mock('../../server/logger', () => ({
   logger: mockLogger,
   sessionLifecycleLogger: mockLogger,
+  freshAgentObservabilityLogger: {
+    info: vi.fn(),
+    warn: vi.fn(),
+  },
   withLogContext: vi.fn((_ctx: any, fn: () => unknown) => fn()),
 }))
 
