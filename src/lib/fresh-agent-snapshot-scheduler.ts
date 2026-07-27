@@ -153,6 +153,28 @@ export class FreshAgentSnapshotScheduler {
       s.trailingRequested = false
     }
   }
+
+  /**
+   * Test-only teardown: cancel pending debounced runs and drop all key state.
+   * The singleton outlives component unmount BY DESIGN (run-closure contract),
+   * so without this a debounce timer armed near the end of one test fires its
+   * stale run into the next test (consuming that test's mock queues). Queued
+   * resolvers are resolved as coalesced so no caller promise is left pending.
+   */
+  disposeForTests(): void {
+    for (const s of this.keys.values()) {
+      if (s.debounceTimer !== null) {
+        clearTimeout(s.debounceTimer)
+        s.debounceTimer = null
+      }
+      s.trailingRequested = false
+      s.pendingRun = null
+      const resolvers = s.pendingResolvers
+      s.pendingResolvers = []
+      for (const resolve of resolvers) resolve({ status: 'coalesced' })
+    }
+    this.keys.clear()
+  }
 }
 
 let singleton: FreshAgentSnapshotScheduler | null = null
@@ -163,5 +185,6 @@ export function getSnapshotScheduler(): FreshAgentSnapshotScheduler {
 }
 
 export function resetSnapshotSchedulerForTests(): void {
+  singleton?.disposeForTests()
   singleton = null
 }

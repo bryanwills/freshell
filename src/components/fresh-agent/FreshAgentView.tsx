@@ -22,6 +22,7 @@ import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
 import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
 import { getRebindQueue } from '@/lib/rebind-queue'
+import { getSnapshotScheduler, makeSnapshotKey, type SnapshotTrigger } from '@/lib/fresh-agent-snapshot-scheduler'
 import {
   normalizeFreshAgentEffort,
   normalizeFreshAgentModel,
@@ -66,7 +67,6 @@ const BUSY_STATES = new Set(['running', 'compacting'])
 // server's create.failed carries no retry-after field by design).
 export const FRESH_AGENT_RESERVE_RETRY_WINDOW_MS = 30_000
 export const FRESH_AGENT_RESERVE_RETRY_FLOOR_MS = 1_000
-const SNAPSHOT_REFRESH_COALESCE_MS = 50
 const SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS = new Set([
   'freshAgent.session.changed',
   'freshAgent.session.snapshot',
@@ -625,8 +625,13 @@ export function FreshAgentView({
   }, [])
   const [loadError, setLoadError] = useState<string | null>(null)
   const [snapshotRefreshNonce, setSnapshotRefreshNonce] = useState(0)
-  const snapshotRefreshTimerRef = useRef<number | null>(null)
-  const snapshotRefreshFollowUpRef = useRef(false)
+  const snapshotRefreshTriggerRef = useRef<SnapshotTrigger>('identity')
+  // Non-null while the snapshot key is rate-limited (429/backoff): the last
+  // good snapshot stays visible and a single retry is armed at expiry.
+  // Task 17 also consumes this for the snapshot `trigger` query param.
+  const [rateLimitedUntil, setRateLimitedUntil] = useState<number | null>(null)
+  void rateLimitedUntil
+  const rateLimitRetryTimerRef = useRef<number | null>(null)
   const [queuedMessages, setQueuedMessages] = useState<string[]>([])
   // Transient, self-clearing banner for action feedback (rewind, shell errors).
   const [notice, setNotice] = useState<string | null>(null)
@@ -812,27 +817,19 @@ export function FreshAgentView({
     }
   }, [releasePendingRebind])
 
-  const scheduleSnapshotRefresh = useCallback((options?: { followUpIfPending?: boolean }) => {
-    if (snapshotRefreshTimerRef.current !== null) {
-      if (options?.followUpIfPending) snapshotRefreshFollowUpRef.current = true
-      return
-    }
-    const fireRefresh = () => {
-      snapshotRefreshTimerRef.current = null
-      setSnapshotRefreshNonce((value) => value + 1)
-      if (!snapshotRefreshFollowUpRef.current) return
-      snapshotRefreshFollowUpRef.current = false
-      snapshotRefreshTimerRef.current = window.setTimeout(fireRefresh, SNAPSHOT_REFRESH_COALESCE_MS)
-    }
-    snapshotRefreshTimerRef.current = window.setTimeout(fireRefresh, SNAPSHOT_REFRESH_COALESCE_MS)
+  // Single trigger-tagged refresh path: every refresh site tags WHY it wants
+  // a snapshot, and the fetch effect hands that trigger to the shared per-key
+  // scheduler (debounce/coalesce now live there, not in this component).
+  const requestSnapshotRefresh = useCallback((trigger: SnapshotTrigger) => {
+    snapshotRefreshTriggerRef.current = trigger
+    setSnapshotRefreshNonce((value) => value + 1)
   }, [])
 
   useEffect(() => () => {
-    if (snapshotRefreshTimerRef.current !== null) {
-      window.clearTimeout(snapshotRefreshTimerRef.current)
-      snapshotRefreshTimerRef.current = null
+    if (rateLimitRetryTimerRef.current !== null) {
+      window.clearTimeout(rateLimitRetryTimerRef.current)
+      rateLimitRetryTimerRef.current = null
     }
-    snapshotRefreshFollowUpRef.current = false
   }, [])
 
   const recordPendingSendMetadata = useCallback((requestId: string, patch: PendingSendMetadata) => {
@@ -1062,7 +1059,7 @@ export function FreshAgentView({
     if (current.sessionId) {
       const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
       sendFreshAgentMessage(buildFreshAgentAttachMessage(current, cwd))
-      setSnapshotRefreshNonce((value) => value + 1)
+      requestSnapshotRefresh('manual')
     } else if (current.status === 'creating' || current.status === 'starting') {
       createSentRef.current = true
       registerFreshAgentCreate(dispatch, current.createRequestId, {
@@ -1076,7 +1073,7 @@ export function FreshAgentView({
     }
 
     dispatch(consumePaneRefreshRequest({ tabId, paneId, requestId: refreshRequest.requestId }))
-  }, [buildCreateMessage, commitSnapshot, dispatch, paneId, refreshRequest, sendFreshAgentMessage, tabId])
+  }, [buildCreateMessage, commitSnapshot, dispatch, paneId, refreshRequest, requestSnapshotRefresh, sendFreshAgentMessage, tabId])
 
   const triggerRecovery = useCallback(() => {
     if (restoreTimeoutRef.current !== null) {
@@ -1375,18 +1372,18 @@ export function FreshAgentView({
         pendingRevealRefreshRef.current = true
       } else {
         sendAttach()
-        scheduleSnapshotRefresh()
+        requestSnapshotRefresh('reconnect')
       }
     })
-  }, [paneId, paneContent.sessionId, scheduleSnapshotRefresh, sendFreshAgentMessage, ws])
+  }, [paneId, paneContent.sessionId, requestSnapshotRefresh, sendFreshAgentMessage, ws])
 
   // F8: consume the deferred snapshot refresh on reveal.
   useEffect(() => {
     if (hidden) return
     if (!pendingRevealRefreshRef.current) return
     pendingRevealRefreshRef.current = false
-    scheduleSnapshotRefresh()
-  }, [hidden, scheduleSnapshotRefresh])
+    requestSnapshotRefresh('reveal')
+  }, [hidden, requestSnapshotRefresh])
 
   // reconcileNotice is a one-shot: visible for 5s, then consumed from the
   // pane content (a chat pane has no xterm write-notice channel; a timed
@@ -1492,7 +1489,7 @@ export function FreshAgentView({
           sessionRef,
         })
         migratePendingAutoTitle(current.sessionId, message.sessionId, message.provider)
-        setSnapshotRefreshNonce((value) => value + 1)
+        requestSnapshotRefresh('materialized')
         dispatch(updatePaneContent({
           tabId,
           paneId,
@@ -1539,15 +1536,13 @@ export function FreshAgentView({
         } else {
           recordPendingSendMetadata(message.requestId, { legacyAccepted: true })
         }
-        scheduleSnapshotRefresh({ followUpIfPending: true })
+        requestSnapshotRefresh('send-accepted')
       }
       if (
         isSnapshotInvalidatingFreshAgentEvent(message)
         && locatorMatchesPane(message, paneContentRef.current, freshOpenCodeRouteCwdRef.current)
       ) {
-        scheduleSnapshotRefresh({
-          followUpIfPending: readMessageEventType(message) === 'freshAgent.turn.complete',
-        })
+        requestSnapshotRefresh('event')
       }
       if (
         message.type === 'freshAgent.forked'
@@ -1588,7 +1583,7 @@ export function FreshAgentView({
       }
     })
     return unsubscribe
-  }, [agentSession?.cwd, clearReserveRedrive, commitSnapshot, dispatch, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, recordPendingSendMetadata, redriveAfterSessionReserved, releasePendingRebind, scheduleSnapshotRefresh, sendFreshAgentMessage, setLocalEcho, tabId, ws])
+  }, [agentSession?.cwd, clearReserveRedrive, commitSnapshot, dispatch, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, recordPendingSendMetadata, redriveAfterSessionReserved, releasePendingRebind, requestSnapshotRefresh, sendFreshAgentMessage, setLocalEcho, tabId, ws])
 
   useEffect(() => {
     if (!snapshotThreadId) return
@@ -1598,7 +1593,6 @@ export function FreshAgentView({
     // provider is lost -- fetching against a dead thread id is a guaranteed
     // 404 and triggerRecovery (below) is what should react to `.lost`.
     if ((paneContent.provider === 'claude' || paneContent.provider === 'codex') && agentSession?.lost) return
-    const controller = new AbortController()
     setLoadError(null)
     const sessionId = snapshotThreadId
     const provider = paneContent.provider
@@ -1610,154 +1604,187 @@ export function FreshAgentView({
       || paneContentRef.current.sessionType !== requestSessionType
       || snapshotThreadIdRef.current !== sessionId
     )
-    const requestCwd = paneContentRef.current.initialCwd
+    // A1: resolve the cwd ONCE (route cwd falls through initialCwd -> session
+    // cwd) and use the SAME value for both the scheduler key and the request,
+    // so sibling panes whose raw initialCwd diverges ('' vs '/w') still share
+    // one key -- keying on raw initialCwd would let the N-pane fan-out survive.
+    const requestCwd = freshOpenCodeRouteCwdRef.current ?? paneContentRef.current.initialCwd
     const requestAgentSessionStatusVersion = agentSessionStatusVersionRef.current
-    void getFreshAgentThreadSnapshot(requestSessionType, provider, sessionId, {
-      signal: controller.signal,
-      ...(requestCwd ? { cwd: requestCwd } : {}),
-    })
-      .then((next) => {
-        if (isStaleSnapshotRequest()) return
-        const snapshotIdentity = currentAutoTitleIdentityRef.current
-        const resolved = next as FreshAgentSnapshot
-        const resolvedHasUserTurns = freshAgentSnapshotHasUserTurn(resolved)
-        if (!resolvedHasUserTurns && !autoTitleSentRef.current) {
-          autoTitleFreshBoundaryRef.current = true
-        }
-        if (resolvedHasUserTurns) {
-          autoTitleFreshBoundaryRef.current = false
-          autoTitleSentRef.current = true
-        }
-        const previousSnapshot = snapshotRef.current
-        const displaySnapshot = mergeSnapshotForDisplay(previousSnapshot, resolved)
-        const snapshotAccepted = displaySnapshot !== previousSnapshot
-        commitSnapshot(displaySnapshot)
-        setSnapshotAutoTitleIdentity(snapshotIdentity)
-        const echo = localEchoRef.current
-        const echoPendingMetadata = echo ? pendingSendMetadataRef.current.get(echo.requestId) : undefined
-        const landedEcho = echo
-          ? localEchoLanded(displaySnapshot.turns, echo, echoPendingMetadata, {
-              allowTextMatch: snapshotAccepted,
-              previousTurns: previousSnapshot?.turns,
-            })
-          : false
-        const staleEcho = echo
-          ? snapshotAccepted && shouldClearStaleLocalEcho(displaySnapshot, echo, echoPendingMetadata)
-          : false
-        if (echo) {
-          if (landedEcho || staleEcho) setLocalEcho(null)
-        }
+    const applySnapshot = (next: FreshAgentSnapshot) => {
+      const snapshotIdentity = currentAutoTitleIdentityRef.current
+      const resolved = next as FreshAgentSnapshot
+      const resolvedHasUserTurns = freshAgentSnapshotHasUserTurn(resolved)
+      if (!resolvedHasUserTurns && !autoTitleSentRef.current) {
+        autoTitleFreshBoundaryRef.current = true
+      }
+      if (resolvedHasUserTurns) {
+        autoTitleFreshBoundaryRef.current = false
+        autoTitleSentRef.current = true
+      }
+      const previousSnapshot = snapshotRef.current
+      const displaySnapshot = mergeSnapshotForDisplay(previousSnapshot, resolved)
+      const snapshotAccepted = displaySnapshot !== previousSnapshot
+      commitSnapshot(displaySnapshot)
+      setSnapshotAutoTitleIdentity(snapshotIdentity)
+      const echo = localEchoRef.current
+      const echoPendingMetadata = echo ? pendingSendMetadataRef.current.get(echo.requestId) : undefined
+      const landedEcho = echo
+        ? localEchoLanded(displaySnapshot.turns, echo, echoPendingMetadata, {
+            allowTextMatch: snapshotAccepted,
+            previousTurns: previousSnapshot?.turns,
+          })
+        : false
+      const staleEcho = echo
+        ? snapshotAccepted && shouldClearStaleLocalEcho(displaySnapshot, echo, echoPendingMetadata)
+        : false
+      if (echo) {
+        if (landedEcho || staleEcho) setLocalEcho(null)
+      }
+      const fresh = paneContentRef.current
+      const nextStatus = (resolved.status as FreshAgentPaneContent['status']) ?? fresh.status
+      const snapshotSessionRef = provider === 'opencode' && resolved.sessionId && resolved.sessionId !== sessionId
+        ? { provider, sessionId: resolved.sessionId }
+        : undefined
+      const nextSessionId = snapshotSessionRef?.sessionId ?? fresh.sessionId
+      const nextSessionRef = snapshotSessionRef ?? fresh.sessionRef
+      const nextResumeSessionId = snapshotSessionRef?.sessionId ?? fresh.resumeSessionId ?? sessionId
+      if (snapshotSessionRef) {
+        migratePendingAutoTitle(fresh.sessionId, snapshotSessionRef.sessionId, provider)
+      }
+      const hasBlockingLocalEchoForSession = hasUnresolvedLocalEchoForSessionRef.current
+      const sessionStatus = nextStatus === 'create-failed' ? null : nextStatus
+      const snapshotIsBusy = sessionStatus === 'running' || sessionStatus === 'compacting'
+      const statusChangedSinceRequest = agentSessionStatusVersionRef.current !== requestAgentSessionStatusVersion
+      const currentSessionStatus = agentSessionStatusRef.current ?? fresh.status
+      const wouldRegressStatus = sessionStatus
+        ? isStatusRegression(currentSessionStatus, sessionStatus)
+        : false
+      if (
+        sessionStatus
+        && nextSessionId
+        && provider === 'codex'
+        && requestSessionType === 'freshcodex'
+        && !wouldRegressStatus
+        && (
+          snapshotIsBusy
+          || (!hasBlockingLocalEchoForSession && !statusChangedSinceRequest)
+        )
+      ) {
+        dispatch(setSessionStatus({
+          sessionId: nextSessionId,
+          sessionType: requestSessionType,
+          provider,
+          status: sessionStatus,
+        }))
+      }
+      if (
+        nextStatus === fresh.status
+        && nextSessionId === fresh.sessionId
+        && nextResumeSessionId === fresh.resumeSessionId
+        && nextSessionRef?.provider === fresh.sessionRef?.provider
+        && nextSessionRef?.sessionId === fresh.sessionRef?.sessionId
+      ) {
+        return
+      }
+      dispatch(updatePaneContent({
+        tabId,
+        paneId,
+        content: {
+          ...fresh,
+          sessionId: nextSessionId,
+          sessionRef: nextSessionRef,
+          status: nextStatus,
+          resumeSessionId: nextResumeSessionId,
+          pendingLocalEcho: landedEcho || staleEcho ? undefined : fresh.pendingLocalEcho,
+        },
+      }))
+    }
+    const handleSnapshotError = (error: unknown) => {
+      // AbortError swallow kept as harmless dead armor: scheduler-path
+      // fetches carry no signal (A2), so this can no longer fire.
+      if (error instanceof Error && error.name === 'AbortError') return
+      if (isStaleSnapshotRequest()) return
+      if (paneContent.provider === 'claude' && claudeSession && isRestoring) {
+        // While a restore is in flight the snapshot legitimately 404s.
+        // Outside of restore, swallowing here left dead Claude sessions as
+        // silent blank panes (live-test finding) — let the error surface.
+        setLoadError(null)
+        return
+      }
+      if (paneContent.provider === 'codex' && isUnmaterializedCodexThreadError(error)) {
         const fresh = paneContentRef.current
-        const nextStatus = (resolved.status as FreshAgentPaneContent['status']) ?? fresh.status
-        const snapshotSessionRef = provider === 'opencode' && resolved.sessionId && resolved.sessionId !== sessionId
-          ? { provider, sessionId: resolved.sessionId }
-          : undefined
-        const nextSessionId = snapshotSessionRef?.sessionId ?? fresh.sessionId
-        const nextSessionRef = snapshotSessionRef ?? fresh.sessionRef
-        const nextResumeSessionId = snapshotSessionRef?.sessionId ?? fresh.resumeSessionId ?? sessionId
-        if (snapshotSessionRef) {
-          migratePendingAutoTitle(fresh.sessionId, snapshotSessionRef.sessionId, provider)
-        }
-        const hasBlockingLocalEchoForSession = hasUnresolvedLocalEchoForSessionRef.current
-        const sessionStatus = nextStatus === 'create-failed' ? null : nextStatus
-        const snapshotIsBusy = sessionStatus === 'running' || sessionStatus === 'compacting'
-        const statusChangedSinceRequest = agentSessionStatusVersionRef.current !== requestAgentSessionStatusVersion
-        const currentSessionStatus = agentSessionStatusRef.current ?? fresh.status
-        const wouldRegressStatus = sessionStatus
-          ? isStatusRegression(currentSessionStatus, sessionStatus)
-          : false
-        if (
-          sessionStatus
-          && nextSessionId
-          && provider === 'codex'
-          && requestSessionType === 'freshcodex'
-          && !wouldRegressStatus
-          && (
-            snapshotIsBusy
-            || (!hasBlockingLocalEchoForSession && !statusChangedSinceRequest)
-          )
-        ) {
-          dispatch(setSessionStatus({
-            sessionId: nextSessionId,
-            sessionType: requestSessionType,
-            provider,
-            status: sessionStatus,
-          }))
-        }
-        if (
-          nextStatus === fresh.status
-          && nextSessionId === fresh.sessionId
-          && nextResumeSessionId === fresh.resumeSessionId
-          && nextSessionRef?.provider === fresh.sessionRef?.provider
-          && nextSessionRef?.sessionId === fresh.sessionRef?.sessionId
-        ) {
-          return
-        }
+        setLoadError(null)
+        commitSnapshot(null)
         dispatch(updatePaneContent({
           tabId,
           paneId,
           content: {
             ...fresh,
-            sessionId: nextSessionId,
-            sessionRef: nextSessionRef,
-            status: nextStatus,
-            resumeSessionId: nextResumeSessionId,
-            pendingLocalEcho: landedEcho || staleEcho ? undefined : fresh.pendingLocalEcho,
+            sessionId: undefined,
+            sessionRef: undefined,
+            createRequestId: nanoid(),
+            status: 'idle',
+            createError: undefined,
+            restoreError: buildRestoreError('durable_artifact_missing'),
           },
         }))
-      })
-      .catch((error: unknown) => {
-        if (error instanceof Error && error.name === 'AbortError') return
-        if (isStaleSnapshotRequest()) return
-        if (paneContent.provider === 'claude' && claudeSession && isRestoring) {
-          // While a restore is in flight the snapshot legitimately 404s.
-          // Outside of restore, swallowing here left dead Claude sessions as
-          // silent blank panes (live-test finding) — let the error surface.
-          setLoadError(null)
-          return
+        return
+      }
+      if (paneContent.provider === 'opencode' && isLostFreshOpencodeThreadError(error)) {
+        const fresh = paneContentRef.current
+        setLoadError(null)
+        commitSnapshot(null)
+        dispatch(updatePaneContent({
+          tabId,
+          paneId,
+          content: {
+            ...fresh,
+            sessionId: undefined,
+            sessionRef: undefined,
+            resumeSessionId: undefined,
+            createRequestId: nanoid(),
+            status: 'idle',
+            createError: undefined,
+            restoreError: buildRestoreError('durable_artifact_missing'),
+          },
+        }))
+        return
+      }
+      setLoadError(error instanceof Error ? error.message : 'Failed to load session')
+    }
+    const key = makeSnapshotKey({ sessionType: requestSessionType, provider, threadId: sessionId, cwd: requestCwd })
+    const trigger = snapshotRefreshTriggerRef.current
+    void getSnapshotScheduler().schedule(key, trigger, () =>
+      // NO signal: the run may execute on behalf of other panes sharing the
+      // key, or after this effect cleaned up (A2). Staleness is handled by
+      // isStaleSnapshotRequest() when the outcome is applied, not by aborting.
+      getFreshAgentThreadSnapshot(requestSessionType, provider, sessionId, {
+        ...(requestCwd ? { cwd: requestCwd } : {}),
+      }),
+    ).then((outcome) => {
+      if (isStaleSnapshotRequest()) return
+      if (outcome.status === 'ok') {
+        applySnapshot(outcome.value as FreshAgentSnapshot)
+        return
+      }
+      if (outcome.status === 'rate-limited' || outcome.status === 'backoff') {
+        // Keep the last good snapshot visible; no error banner. Re-arm one
+        // retry at expiry (dedupe: never arm a second timer alongside one
+        // already counting down).
+        setRateLimitedUntil(outcome.retryAtMs)
+        if (rateLimitRetryTimerRef.current === null) {
+          const delay = Math.max(0, outcome.retryAtMs - Date.now())
+          rateLimitRetryTimerRef.current = window.setTimeout(() => {
+            rateLimitRetryTimerRef.current = null
+            setRateLimitedUntil(null)
+            requestSnapshotRefresh('manual')
+          }, delay + 50)
         }
-        if (paneContent.provider === 'codex' && isUnmaterializedCodexThreadError(error)) {
-          const fresh = paneContentRef.current
-          setLoadError(null)
-          commitSnapshot(null)
-          dispatch(updatePaneContent({
-            tabId,
-            paneId,
-            content: {
-              ...fresh,
-              sessionId: undefined,
-              sessionRef: undefined,
-              createRequestId: nanoid(),
-              status: 'idle',
-              createError: undefined,
-              restoreError: buildRestoreError('durable_artifact_missing'),
-            },
-          }))
-          return
-        }
-        if (paneContent.provider === 'opencode' && isLostFreshOpencodeThreadError(error)) {
-          const fresh = paneContentRef.current
-          setLoadError(null)
-          commitSnapshot(null)
-          dispatch(updatePaneContent({
-            tabId,
-            paneId,
-            content: {
-              ...fresh,
-              sessionId: undefined,
-              sessionRef: undefined,
-              resumeSessionId: undefined,
-              createRequestId: nanoid(),
-              status: 'idle',
-              createError: undefined,
-              restoreError: buildRestoreError('durable_artifact_missing'),
-            },
-          }))
-          return
-        }
-        setLoadError(error instanceof Error ? error.message : 'Failed to load session')
-      })
-    return () => controller.abort()
+        return
+      }
+      if (outcome.status === 'coalesced') return
+      handleSnapshotError(outcome.error)
+    })
     // Depend only on what identifies *which* snapshot to load. This effect
     // dispatches updatePaneContent to persist its own resolved resumeSessionId/
     // status; listing the whole paneContent object (or those output fields) made
@@ -1776,6 +1803,7 @@ export function FreshAgentView({
     paneId,
     commitSnapshot,
     migratePendingAutoTitle,
+    requestSnapshotRefresh,
     setLocalEcho,
     snapshotThreadId,
     snapshotRefreshNonce,
@@ -1927,10 +1955,10 @@ export function FreshAgentView({
     if (hidden || !paneContent.sessionId) return
     if (!isBusy && !EARLY_STATES.has(effectiveStatus)) return
     const timer = window.setInterval(() => {
-      setSnapshotRefreshNonce((value) => value + 1)
+      requestSnapshotRefresh('poll')
     }, 3000)
     return () => window.clearInterval(timer)
-  }, [effectiveStatus, hidden, isBusy, paneContent.sessionId])
+  }, [effectiveStatus, hidden, isBusy, paneContent.sessionId, requestSnapshotRefresh])
 
   useEffect(() => {
     if (!notice) return

@@ -8,6 +8,7 @@ import freshAgentReducer from '@/store/freshAgentSlice'
 import tabsReducer from '@/store/tabsSlice'
 import { FreshAgentView } from '@/components/fresh-agent/FreshAgentView'
 import { getRebindQueue, resetRebindQueueForTests } from '@/lib/rebind-queue'
+import { resetSnapshotSchedulerForTests } from '@/lib/fresh-agent-snapshot-scheduler'
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
 
 // Claude snapshot hydration is keyed by Claude's durable UUID
@@ -145,6 +146,7 @@ describe('FreshAgentView hidden-pane rebind (F8)', () => {
   beforeEach(() => {
     vi.useFakeTimers()
     resetRebindQueueForTests()
+    resetSnapshotSchedulerForTests()
     wsMock.send.mockClear()
     wsMock.onReconnect.mockClear()
     wsMock.onMessage.mockClear()
@@ -224,13 +226,17 @@ describe('FreshAgentView hidden-pane rebind (F8)', () => {
     // the reconnect edge.
     const paneContent = { ...basePaneContent, sessionId: SESS_4, status: 'idle' as const }
     const { rerender } = renderView({ paneContent, hidden: true })
-    act(() => { vi.advanceTimersByTime(500) })
+    // Async timer advance: the snapshot scheduler is single-flight per key, so
+    // the mount identity fetch must fully settle (promise continuations AND
+    // debounce timers) or the reveal refresh would fold into a trailing run
+    // that a sync advance can never fire.
+    await act(async () => { await vi.advanceTimersByTimeAsync(500) })
     const callsBeforeReconnect = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
     fireReconnect()
-    act(() => { vi.advanceTimersByTime(500) })
+    await act(async () => { await vi.advanceTimersByTimeAsync(500) })
     expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBe(callsBeforeReconnect)
     rerenderView(rerender, { paneContent, hidden: false })
-    act(() => { vi.advanceTimersByTime(500) })
+    await act(async () => { await vi.advanceTimersByTimeAsync(500) })
     expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBeGreaterThan(callsBeforeReconnect)
   })
 })

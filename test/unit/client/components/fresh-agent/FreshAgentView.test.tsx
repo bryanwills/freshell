@@ -12,6 +12,8 @@ import { initLayout, requestPaneRefresh, setActivePane, updatePaneContent, updat
 import { useAppSelector } from '@/store/hooks'
 import { updateTab } from '@/store/tabsSlice'
 import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
+import { ApiError } from '@/lib/api'
+import { resetSnapshotSchedulerForTests } from '@/lib/fresh-agent-snapshot-scheduler'
 import type { PaneNode } from '@/store/paneTypes'
 
 const CLAUDE_THREAD_ID = '550e8400-e29b-41d4-a716-446655440000'
@@ -182,6 +184,7 @@ function freshopencodeSnapshot(text: string, revision: number) {
 }
 
 beforeEach(() => {
+  resetSnapshotSchedulerForTests()
   wsMock.send.mockReset()
   wsMock.onMessage.mockReset()
   wsMock.onReconnect.mockReset()
@@ -4155,7 +4158,7 @@ describe('FreshAgentView', () => {
     })
   })
 
-  it('performs a follow-up freshopencode refresh when final send acceptance lands during an earlier invalidation debounce', async () => {
+  it('coalesces a final send acceptance landing during an earlier invalidation debounce into one shared refresh', async () => {
     const store = createStore()
     let wsHandler: ((message: any) => void) | undefined
     wsMock.onMessage.mockImplementation((handler) => {
@@ -4170,23 +4173,6 @@ describe('FreshAgentView', () => {
         status: 'idle',
         capabilities: { send: true, interrupt: true, fork: true },
         turns: [],
-      })
-      .mockResolvedValueOnce({
-        sessionType: 'freshopencode',
-        provider: 'opencode',
-        threadId: 'ses_final_race',
-        revision: 2,
-        status: 'idle',
-        capabilities: { send: true, interrupt: true, fork: true },
-        turns: [
-          {
-            id: 'turn-final-user',
-            turnId: 'turn-final-user',
-            role: 'user',
-            summary: 'Race final prompt',
-            items: [{ id: 'item-final-user', kind: 'text', text: 'Race final prompt' }],
-          },
-        ],
       })
       .mockResolvedValueOnce({
         sessionType: 'freshopencode',
@@ -4269,7 +4255,9 @@ describe('FreshAgentView', () => {
     await waitFor(() => {
       expect(screen.getByText('Final answer after durable history catches up')).toBeInTheDocument()
     })
-    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(3)
+    // The invalidation debounce and the send acceptance coalesce into ONE
+    // shared scheduler run (initial fetch + one refresh), not a follow-up chain.
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
   })
 
   it('clears stale local echo after an idle recovered snapshot without the submitted turn', async () => {
@@ -5650,5 +5638,158 @@ describe('FreshAgentView transcript font size', () => {
       await waitFor(() => expect(document.activeElement).toBe(root))
       expect(focusSpy).not.toHaveBeenCalled()
     })
+  })
+})
+
+describe('snapshot scheduler integration (zrrj)', () => {
+  const SCHED_SESSION_ID = 'ses_late_change'
+
+  function schedulerPaneContent(createRequestId: string) {
+    return {
+      kind: 'fresh-agent',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      createRequestId,
+      sessionId: SCHED_SESSION_ID,
+      sessionRef: { provider: 'opencode', sessionId: SCHED_SESSION_ID },
+      resumeSessionId: SCHED_SESSION_ID,
+      status: 'idle',
+    } as const
+  }
+
+  /**
+   * Capture EVERY ws.onMessage subscription and broadcast to all of them,
+   * like the real ws client does. Last-handler capture (the older pattern)
+   * only reaches one pane, which would hide the N-pane fan-out this task
+   * collapses.
+   */
+  function captureWsBroadcast() {
+    const handlers: Array<(message: unknown) => void> = []
+    wsMock.onMessage.mockImplementation((handler) => {
+      handlers.push(handler)
+      return () => {}
+    })
+    return (message: unknown) => {
+      act(() => {
+        for (const handler of [...handlers]) handler(message)
+      })
+    }
+  }
+
+  function sessionChanged() {
+    return {
+      type: 'freshAgent.event',
+      sessionId: SCHED_SESSION_ID,
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      event: {
+        type: 'freshAgent.session.changed',
+        sessionId: SCHED_SESSION_ID,
+        reason: 'opencode-message',
+      },
+    }
+  }
+
+  /** Real-timer sleep wrapped in act so late state updates never warn. */
+  const flushMs = (ms: number) => act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, ms))
+  })
+
+  it('coalesces a burst of freshopencode session.changed events across sibling panes into one snapshot GET', async () => {
+    const store = createStore()
+    const broadcast = captureWsBroadcast()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(freshopencodeSnapshot('done', 10))
+
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: schedulerPaneContent('req-sched-a') }))
+    store.dispatch(initLayout({ tabId: 'tab-2', paneId: 'pane-2', content: schedulerPaneContent('req-sched-b') }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        <StoreBackedFreshAgentView tabId="tab-2" paneId="pane-2" />
+      </Provider>,
+    )
+    // Let the identity fetches (immediate + trailing coalesce for the sibling)
+    // fully settle before measuring the burst.
+    await waitFor(() => expect(screen.getAllByText('done').length).toBeGreaterThan(0))
+    await flushMs(400)
+    apiMock.getFreshAgentThreadSnapshot.mockClear()
+
+    for (let i = 0; i < 10; i += 1) {
+      broadcast(sessionChanged())
+    }
+
+    // Exactly one trailing GET shared by both panes, not one per event/pane.
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+    await flushMs(400)
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps the last good snapshot visible and stops fetching during 429 backoff', async () => {
+    const store = createStore()
+    const broadcast = captureWsBroadcast()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce(freshopencodeSnapshot('hello world', 10))
+
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: schedulerPaneContent('req-sched-429') }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await screen.findByText('hello world')
+    apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new ApiError(429, 'Too many requests', undefined, 60_000))
+
+    broadcast(sessionChanged())
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
+    await flushMs(50)
+    // Last good transcript stays visible; no load-error banner.
+    expect(screen.getByText('hello world')).toBeInTheDocument()
+    expect(screen.queryByText(/Too many requests/)).not.toBeInTheDocument()
+
+    // Further invalidations during backoff are suppressed without network.
+    broadcast(sessionChanged())
+    await flushMs(400)
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+    expect(screen.getByText('hello world')).toBeInTheDocument()
+  })
+
+  it('does not refetch when another session sends (send.accepted for a foreign request)', async () => {
+    const store = createStore()
+    const broadcast = captureWsBroadcast()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(freshopencodeSnapshot('done', 10))
+
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: schedulerPaneContent('req-sched-foreign') }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+    apiMock.getFreshAgentThreadSnapshot.mockClear()
+
+    broadcast({
+      type: 'freshAgent.send.accepted',
+      requestId: 'someone-elses-request',
+      sessionId: SCHED_SESSION_ID,
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+    })
+    await flushMs(400)
+    expect(apiMock.getFreshAgentThreadSnapshot).not.toHaveBeenCalled()
+  })
+
+  it('scheduler-path fetches carry no abort signal (shared runs must survive one pane unmounting)', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(freshopencodeSnapshot('done', 10))
+
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: schedulerPaneContent('req-sched-signal') }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+    // 4th positional arg is the query/options bag ({ revision?, cwd?, signal? }).
+    const options = apiMock.getFreshAgentThreadSnapshot.mock.calls[0][3]
+    expect(options?.signal).toBeUndefined()
   })
 })

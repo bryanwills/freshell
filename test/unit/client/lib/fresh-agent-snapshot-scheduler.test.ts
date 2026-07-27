@@ -121,4 +121,15 @@ describe('FreshAgentSnapshotScheduler', () => {
     expect(out).toEqual({ status: 'error', error: boom })
     expect(scheduler.getBackoffUntil(KEY)).toBeNull()
   })
+
+  it('reset cancels pending debounced runs so a stale run cannot fire into the next test', async () => {
+    const scheduler = getSnapshotScheduler()
+    const run = vi.fn(async () => 'snap')
+    const pending = scheduler.schedule(KEY, 'event', run) // debounced 250ms
+    resetSnapshotSchedulerForTests()
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(run).not.toHaveBeenCalled()
+    // The caller's promise must still settle, never hang.
+    await expect(pending).resolves.toEqual({ status: 'coalesced' })
+  })
 })
