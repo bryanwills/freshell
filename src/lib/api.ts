@@ -41,12 +41,14 @@ import {
 export class ApiError extends Error {
   readonly status: number
   readonly details?: unknown
+  readonly retryAfterMs?: number
 
-  constructor(status: number, message: string, details?: unknown) {
+  constructor(status: number, message: string, details?: unknown, retryAfterMs?: number) {
     super(message)
     this.name = 'ApiError'
     this.status = status
     this.details = details
+    this.retryAfterMs = retryAfterMs
   }
 
   // `Error.prototype.message` is non-enumerable, so a bare `JSON.stringify` of an
@@ -120,6 +122,16 @@ export function isApiUnauthorizedError(error: unknown): error is ApiError {
 // Vite dev proxy) couldn't service the request right now. During a restart these
 // are expected and transient — unlike a 500 (app bug) or 4xx (client error).
 const TRANSIENT_HTTP_STATUSES = new Set([502, 503, 504])
+
+/** Parse a Retry-After header (delta-seconds or HTTP-date) into milliseconds. */
+export function parseRetryAfterMs(value: string | null | undefined, nowMs = Date.now()): number | undefined {
+  if (!value) return undefined
+  const trimmed = value.trim()
+  if (/^\d+$/.test(trimmed)) return Number(trimmed) * 1000
+  const dateMs = Date.parse(trimmed)
+  if (!Number.isFinite(dateMs)) return undefined
+  return Math.max(0, dateMs - nowMs)
+}
 
 function isAbortError(error: unknown): boolean {
   if (typeof DOMException !== 'undefined' && error instanceof DOMException) {
@@ -247,7 +259,10 @@ async function request<T = any>(path: string, options: RequestInit = {}): Promis
   }
 
   if (!res.ok) {
-    throw new ApiError(res.status, getApiErrorMessage(data, res.statusText), data)
+    const retryAfterMs = res.status === 429
+      ? parseRetryAfterMs(typeof res.headers?.get === 'function' ? res.headers.get('retry-after') : undefined)
+      : undefined
+    throw new ApiError(res.status, getApiErrorMessage(data, res.statusText), data, retryAfterMs)
   }
 
   return data as T
