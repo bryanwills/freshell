@@ -256,7 +256,57 @@ describe('TabItem', () => {
       />
     )
 
-    expect(screen.getByText('+1').getAttribute('class')).toContain('text-blue-500')
+    expect(screen.getByText('+4').getAttribute('class')).toContain('text-blue-500')
+  })
+
+  it('caps pane icons at 3 and shows a muted +N badge for the rest', () => {
+    const paneContents: PaneContent[] = Array.from({ length: 5 }, (_, index) => ({
+      kind: 'terminal',
+      mode: 'shell',
+      shell: 'system',
+      status: 'running',
+      createRequestId: `req-${index + 1}`,
+      terminalId: `term-${index + 1}`,
+    }))
+
+    render(<TabItem {...defaultProps} paneEntries={createPaneEntries(paneContents)} />)
+
+    expect(screen.getAllByTestId('pane-icon')).toHaveLength(3)
+    const badge = screen.getByText('+2')
+    expect(badge.getAttribute('class')).toContain('text-muted-foreground')
+    expect(badge.getAttribute('class')).not.toContain('text-blue-500')
+  })
+
+  it('shows 3 icons plus +1 at 4 panes (cap boundary)', () => {
+    const paneContents: PaneContent[] = Array.from({ length: 4 }, (_, index) => ({
+      kind: 'terminal',
+      mode: 'shell',
+      shell: 'system',
+      status: 'running',
+      createRequestId: `req-${index + 1}`,
+      terminalId: `term-${index + 1}`,
+    }))
+
+    render(<TabItem {...defaultProps} paneEntries={createPaneEntries(paneContents)} />)
+
+    expect(screen.getAllByTestId('pane-icon')).toHaveLength(3)
+    expect(screen.getByText('+1')).toBeInTheDocument()
+  })
+
+  it('shows no overflow badge at exactly 3 panes', () => {
+    const paneContents: PaneContent[] = Array.from({ length: 3 }, (_, index) => ({
+      kind: 'terminal',
+      mode: 'shell',
+      shell: 'system',
+      status: 'running',
+      createRequestId: `req-${index + 1}`,
+      terminalId: `term-${index + 1}`,
+    }))
+
+    render(<TabItem {...defaultProps} paneEntries={createPaneEntries(paneContents)} />)
+
+    expect(screen.getAllByTestId('pane-icon')).toHaveLength(3)
+    expect(screen.queryByText(/^\+\d+$/)).toBeNull()
   })
 
   it('calls onClick when clicked', () => {

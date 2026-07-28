@@ -24,7 +24,8 @@ function StatusDot({ status, busy }: { status: TerminalStatus; busy?: boolean })
   return <Circle className={cn('h-2 w-2', busy ? 'fill-blue-500 text-blue-500' : getTerminalStatusDotClassName(status))} />
 }
 
-const MAX_TAB_ICONS = 6
+/** Max pane-type icons shown per tab; panes beyond this fold into the '+N' badge. */
+const MAX_PANE_ICONS = 3
 
 export interface TabItemProps {
   tab: Tab
@@ -82,10 +83,10 @@ export default function TabItem({
       return <StatusDot status={tab.status} busy={busy} />
     }
 
-    const visible = paneEntries.slice(0, MAX_TAB_ICONS)
-    const overflow = paneEntries.length - MAX_TAB_ICONS
+    const visible = paneEntries.slice(0, MAX_PANE_ICONS)
+    const overflow = paneEntries.length - MAX_PANE_ICONS
     const hiddenBusyPane = paneEntries
-      .slice(MAX_TAB_ICONS)
+      .slice(MAX_PANE_ICONS)
       .some((entry) => busyPaneIds.includes(entry.paneId))
 
     // Group visible entries by repo identity (first-appearance order) so each

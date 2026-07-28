@@ -1389,7 +1389,7 @@ describe('TabBar', () => {
       expect(screen.queryByTestId('pane-icon')).toBeNull()
     })
 
-    it('caps at 6 icons and shows overflow indicator', () => {
+    it('caps at 3 icons and shows overflow indicator', () => {
       const tab = createTab({ id: 'tab-1', title: 'Many Panes' })
 
       // Build a deeply nested layout with 7 panes
@@ -1438,12 +1438,12 @@ describe('TabBar', () => {
 
       renderWithStore(<TabBar />, store)
 
-      // Should show 6 icons + overflow indicator
+      // Should show 3 icons + overflow indicator
       const icons = screen.getAllByTestId('pane-icon')
-      expect(icons).toHaveLength(6)
+      expect(icons).toHaveLength(3)
 
-      // Overflow indicator shows +1
-      expect(screen.getByText('+1')).toBeInTheDocument()
+      // Overflow indicator shows +4
+      expect(screen.getByText('+4')).toBeInTheDocument()
     })
 
     it('renders single icon for tab with single pane (no layout)', () => {
