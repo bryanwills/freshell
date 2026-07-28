@@ -2,7 +2,7 @@ import type { Middleware } from '@reduxjs/toolkit'
 import { getWsClient } from '@/lib/ws-client'
 import { collectAllTerminalIds } from '@/lib/pane-utils'
 import { consumeTerminalReleaseMark } from '@/lib/terminal-release-marks'
-import { clearDeadTerminals, clearTerminalLiveHandles } from './panesSlice'
+import { applyReconcileAttach, clearDeadTerminals, clearTerminalLiveHandles } from './panesSlice'
 import type { PaneNode } from './paneTypes'
 
 type PanesStateSlice = { panes: { layouts: Record<string, PaneNode | undefined> } }
@@ -25,6 +25,13 @@ type PanesStateSlice = { panes: { layouts: Record<string, PaneNode | undefined> 
 const skipDetachActionTypes = new Set<string>([
   clearDeadTerminals.type,
   clearTerminalLiveHandles.type,
+  // Two dispatch sites, both safe to skip:
+  // 1. Lane D1 crash fold (TerminalView terminal.replaced handler): the old
+  //    terminal already exited server-side — never detach-storm it.
+  // 2. Reconnect reconcile (pane-reconcile.ts:428): runs on a fresh
+  //    connection BEFORE any attach, so no live subscription exists for the
+  //    terminalId being swapped out.
+  applyReconcileAttach.type,
 ])
 
 /**

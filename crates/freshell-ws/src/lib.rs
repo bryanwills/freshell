@@ -22,6 +22,7 @@
 
 pub mod activity;
 pub mod amplifier_association;
+pub mod auto_resume;
 pub mod backpressure;
 pub mod codex_association;
 pub(crate) mod codex_identity;
@@ -97,6 +98,11 @@ pub struct WsState {
     /// Carries `ui.command` / `freshAgent.session.materialized` / `sessions.changed`
     /// during a fresh-agent turn, which the oracle's capture socket records.
     pub broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
+    /// Lane D1: natural-exit crash events for the auto-resume hub. The
+    /// receiver half is consumed by `auto_resume::spawn_auto_resume_hub`
+    /// (Task 5); until then tests drain it directly (construction sites
+    /// without a consumer drop the receiver — sends are best-effort).
+    pub auto_resume_tx: tokio::sync::mpsc::UnboundedSender<crate::auto_resume::CrashEvent>,
     /// The freshcodex WS fresh-agent slice: the post-handshake loop dispatches
     /// `freshAgent.create` / `freshAgent.send` (codex) here, which spawns the codex
     /// app-server sidecar and broadcasts `freshAgent.created` / `freshAgent.send.accepted`
@@ -774,6 +780,7 @@ mod tests {
             boot_id: Arc::new("boot-2222".to_string()),
             settings: Arc::new(test_settings()),
             broadcast_tx: Arc::clone(&broadcast_tx),
+            auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
             fresh_codex: freshell_freshagent::FreshCodexState::new(
                 Arc::clone(&auth_token),
                 Arc::clone(&broadcast_tx),

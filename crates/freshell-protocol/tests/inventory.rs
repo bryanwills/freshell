@@ -48,12 +48,12 @@ fn server_types_match_inventory_exactly() {
     let inv = inventory();
     assert_eq!(
         inv["serverToClient"]["count"].as_u64(),
-        Some(56),
-        "inventory declares 56 server→client types"
+        Some(57),
+        "inventory declares 57 server→client types"
     );
     let expected = json_type_set(&inv["serverToClient"]["types"]);
     let actual: BTreeSet<String> = SERVER_MESSAGE_TYPES.iter().map(|s| s.to_string()).collect();
-    assert_eq!(actual.len(), 56, "crate declares 56 server types (no dups)");
+    assert_eq!(actual.len(), 57, "crate declares 57 server types (no dups)");
     assert_eq!(
         actual, expected,
         "SERVER_MESSAGE_TYPES must equal the frozen inventory (no missing/extra)"
@@ -61,14 +61,27 @@ fn server_types_match_inventory_exactly() {
 }
 
 #[test]
-fn combined_surface_is_85() {
+fn combined_surface_is_86() {
     let all = all_message_types();
-    assert_eq!(all.len(), 85, "29 client + 56 server = 85 discriminants");
+    assert_eq!(all.len(), 86, "29 client + 57 server = 86 discriminants");
     // sorted + unique
     let unique: BTreeSet<&str> = all.iter().copied().collect();
     assert_eq!(
         unique.len(),
-        85,
+        86,
         "no discriminant collides across directions"
     );
+}
+
+#[test]
+fn terminal_replaced_roundtrips_camel_case() {
+    let json = r#"{"type":"terminal.replaced","oldTerminalId":"t-old","newTerminalId":"t-new","exitCode":1,"attempt":1,"maxAttempts":2}"#;
+    let msg: freshell_protocol::ServerMessage = serde_json::from_str(json).expect("parse");
+    let back = serde_json::to_string(&msg).expect("serialize");
+    let v: serde_json::Value = serde_json::from_str(&back).unwrap();
+    assert_eq!(v["type"], "terminal.replaced");
+    assert_eq!(v["oldTerminalId"], "t-old");
+    assert_eq!(v["newTerminalId"], "t-new");
+    assert_eq!(v["exitCode"], 1);
+    assert_eq!(v["maxAttempts"], 2);
 }

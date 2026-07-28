@@ -549,7 +549,13 @@ async fn main() -> ExitCode {
     fresh_opencode_state.set_identity_sink(fresh_agent_identity_sink.clone());
     // opencode REST surface (Task 7's materialization site; V10 A13-N1)
     fresh_agent_state.set_identity_sink(fresh_agent_identity_sink.clone());
+    // Lane D1: the crash-event channel for terminal auto-resume. The receiver
+    // is consumed by `auto_resume::spawn_auto_resume_hub`, spawned right
+    // after `ws_state` is assembled (the hub needs the full state).
+    let (auto_resume_tx, auto_resume_rx) =
+        tokio::sync::mpsc::unbounded_channel::<freshell_ws::auto_resume::CrashEvent>();
     let ws_state = WsState {
+        auto_resume_tx,
         activity: Some(activity_hub.clone()),
         identity: terminal_identity.clone(),
         amplifier_locator: amplifier_locator.clone(),
@@ -626,6 +632,15 @@ async fn main() -> ExitCode {
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         pane_ledger: std::sync::Arc::clone(&pane_ledger),
     };
+
+    // Lane D1 (Task 5): the auto-resume hub — consumes the crash events the
+    // PTY exit hook sends and drives bounded respawns. A boot-time background
+    // task, same precedent as `spawn_idle_monitor` above. The handle is
+    // deliberately discarded: the hub SELF-SUPERVISES (council 7w4h/xkhx,
+    // crusty) — a driver panic is caught inside the task, logged ERROR, and
+    // the loop restarted with bounded escalating backoff, so the task only
+    // ever ends when the crash-event channel closes at shutdown.
+    freshell_ws::auto_resume::spawn_auto_resume_hub(ws_state.clone(), auto_resume_rx);
 
     // P1.8 boot hygiene: quarantine, stale-marker sweep, supersession
     // repair, GC. Tombstone deletion keys on the DIRECT stat

@@ -3,7 +3,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `npm run contract:generate`. Each entry is a JSON Schema for one server→client message shape, keyed by its `type` discriminant and synthesized from the ServerMessage union via the TypeScript type checker. Opaque values (unknown / index signatures / any) are intentionally permissive — see nondeterministic-fields.md. The wire contract is frozen for the Rust port.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-  "messageCount": 56,
+  "messageCount": 57,
   "messages": {
     "amplifier.activity.list.response": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2926,6 +2926,40 @@
       ],
       "type": "object"
     },
+    "terminal.replaced": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "attempt": {
+          "type": "number"
+        },
+        "exitCode": {
+          "type": "number"
+        },
+        "maxAttempts": {
+          "type": "number"
+        },
+        "newTerminalId": {
+          "type": "string"
+        },
+        "oldTerminalId": {
+          "type": "string"
+        },
+        "type": {
+          "const": "terminal.replaced",
+          "type": "string"
+        }
+      },
+      "required": [
+        "attempt",
+        "exitCode",
+        "maxAttempts",
+        "newTerminalId",
+        "oldTerminalId",
+        "type"
+      ],
+      "type": "object"
+    },
     "terminal.session.associated": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -2966,6 +3000,12 @@
       "additionalProperties": false,
       "properties": {
         "attempt": {
+          "type": "number"
+        },
+        "exitCode": {
+          "type": "number"
+        },
+        "maxAttempts": {
           "type": "number"
         },
         "reason": {

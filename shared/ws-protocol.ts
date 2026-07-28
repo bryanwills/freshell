@@ -775,6 +775,23 @@ export type TerminalStatusMessage = {
   status: 'running' | 'recovering'
   reason?: string
   attempt?: number
+  /** Auto-resume 'recovering' frames only: the bounded retry budget. The
+   * client renders attempt/maxAttempts from these FIELDS — `reason` prose is
+   * purely presentational and must never be parsed (council 7w4h/xkhx). */
+  maxAttempts?: number
+  /** Auto-resume 'recovering' frames only: the crashed generation's exit code. */
+  exitCode?: number
+}
+
+/** Lane D1: server-initiated crash auto-resume replaced a pane's terminal.
+ * The client folds newTerminalId into the pane that owns oldTerminalId. */
+export type TerminalReplacedMessage = {
+  type: 'terminal.replaced'
+  oldTerminalId: string
+  newTerminalId: string
+  exitCode: number
+  attempt: number
+  maxAttempts: number
 }
 
 export type TerminalOutputMessage = {
@@ -1084,6 +1101,7 @@ export type ServerMessage =
   | TerminalDetachedMessage
   | TerminalExitMessage
   | TerminalStatusMessage
+  | TerminalReplacedMessage
   | TerminalOutputMessage
   | TerminalOutputBatchMessage
   | TerminalOutputGapMessage

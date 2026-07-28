@@ -197,6 +197,7 @@ mod tests {
                 .unwrap(),
             ),
             broadcast_tx: StdArc::clone(&broadcast_tx),
+            auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
             fresh_codex: freshell_freshagent::FreshCodexState::new(
                 StdArc::clone(&auth_token),
                 StdArc::clone(&broadcast_tx),

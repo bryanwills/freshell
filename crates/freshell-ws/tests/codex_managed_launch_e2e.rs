@@ -124,6 +124,7 @@ async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
         boot_id: Arc::new("boot-e2e".to_string()),
         settings,
         broadcast_tx: Arc::clone(&broadcast_tx),
+        auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
         fresh_codex: freshell_freshagent::FreshCodexState::new(
             Arc::clone(&auth_token),
             Arc::clone(&broadcast_tx),

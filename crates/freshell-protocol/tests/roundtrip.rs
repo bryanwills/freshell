@@ -257,6 +257,19 @@ fn rich_server_messages() {
         ServerMessage::TerminalTurnComplete(t) => assert_eq!(t.provider, AgentProvider::Opencode),
         other => panic!("expected TerminalTurnComplete, got {other:?}"),
     }
+
+    // terminal.status — auto-resume `recovering` with the typed retry-budget
+    // fields (council 7w4h/xkhx: attempt/maxAttempts/exitCode are FIELDS, the
+    // reason prose is purely presentational and never parsed by the client).
+    let wire = r#"{"type":"terminal.status","status":"recovering","terminalId":"t1","attempt":1,"maxAttempts":2,"exitCode":137,"reason":"claude crashed (exit 137) — auto-resuming, attempt 1/2"}"#;
+    match server_roundtrip(wire, "terminal.status") {
+        ServerMessage::TerminalStatus(s) => {
+            assert_eq!(s.attempt, Some(1));
+            assert_eq!(s.max_attempts, Some(2));
+            assert_eq!(s.exit_code, Some(137));
+        }
+        other => panic!("expected TerminalStatus, got {other:?}"),
+    }
 }
 
 #[test]

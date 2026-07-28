@@ -13,10 +13,12 @@ import { shallowEqual } from 'react-redux'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { updateTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import {
+  applyReconcileAttach,
   clearPaneReconcileNotice,
   clearReconcilePendingPane,
   consumePaneRefreshRequest,
   repairCodexIdentityMismatch,
+  resetPaneForReconcileCreate,
   splitPane,
   updatePaneContent,
   updatePaneTitle,
@@ -28,6 +30,17 @@ import { recordPaneTabActivity } from '@/store/tabRecencySlice'
 import { updateSettingsLocal } from '@/store/settingsSlice'
 import { clearPaneRuntimeActivity } from '@/store/paneRuntimeActivitySlice'
 import { recordTurnComplete } from '@/store/turnCompletionSlice'
+import {
+  AUTO_RESUME_NOTICE_TTL_MS,
+  clearTerminalLifecycle,
+  foldTerminalReplacement,
+  recordAutoResumeRecovering,
+  recordTerminalExit,
+  selectActiveNotice,
+  selectExitRecord,
+  selectLastTerminalIdFrom,
+} from '@/store/terminalLifecycleSlice'
+import { TerminalExitBanner } from '@/components/TerminalExitBanner'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { focusNextTerminalSearchMatch, focusPreviousTerminalSearchMatch, loadTerminalSearch } from '@/store/terminalDirectoryThunks'
 import { isFatalConnectionErrorCode } from '@/store/connectionSlice'
@@ -553,6 +566,23 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const verdictWaitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const connectionErrorCode = useAppSelector((s) => s.connection.lastErrorCode)
   const settings = useAppSelector((s) => s.settings.settings)
+  // Crash/auto-resume presentation state (Lane D1). Keyed by paneId, NOT
+  // terminalId — the exit handler clears paneContent.terminalId, so an exited
+  // pane has no terminal id to key by.
+  const exitRecord = useAppSelector((s) => selectExitRecord(s, paneId))
+  const activeNotice = useAppSelector((s) => selectActiveNotice(s, paneId, Date.now()))
+  // Deterministic notice→alert degradation: a 'recovering' notice orphaned by
+  // a SILENT auto-resume settle (respawn_failed / session_lease_held /
+  // session_owned_live / pane_closed — none emits a frame) would otherwise
+  // only flip to the error bar "whenever something else re-renders". Schedule
+  // exactly one re-render at TTL expiry so selectActiveNotice re-evaluates.
+  const [, setNoticeExpiryTick] = useState(0)
+  useEffect(() => {
+    if (!activeNotice) return
+    const delay = Math.max(0, activeNotice.at + AUTO_RESUME_NOTICE_TTL_MS - Date.now() + 1)
+    const timer = window.setTimeout(() => setNoticeExpiryTick((n) => n + 1), delay)
+    return () => window.clearTimeout(timer)
+  }, [activeNotice])
 
   // All hooks MUST be called before any conditional returns
   const ws = useMemo(() => getWsClient(), [])
@@ -4084,21 +4114,91 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           }
         }
 
-        if (msg.type === 'terminal.status' && msg.terminalId === tid) {
+        if (msg.type === 'terminal.status') {
+          // Auto-resume 'recovering' frames carry the OLD terminalId, and the
+          // crash has usually already cleared tid by the time they arrive —
+          // match against the recorded lastTerminalId from the lifecycle slice.
+          const statusMine = msg.terminalId === tid
+            || msg.terminalId === selectLastTerminalIdFrom(appStore.getState().terminalLifecycle, paneIdRef.current)
+          // Attempt/max/exit come from the frame's typed FIELDS — never parsed
+          // out of the reason prose, which is purely presentational (council
+          // 7w4h/xkhx: rewording UI copy must not change client behavior).
           if (
-            msg.status === 'running'
-            || msg.status === 'recovering'
+            statusMine
+            && msg.status === 'recovering'
+            && typeof msg.attempt === 'number'
+            && typeof msg.maxAttempts === 'number'
+            && typeof msg.exitCode === 'number'
           ) {
-            updateContent({ status: msg.status })
-            const statusTab = tabRef.current
-            if (statusTab) {
-              dispatch(updateTab({ id: statusTab.id, updates: { status: msg.status } }))
+            dispatch(recordAutoResumeRecovering({
+              paneId: paneIdRef.current,
+              attempt: msg.attempt,
+              maxAttempts: msg.maxAttempts,
+              exitCode: msg.exitCode,
+              at: Date.now(),
+            }))
+          }
+          if (msg.terminalId === tid) {
+            if (
+              msg.status === 'running'
+              || msg.status === 'recovering'
+            ) {
+              updateContent({ status: msg.status })
+              const statusTab = tabRef.current
+              if (statusTab) {
+                dispatch(updateTab({ id: statusTab.id, updates: { status: msg.status } }))
+              }
             }
           }
           return
         }
 
+        if (msg.type === 'terminal.replaced') {
+          // Server-driven crash auto-resume: this pane handles the frame when
+          // the old id matches its recorded lastTerminalId (tid was cleared by
+          // the preceding terminal.exit) or, defensively, a still-set live tid.
+          const replacedMine = msg.oldTerminalId === terminalIdRef.current
+            || msg.oldTerminalId === selectLastTerminalIdFrom(appStore.getState().terminalLifecycle, paneIdRef.current)
+          if (replacedMine) {
+            dispatch(foldTerminalReplacement({
+              paneId: paneIdRef.current,
+              newTerminalId: msg.newTerminalId,
+              exitCode: msg.exitCode,
+              attempt: msg.attempt,
+              maxAttempts: msg.maxAttempts,
+              at: Date.now(),
+            }))
+            // Fold the new terminalId into this pane via the ONE reducer built
+            // for server-supplied rebinds (mirrors pane-reconcile.ts:428-436).
+            // applyReconcileAttach unconditionally overwrites serverInstanceId
+            // (panesSlice.ts:1904), so supply the current one. The replaced
+            // frame carries no verdict data, so sessionRef/corrected/duplicate
+            // stay unset — the reducer preserves the pane's sessionRef.
+            // Bind-before-attach holds: the reducer's epoch bump re-fires the
+            // create-or-attach effect after this rebind.
+            dispatch(applyReconcileAttach({
+              tabId,
+              paneId: paneIdRef.current,
+              terminalId: msg.newTerminalId,
+              serverInstanceId: serverInstanceIdRef.current,
+            }))
+          }
+          return
+        }
+
         if (msg.type === 'terminal.exit' && msg.terminalId === tid) {
+          // Record on EVERY exit path (including the early-return branches
+          // below): this is the only moment both paneId and the dying
+          // terminalId are simultaneously known — the tail clears
+          // terminalIdRef/terminalId, and subsequent auto-resume frames
+          // (terminal.status 'recovering' / terminal.replaced) carry the old
+          // id and can only be matched via the recorded lastTerminalId.
+          dispatch(recordTerminalExit({
+            paneId: paneIdRef.current,
+            terminalId: msg.terminalId,
+            exitCode: msg.exitCode,
+            at: Date.now(),
+          }))
           const pendingReplacement = pendingDurableReplacementRef.current
           if (pendingReplacement?.terminalId === tid) {
             completeDurableReplacement(pendingReplacement)
@@ -4835,6 +4935,26 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     ? 'Offline: input will queue until reconnected.'
     : (showInlineRecoveringStatus ? 'Recovering terminal output...' : null)
 
+  // Loud exited-pane presentation for coding-agent panes (Lane D1). Shells
+  // keep today's quiet presentation. Rules:
+  // - active auto-resume notice (recovering/resumed) → status strip
+  // - settled 'exited' with a non-zero exit record → alert + Relaunch
+  // - settled 'exited' with NO record (post-reload — the ephemeral slice is
+  //   empty) → codeless alert + Relaunch
+  // - settled 'error' WITH a recorded non-zero exit: a crash BEFORE
+  //   terminal.attach.ready settles via failLaunch as 'error', not 'exited' —
+  //   the dominant timing for a fast-crashing CLI. Same user situation
+  //   (agent process died), same alert. Plain launch failures (create
+  //   rejected — no exit record) keep today's presentation.
+  const isAgentPane = Boolean(terminalContent.mode && terminalContent.mode !== 'shell')
+  const showExitBanner = Boolean(
+    isAgentPane && (
+      activeNotice ||
+      (terminalContent.status === 'exited' && (exitRecord ? exitRecord.exitCode !== 0 : true)) ||
+      (terminalContent.status === 'error' && exitRecord && exitRecord.exitCode !== 0)
+    )
+  )
+
   return (
     <div
       ref={wrapperRef}
@@ -4913,6 +5033,30 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           >
             Load more history
           </button>
+        </div>
+      )}
+      {showExitBanner && (
+        <div className="absolute inset-x-0 bottom-0 z-20">
+          <TerminalExitBanner
+            mode={terminalContent.mode ?? 'agent'}
+            exitCode={exitRecord?.exitCode ?? null}
+            notice={activeNotice ?? null}
+            onRelaunch={() => {
+              // Discard the OLD crash's lifecycle entry: if the relaunch
+              // create is rejected (pane settles 'error' with no new
+              // terminal.exit), a stale exit record would resurrect the
+              // previous "process exited (code N)" banner for what is
+              // actually a launch failure. A genuine crash-during-relaunch
+              // repopulates via recordTerminalExit.
+              dispatch(clearTerminalLifecycle({ paneId }))
+              dispatch(resetPaneForReconcileCreate({
+                tabId,
+                paneId,
+                intent: 'respawn',
+                sessionRef: terminalContent.sessionRef,
+              }))
+            }}
+          />
         </div>
       )}
       <ConnectionErrorOverlay />

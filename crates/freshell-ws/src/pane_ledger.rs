@@ -287,6 +287,14 @@ impl PaneLedger {
         Self::new(None)
     }
 
+    /// Whether this ledger actually stores anything (`root: Some`). The
+    /// auto-resume guard needs the distinction: with the ledger DISABLED,
+    /// `bound_session_ref_for_terminal` answering `None` means nothing —
+    /// only an ENABLED ledger's `None` is evidence the binding was retired.
+    pub fn is_enabled(&self) -> bool {
+        self.root.is_some()
+    }
+
     fn bindings_dir(root: &Path) -> PathBuf {
         root.join("bindings")
     }

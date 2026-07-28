@@ -252,6 +252,7 @@ async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
         boot_id: Arc::new("boot-test".to_string()),
         settings,
         broadcast_tx: Arc::clone(&broadcast_tx),
+        auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
         fresh_codex,
         fresh_claude,
         fresh_opencode,

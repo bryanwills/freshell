@@ -144,6 +144,8 @@ const RUST_ONLY_SPECS = [
   /freshagent-settings-resume-rust\.spec\.ts$/,
   // imports RustServer directly; restart()/ledger semantics are rust-only (P1.14)
   /sidebar-registry-sync-rust\.spec\.ts$/,
+  // Lane D1: agent crash auto-resume — rust-server-only spec.
+  /agent-crash-autoresume-rust\.spec\.ts$/,
   // Kata enn3: REST spawn-gate burst; owns its RustServer.
   // See docs/plans/2026-07-27-rest-spawn-gate.md
   /rest-spawn-gate-rust\.spec\.ts$/,
@@ -324,6 +326,8 @@ export default defineConfig({
         // P1.14 (Lane C1): sidebar/tab-registry sync pinning suite -- imports
         // RustServer directly; restart()/ledger semantics are rust-only.
         /sidebar-registry-sync-rust\.spec\.ts$/,
+        // Lane D1: agent crash auto-resume — rust-server-only spec.
+        /agent-crash-autoresume-rust\.spec\.ts$/,
         // Kata enn3: REST spawn-gate burst; owns its RustServer.
         // See docs/plans/2026-07-27-rest-spawn-gate.md
         /rest-spawn-gate-rust\.spec\.ts$/,
