@@ -380,9 +380,24 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
       // create-firing code a settle window BEFORE snapshotting sent
       // messages, so this "never fires" assertion can't pass merely because
       // we checked too early for a delayed create to have gone out yet.
+      // FORWARD-LOOKING HAZARD (follow-up from the PR #562 council review):
+      // this settle window is a fixed 1s. If freshell-ws auto-resume
+      // supervision ever extends to fresh-agent drivers (today it only
+      // covers terminal panes), a respawn create arriving with a backoff
+      // longer than 1s would land AFTER this snapshot and be invisible to
+      // the assertion below -- silently defeating this hazard guard. Any PR
+      // extending auto-resume supervision to fresh-agent drivers must widen
+      // this window (or poll) accordingly.
       await page.waitForTimeout(1_000)
+      // Re-fetch the leaf AFTER the settle window: the `leaf` captured above
+      // (before the settle) only proves the initial dead_session
+      // adjudication fired -- it is a stale snapshot with respect to any
+      // create that might land during the settle window, so asserting on it
+      // here would not actually prove "never silent" (follow-up from the PR
+      // #562 council review).
+      const leafAfterSettle = findFreshAgentLeaf(await harness.getPaneLayout(tabIdAfter!))
       // NEVER silent: identity not swapped, no create fired for this pane.
-      expect(leaf?.content?.sessionRef?.sessionId).toBe(DURABLE_CLI_SESSION_ID)
+      expect(leafAfterSettle?.content?.sessionRef?.sessionId).toBe(DURABLE_CLI_SESSION_ID)
       const sent = await harness.getSentWsMessages()
       expect(sent.filter((m: any) => m?.type === 'freshAgent.create')).toEqual([])
     } finally {

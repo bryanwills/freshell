@@ -1275,7 +1275,19 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       // Any freshAgent.create fired across the restart+reload window must
       // carry the ORIGINAL durable id -- never a bare (resume-less) create,
       // which the fixture would otherwise re-stamp with the same static
-      // default and mask a lost identity.
+      // default and mask a lost identity. Non-vacuity checked (follow-up
+      // from the PR #562 council review): unlike
+      // specs/freshclaude-identity-persistence-rust.spec.ts's test 1, which
+      // RELOADS BEFORE the SIGKILL restart and observes exactly one RESPAWN
+      // freshAgent.create, THIS leg's ordering -- SIGKILL restart THEN
+      // reload -- resolves via freshAgent.attach alone; verified empirically
+      // (message list: hello, terminal.attach x3, ..., freshAgent.attach --
+      // zero freshAgent.create). So no non-vacuity assertion is added here:
+      // one would assert a create that never happens on this ordering and
+      // permanently red this leg. The for-loop below stays as the safety
+      // net against any future regression that starts firing a bare
+      // (identity-losing) create on this path, without falsely claiming a
+      // create is expected today.
       const sentAfterRestartReload = await harness.getSentWsMessages()
       const restartCreates = sentAfterRestartReload.filter((m: any) => m?.type === 'freshAgent.create') as any[]
       for (const create of restartCreates) {
