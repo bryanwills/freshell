@@ -569,7 +569,8 @@
             "RATE_LIMITED",
             "UNAUTHORIZED",
             "PROTOCOL_MISMATCH",
-            "SESSION_RESERVED"
+            "SESSION_RESERVED",
+            "FRESH_AGENT_LOST_SESSION"
           ],
           "type": "string"
         },
