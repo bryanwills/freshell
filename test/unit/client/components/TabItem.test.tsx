@@ -447,6 +447,12 @@ describe('TabItem', () => {
       '/repo/b': { repoKey: '/repo/b', repoName: 'b' },
     }
 
+    const manyRepoIcons = {
+      ...repoIcons,
+      '/repo/c': { repoKey: '/repo/c', repoName: 'c' },
+      '/repo/d': { repoKey: '/repo/d', repoName: 'd' },
+    }
+
     const entries = (cwds: Array<string | undefined>) =>
       cwds.map((repoCwd, i) => ({
         paneId: `pane-${i}`,
@@ -502,6 +508,56 @@ describe('TabItem', () => {
       )
       expect(screen.queryByTestId('repo-icon')).toBeNull()
       expect(screen.getAllByTestId('pane-icon')).toHaveLength(2)
+    })
+
+    it('shows at most 3 repo icons when a tab spans more than 3 distinct repos', () => {
+      render(
+        <TabItem
+          {...defaultProps}
+          paneEntries={entries(['/repo/a', '/repo/b', '/repo/c', '/repo/d'])}
+          repoIcons={manyRepoIcons}
+        />,
+      )
+      const repoIconsRendered = screen.getAllByTestId('repo-icon')
+      expect(repoIconsRendered).toHaveLength(3)
+      // Deterministic: the first 3 distinct repos in pane order.
+      expect(repoIconsRendered.map((el) => el.getAttribute('data-repo-key'))).toEqual([
+        '/repo/a',
+        '/repo/b',
+        '/repo/c',
+      ])
+      expect(screen.getAllByTestId('pane-icon')).toHaveLength(3)
+      // Repo truncation is silent: the only badge is the pane-overflow +1.
+      expect(screen.getAllByText(/^\+\d+$/)).toHaveLength(1)
+      expect(screen.getByText('+1')).toBeInTheDocument()
+    })
+
+    it('does not render repo icons for repos whose panes are all hidden beyond the pane cap', () => {
+      render(
+        <TabItem
+          {...defaultProps}
+          paneEntries={entries(['/repo/a', '/repo/a', '/repo/a', '/repo/b'])}
+          repoIcons={manyRepoIcons}
+        />,
+      )
+      const repoIconsRendered = screen.getAllByTestId('repo-icon')
+      expect(repoIconsRendered).toHaveLength(1)
+      expect(repoIconsRendered[0].getAttribute('data-repo-key')).toBe('/repo/a')
+      expect(screen.getAllByTestId('pane-icon')).toHaveLength(3)
+      expect(screen.getByText('+1')).toBeInTheDocument()
+    })
+
+    it('shows all 3 repo icons with no badge when exactly 3 panes span 3 repos', () => {
+      render(
+        <TabItem
+          {...defaultProps}
+          paneEntries={entries(['/repo/a', '/repo/b', '/repo/c'])}
+          repoIcons={manyRepoIcons}
+        />,
+      )
+      expect(screen.getAllByTestId('repo-icon')).toHaveLength(3)
+      expect(screen.getAllByTestId('pane-icon')).toHaveLength(3)
+      expect(screen.queryByText(/^\+\d+$/)).toBeNull()
     })
   })
 })
