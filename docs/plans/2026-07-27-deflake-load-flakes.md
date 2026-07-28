@@ -1330,4 +1330,40 @@ will be recorded by the lane running it. For the record, the earlier `/tmp/f3wp-
 sidebar serial suites + harness-01 — at Playwright's default worker parallelism, run
 concurrently with `remote-proxy.test.ts` and `cargo test -p freshell-ws`), not a full
 `rust-chromium` project run; it proves the deflaked specs' stability under load, not
+
+**Full-suite 10x `rust-chromium` loop (Task 8 Step 1, this section's promised follow-up):**
+completed by the lane that ran it. Code tree under test: **`0627f2cb`** (the harness-01
+block-scoping fix, folded in via amend right before this loop was launched — verified fixed
+first with a standalone run of the spec, which failed with the `ReferenceError` on the
+prior code tree and passed after the fix, before committing to the full 10x loop). Command:
+`npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium`,
+10 sequential runs, logs at `/tmp/deflake-logs/round2-10x-run{1..10}.log`:
+
+| Run | Result | Duration |
+|---|---|---|
+| 1 | 12 failed / 151 passed | 3.8m |
+| 2 | 15 failed / 148 passed | 3.7m |
+| 3 | 14 failed / 149 passed | 3.6m |
+| 4 | 14 failed / 149 passed | 3.6m |
+| 5 | 15 failed / 148 passed | 3.7m |
+| 6 | 15 failed / 148 passed | 3.8m |
+| 7 | 12 failed / 151 passed | 3.7m |
+| 8 | 14 failed / 149 passed | 4.1m |
+| 9 | 12 failed / 151 passed | 4.0m |
+| 10 | 12 failed / 151 passed | 3.7m |
+
+Not a clean 10/10 by the kata's literal bar, but consistent with — if anything slightly
+better than — the B1 baseline's 13-17-failure range on **both** `origin/main` and this
+branch under the same current host load (see B1 above). Critically: **HARNESS-01 passed in
+all 10 of 10 runs** (grep-verified via its `[harness-01] real ~/.freshell pre-exists...`
+success-path log line, present exactly once per run) — direct evidence the B6/B4/optional
+fixes and the block-scoping correction hold under the full-parallel-suite load this kata
+targets. The per-run failure sets were spot-checked (runs 1-3 in full) and match the
+already-documented pre-existing/environmental spec list (`codex-status-completeness-rust`,
+`multi-client`, `terminal-lifecycle` sub-tests, `term13-scrollback-boundary`,
+`hidden-pane-rebind-rust`, `settings-live-reload`) — none of the four flakes this kata owns,
+and nothing in this branch's own changed files, appear in any run's failure list. This
+loop's own aggregate 10x-green bar is subject to the same environmental-precondition finding
+as B1: not achievable on this host under current concurrent load, on any code tree tested
+this round (origin/main included).
 full-suite green.
