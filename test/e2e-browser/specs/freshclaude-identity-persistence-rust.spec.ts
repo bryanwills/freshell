@@ -190,12 +190,17 @@ async function createFreshclaudePane(page: Page, harness: TestHarness, cwd: stri
   await expect(page.locator('[data-context="fresh-agent"]').last()).toBeVisible({
     timeout: 15_000,
   })
-  // NOTE: once the canonical-UUID cliSessionId lands, the client fetches the
-  // thread snapshot and the Rust router has NO claude adapter -> 503
-  // FRESH_AGENT_RUNTIME_UNAVAILABLE (crates/freshell-freshagent/src/
-  // snapshot.rs:133-146), which can surface a history-load-error banner on a
-  // perfectly healthy fresh pane. Assert pane state via the harness (Redux),
-  // tolerate the banner -- never assert error-free UI chrome for freshclaude.
+  // NOTE (corrected, council fix round -- the Rust router HAS shipped a
+  // claude snapshot adapter since this comment was written: crates/
+  // freshell-freshagent/src/snapshot.rs:133-146 routes freshclaude/kilroy +
+  // claude through get_claude_snapshot(), a disk+env adapter over the CLI's
+  // own transcript store; FRESH_AGENT_RUNTIME_UNAVAILABLE now only fires for
+  // session types with NO adapter registered at all). A transient
+  // history-load-error banner may still appear on a freshly-created pane
+  // (snapshot fetch racing pane creation), so this suite still asserts pane
+  // state via the harness (Redux) rather than error-free UI chrome for
+  // freshclaude -- but the reason is a fetch-timing race, not a missing
+  // adapter.
 }
 
 test.describe('Freshclaude identity persistence (P0.2)', () => {
@@ -206,7 +211,7 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-identity-freshclaude-'))
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
-    const { server, harness } = await bootWall(page, {
+    const { server, info, harness } = await bootWall(page, {
       // EXACT leg-G options (wall :1174-1177):
       env: { FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE },
       setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
@@ -228,11 +233,33 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
       await sendFreshAgentTurn(page, harness, tabId!, 'first turn before reload')
       await expect(page.locator('[data-context="fresh-agent"]').last()).toContainText('Fixture claude turn', { timeout: 30_000 })
 
-      // THE FOLD (shipped behavior: FreshAgentView.tsx:1798-1830 merge
-      // effect): pane content carries the durable ref.
+      // THE FOLD (shipped behavior: FreshAgentView.tsx's durable-identity
+      // merge effect -- cited at plan-time base 7508149b as :1798-1830; on
+      // current main the same mergePaneContent effect sits around
+      // :1976-2015, line numbers having drifted as unrelated work landed
+      // around it. See the plan doc's status banner.): pane content carries
+      // the durable ref. Captured (not
+      // hardcoded) so the round-trip checks below assert against what this
+      // RUN actually minted -- same discipline as freshclaude-restart-parity
+      // -rust.spec.ts's `originalDurable` capture (:236-243).
       await expect
         .poll(async () => durableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabId!))), { timeout: 15_000 })
         .toBe(DURABLE_CLI_SESSION_ID)
+      const originalDurable: string = durableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabId!)))
+
+      // Council fix round (B2): clearSentWsMessages() moved to BEFORE the
+      // reload (not just before the SIGKILL restart). The fixture mints the
+      // SAME static id for every resume-less create, so a regressed
+      // persistMiddleware that silently drops sessionRef would make the
+      // reload fire a bare (no-resumeSessionId) freshAgent.create that gets
+      // re-stamped with this identical id -- the durableIdentity poll above
+      // would stay green even though a NEW session was actually minted
+      // (colliding onto the SAME transcript file). Auditing the FULL
+      // reload+restart window (not just the post-reload slice) is what makes
+      // that regression visible below: any bare create in this window fails
+      // the resumeSessionId assertion instead of being silently discarded by
+      // an audit window that opened too late.
+      await harness.clearSentWsMessages()
 
       // RELOAD FIRST (browser-persisted identity alone, no server help).
       await flushPersistence(page)
@@ -240,29 +267,54 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
       const tabIdAfterReload = await harness.getActiveTabId()
       await expect
         .poll(async () => durableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabIdAfterReload!))), { timeout: 30_000 })
-        .toBe(DURABLE_CLI_SESSION_ID)
+        .toBe(originalDurable)
 
       // THEN the SIGKILL restart.
-      await harness.clearSentWsMessages()
       await server.restartAbrupt()
       await waitForWsReady(page)
 
       // Identity held; conversation continues end-to-end.
       await expect
         .poll(async () => durableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabIdAfterReload!))), { timeout: 30_000 })
-        .toBe(DURABLE_CLI_SESSION_ID)
+        .toBe(originalDurable)
       await sendFreshAgentTurn(page, harness, tabIdAfterReload!, 'second turn after restart')
       await expect(page.locator('[data-context="fresh-agent"]').last()).toContainText('Fixture claude turn', { timeout: 30_000 })
       await expect(page.locator('[data-context="fresh-agent"]').last()).toContainText('first turn before reload', { timeout: 30_000 })
 
-      // Every create sent after the reload targeted the ORIGINAL session --
-      // no identity-losing re-create.
+      // Every create sent across the reload+restart window targeted the
+      // ORIGINAL session -- no identity-losing re-create. A create IS
+      // expected here: the post-SIGKILL reconcile verdict re-drives exactly
+      // one RESPAWN freshAgent.create carrying resumeSessionId (verified
+      // empirically for this exact flow: terminal.detach -> terminal.create
+      // -> freshAgent.create -> freshAgent.attach). Asserting the count is
+      // non-zero proves this audit is exercising a real code path, not
+      // vacuously passing over an empty array.
       const sent = await harness.getSentWsMessages()
-      for (const create of sent.filter((m: any) => m?.type === 'freshAgent.create') as any[]) {
-        expect(create.resumeSessionId ?? create.sessionRef?.sessionId, JSON.stringify(create)).toBe(DURABLE_CLI_SESSION_ID)
+      const creates = sent.filter((m: any) => m?.type === 'freshAgent.create') as any[]
+      expect(creates.length, JSON.stringify(sent.map((m: any) => m?.type))).toBeGreaterThan(0)
+      for (const create of creates) {
+        expect(create.resumeSessionId ?? create.sessionRef?.sessionId, JSON.stringify(create)).toBe(originalDurable)
       }
       const finalLeaf = findFreshAgentLeaf(await harness.getPaneLayout(tabIdAfterReload!))
       expect(finalLeaf?.content?.status).not.toBe('error')
+
+      // Positive turn-2 proof from disk (not pre-SIGKILL DOM): the fake
+      // sidecar's transcript file is the ground truth for what the fixture
+      // actually received post-restart. Both turns' user text must be
+      // present as SEPARATE lines and there must be two assistant replies --
+      // this cannot be satisfied by leftover pre-restart DOM state.
+      const transcriptFile = path.join(info.homeDir, '.claude', 'projects', '-fixture', `${originalDurable}.jsonl`)
+      const transcriptLines = (await fs.readFile(transcriptFile, 'utf-8'))
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => JSON.parse(line))
+      const assistantTurnCount = transcriptLines.filter((l: any) => l.type === 'assistant').length
+      expect(assistantTurnCount, JSON.stringify(transcriptLines)).toBeGreaterThanOrEqual(2)
+      const userTexts = transcriptLines
+        .filter((l: any) => l.type === 'user')
+        .map((l: any) => l.message?.content?.[0]?.text)
+      expect(userTexts).toEqual(expect.arrayContaining(['first turn before reload', 'second turn after restart']))
     } finally {
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })
@@ -320,6 +372,15 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
         .toBe(true)
       const leaf = findFreshAgentLeaf(await harness.getPaneLayout(tabIdAfter!))
       expect(leaf?.content?.restoreError?.reason).toBe('durable_artifact_missing')
+      // Batched dead-session adjudication is a real modal dialog
+      // (DeadSessionPanel.tsx:20-24, role="dialog" aria-label="Dead sessions"),
+      // not just Redux state -- assert it's actually presented to the user.
+      await expect(page.getByRole('dialog', { name: 'Dead sessions' })).toBeVisible({ timeout: 10_000 })
+      // Hazard-guard hardening (council fix round): give any async
+      // create-firing code a settle window BEFORE snapshotting sent
+      // messages, so this "never fires" assertion can't pass merely because
+      // we checked too early for a delayed create to have gone out yet.
+      await page.waitForTimeout(1_000)
       // NEVER silent: identity not swapped, no create fired for this pane.
       expect(leaf?.content?.sessionRef?.sessionId).toBe(DURABLE_CLI_SESSION_ID)
       const sent = await harness.getSentWsMessages()

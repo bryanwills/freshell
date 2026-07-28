@@ -324,15 +324,12 @@ export default defineConfig({
         // P1.14 (Lane C1): sidebar/tab-registry sync pinning suite -- imports
         // RustServer directly; restart()/ledger semantics are rust-only.
         /sidebar-registry-sync-rust\.spec\.ts$/,
-<<<<<<< HEAD
         // Kata enn3: REST spawn-gate burst; owns its RustServer.
         // See docs/plans/2026-07-27-rest-spawn-gate.md
         /rest-spawn-gate-rust\.spec\.ts$/,
-=======
         // P0.2 lane D4: freshclaude durable identity across reload + SIGKILL +
         // stale-sessionRef dead_session guard. Imports RustServer for restartAbrupt().
         /freshclaude-identity-persistence-rust\.spec\.ts$/,
->>>>>>> d47f841e (test(e2e): pin freshclaude identity persistence across reload+SIGKILL; stale sessionRef dies loud (P0.2 lane D4))
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL

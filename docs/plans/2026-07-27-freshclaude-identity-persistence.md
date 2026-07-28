@@ -1,5 +1,20 @@
 # Freshclaude Durable Identity Persistence — Verification, Hazard Guard, and P0.2 Wall Pin Flip Implementation Plan
 
+> **STATUS BANNER (council fix round, 2026-07-28):** This plan's original
+> premise was FALSIFIED before implementation began — see the "Re-grounding
+> addendum" near the bottom of this doc. The durable `sessionRef` fold and
+> its persist round-trip were **already shipped** on `origin/main`; there was
+> no missing mechanism to build. The branch pivoted from "build durable
+> identity persistence" to "prove the shipped mechanism end-to-end, pin it
+> with tests, and fix the wall's reader bug that made pin P0.2 look red for
+> the wrong reason." **No production code changed on this branch** — every
+> file:line reference below describes pre-existing behavior. File:line
+> citations throughout this doc are pinned to base commit `7508149b` (the
+> branch's rebase point at plan-writing time); on current `main` the same
+> merge effect this plan describes lives at `FreshAgentView.tsx:1983-2015`
+> (line numbers drift as unrelated work lands around it — the mechanism
+> itself is unchanged).
+
 > **For agentic workers:** This plan is executed task-by-task by the
 > workflow's execute stage: a fresh implementer per task, with a spec +
 > quality review after each task. Steps use checkbox (`- [ ]`) syntax
@@ -95,7 +110,7 @@ If any of these bites during this lane's verification (Task 3/4 STOP-gates), rep
 - Consumes: nothing.
 - Produces: a worktree rebased on current `origin/main`, a recorded green baseline, and confirmation the P0.2 pin still exists (all later tasks assume this).
 
-- [ ] **Step 1: Rebase the branch onto current origin/main**
+- [x] **Step 1: Rebase the branch onto current origin/main**
 
 ```bash
 cd /home/dan/code/freshell/.worktrees/freshclaude-identity-persistence
@@ -106,7 +121,7 @@ git log --oneline -5
 
 Expected: clean rebase — the branch carries only this plan document's commits (docs-only), which cannot conflict with source changes on main. If the rebase surprises you with conflicts, STOP and report.
 
-- [ ] **Step 2: Ensure node deps work in this worktree**
+- [x] **Step 2: Ensure node deps work in this worktree**
 
 ```bash
 node --version && npm --version
@@ -115,7 +130,7 @@ ls node_modules/.bin/vitest >/dev/null 2>&1 || npm ci
 
 If a later `npm test` complains about tsx: `ln -s ../node_modules/tsx node_modules/tsx`.
 
-- [ ] **Step 3: Verify the P0.2 pin is still present (STOP-gate)**
+- [x] **Step 3: Verify the P0.2 pin is still present (STOP-gate)**
 
 ```bash
 grep -n "test.fail(" test/e2e-browser/specs/restore-contract-wall-rust.spec.ts
@@ -124,7 +139,7 @@ grep -n "narrowed 2026-07-26 by reconcile-completion" test/e2e-browser/specs/res
 
 Expected: a `test.fail(` inside the `freshclaude: SIGKILL restore rebinds` test (~line 1165) whose reason string contains "narrowed 2026-07-26 by reconcile-completion". Record the full pin inventory (all `test.fail(` lines) in your notes — Task 4 compares against it. **If the freshclaude pin is gone or its reason changed materially, STOP and report** (another lane may have closed or reshaped P0.2).
 
-- [ ] **Step 4: Baseline unit suite green (coordinator-gated)**
+- [x] **Step 4: Baseline unit suite green (coordinator-gated)**
 
 ```bash
 npm run test:status
@@ -133,7 +148,7 @@ FRESHELL_TEST_SUMMARY="lane D4 baseline" env -u FRESHELL_BIND_HOST npm test
 
 Expected: PASS. If the coordinator gate is held by a sibling lane, WAIT (poll `npm run test:status`); never kill a foreign holder. If baseline is red, STOP and report — do not build on a red base.
 
-- [ ] **Step 5: Baseline the pinned wall leg (records today's red)**
+- [x] **Step 5: Baseline the pinned wall leg (records today's red)**
 
 ```bash
 npm run test:e2e -- --project=rust-chromium specs/restore-contract-wall-rust.spec.ts -g 'freshclaude: SIGKILL restore rebinds'
@@ -141,7 +156,7 @@ npm run test:e2e -- --project=rust-chromium specs/restore-contract-wall-rust.spe
 
 Expected: 1 **expected-failure** (Playwright reports the `test.fail()`-annotated test as passing-the-suite because it failed as expected). Save the output — this is the red half of the red→green proof for the wall leg. (First e2e invocation also builds client+server via global-setup; allow ~10 min.)
 
-- [ ] **Step 6: Baseline the FULL wall (Task 4's attribution baseline)**
+- [x] **Step 6: Baseline the FULL wall (Task 4's attribution baseline)**
 
 ```bash
 npm run test:e2e -- --project=rust-chromium specs/restore-contract-wall-rust.spec.ts
@@ -162,7 +177,7 @@ No commit for this task.
 - Consumes: the persist/reload seams this file already exercises (`loadInitialPanesState` / persisted-layout round-trip helpers — the test at `:46` "persist+restore across refresh" and `:333` "does not persist refreshRequestsByPane" are the structural donors).
 - Produces: a pinned invariant later reviewers rely on: *durable `sessionRef` identity survives the persist round-trip; the live placeholder and `resumeSessionId` do not.*
 
-- [ ] **Step 1: Write the test**
+- [x] **Step 1: Write the test**
 
 Following the round-trip harness of the `:46` test (build store state → trigger flush → re-load via the same seam that test uses):
 
@@ -183,7 +198,7 @@ it('round-trips a freshclaude durable identity: sessionRef survives, live placeh
 })
 ```
 
-- [ ] **Step 2: Run it**
+- [x] **Step 2: Run it**
 
 ```bash
 npm run test:vitest -- run test/unit/client/store/panesPersistence.test.ts
@@ -191,7 +206,7 @@ npm run test:vitest -- run test/unit/client/store/panesPersistence.test.ts
 
 Expected: PASS — and that is the point. **Honest status:** this pins PRE-EXISTING behavior (`stripTransientSessionFields` keeps sanitized `sessionRef`, strips `sessionId` + `resumeSessionId` — `persistMiddleware.ts:245-268`); it is a *contract pin*, not a red-first driver. The lane's red→green driver is the wall leg G (red baselined in Task 1 Step 5; green in Task 4). If this test FAILS, `sanitizeSessionRef` or `normalizeFreshAgentContent` rejects the ref — STOP and investigate before proceeding (the canonical UUID above must pass `rejectNonCanonicalClaudeSessionRef`).
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add test/unit/client/store/panesPersistence.test.ts
@@ -210,7 +225,7 @@ git commit -m "test(client): pin freshclaude durable sessionRef persist round-tr
 - Consumes: `RustServer` (`test/e2e-browser/helpers/rust-server.ts:272` — `.start()`, `.restartAbrupt()` `:344`, `.stop()`, `info.homeDir`); `TestHarness` (`helpers/test-harness.ts` — `getState()`, `getPaneLayout(tabId)`, `getActiveTabId()`, `getSentWsMessages()`, `clearSentWsMessages()`); spec-local helper bodies COPIED (per this suite's per-spec-ownership convention, wall spec file doc `:47-51`) from `restore-contract-wall-rust.spec.ts`: `selectShellIfPickerShowing` (`:95` \u2014 the boot-picker settle guard every donor creation path runs before `createFreshclaudePane`; leg G `:1179`, leg M `:2017`), `seedWallConfig` (`:131`), `bootWall` (`:156`), `flushPersistence` (`:118`), `reloadAndReconnect` (`:124`), `waitForWsReady` (`:108`), `findFreshAgentLeaf` (`:233`), `createFreshclaudePane` (`:436` — **returns `Promise<void>`; it does NOT return a tab id**), `sendFreshAgentTurn` (`:371`); IMPORTED (not copied): `openPanePicker` from `helpers/pane-picker.ts` (the copied `createFreshclaudePane` body calls it -- wall imports it at `:29`) and `fileURLToPath` from `node:url` (feeds the copied `FAKE_CLAUDE_SIDECAR_SOURCE` constant, wall `:34,:39`); `Page` type comes from `@playwright/test` (fixtures.ts exports only `test`/`expect`); plus the fake-sidecar env plumbing the wall's leg G uses (fixture `test/e2e-browser/fixtures/fake-claude-sidecar.mjs`; env keys `FRESHELL_CLAUDE_SIDECAR`, `FAKE_CLAUDE_SIDECAR_LOG`; durable UUID constant `44444444-4444-4444-8444-444444444444`; assistant reply text `'Fixture claude turn'`).
 - Produces: the e2e evidence Task 5 reports; the stale-identity guard that pins the archaeology safety argument.
 
-- [ ] **Step 1: Write the spec**
+- [x] **Step 1: Write the spec**
 
 Create `test/e2e-browser/specs/freshclaude-identity-persistence-rust.spec.ts`. Skeleton (copy the named helpers verbatim from the wall spec at the cited lines; keep this spec self-contained per convention):
 
@@ -424,11 +439,11 @@ Implementation notes for the copier:
 - **History must be asserted via RENDERED pane content** (the `toContainText` polls), never via the create-response `session.snapshot` event — the fixture's resume snapshot is empty by design; rehydration flows through the server snapshot adapter reading the transcript (`snapshot.rs:134` → `locate_transcript`).
 - **Test 2 create/adjudication interplay (validated 2026-07-27, corrected by fresh-eyes review):** the fixture resurrects the transcript on ANY create-with-resume (`fake-claude-sidecar.mjs:95`), after which reconcile sees the session Present and `dead_session` is unreachable — so the test's structure guarantees no create fires before the verdict: the ws-client holds boot-reconcile-claimed creates until the verdict folds (`ws-client.ts:263-284, 687-698`, ~4s bound `ws-client.ts:79`), and a `dead_session` fold sets `restoreError`, which blocks the pane's auto-create. **If the adjudication poll times out, FIRST inspect `getSentWsMessages()` for a pre-adjudication `freshAgent.create`:** if one exists, the sequencing let a create escape the hold (verdict arrived after the ~4s bound) and the run is structurally invalid for this guard — fix the test's timing (e.g. reduce work between reload and the poll; do not add waits before the reload) rather than relaxing ANY assertion. If NO create was sent and the verdict was `fresh` instead of `dead_session`, that is the silent-data-loss hazard itself — STOP and investigate; do not weaken the assertion. There is no fallback that keeps the `dead_session` poll while tolerating a create-with-resume: those two outcomes are mutually exclusive by fixture construction.
 
-- [ ] **Step 2: Register the spec**
+- [x] **Step 2: Register the spec**
 
 In `test/e2e-browser/playwright.config.ts`: add `/freshclaude-identity-persistence-rust\.spec\.ts$/` to the `RUST_ONLY_SPECS` array (~`:89`) AND to the `rust-chromium` project's `testMatch` array (~`:265`). Both are required (wall report convention: rust-only specs are testIgnored by the match-all project and testMatched by rust-chromium).
 
-- [ ] **Step 3: Run the new spec**
+- [x] **Step 3: Run the new spec**
 
 ```bash
 npm run test:e2e -- --project=rust-chromium specs/freshclaude-identity-persistence-rust.spec.ts
@@ -439,7 +454,7 @@ Expected: 2 PASSED. **Honest status: both tests pin SHIPPED behavior and are exp
 - If test 1 fails on the post-reload identity poll, `sessionRef` did not round-trip — re-check against Task 2's unit pin, then **STOP and report.**
 - If test 2 fails, follow the create/adjudication interplay note above; a `fresh` verdict is the silent-data-loss hazard — **STOP and investigate.**
 
-- [ ] **Step 4: Flake check (this suite's convention for new e2e)**
+- [x] **Step 4: Flake check (this suite's convention for new e2e)**
 
 ```bash
 npm run test:e2e -- --project=rust-chromium specs/freshclaude-identity-persistence-rust.spec.ts --repeat-each=2
@@ -447,7 +462,7 @@ npm run test:e2e -- --project=rust-chromium specs/freshclaude-identity-persisten
 
 Expected: all green twice.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add test/e2e-browser/specs/freshclaude-identity-persistence-rust.spec.ts test/e2e-browser/playwright.config.ts
@@ -465,7 +480,7 @@ git commit -m "test(e2e): pin freshclaude identity persistence across reload+SIG
 - Consumes: the pin inventory + full-wall baseline recorded in Task 1; the coverage pins from Tasks 2-3.
 - Produces: wall leg G green as a normal expectation; full-wall run evidence for Task 5's report.
 
-- [ ] **Step 1: Make `leafDurableIdentity` sessionRef-first**
+- [x] **Step 1: Make `leafDurableIdentity` sessionRef-first**
 
 At `restore-contract-wall-rust.spec.ts:245-251`, read the CURRENT body first, then reorder so `sessionRef` (the contract's durable identity) wins over the live handle — **only hoist `sessionRef?.sessionId` to the front; preserve the existing fallback arms verbatim, in their current relative order, and keep the function's existing return type exactly as-is** (do not add or remove terminal fallback arms):
 
@@ -479,7 +494,7 @@ const leafDurableIdentity = (leaf: any) =>
   leaf?.content?.sessionRef?.sessionId ?? /* ...the pre-existing arms, unchanged... */
 ```
 
-- [ ] **Step 2: Flip the pin**
+- [x] **Step 2: Flip the pin**
 
 (Order matters: the flip is only valid AFTER Step 1's reader reorder — the pin's 2026-07-26 "server must expose the durable id as the primary handle" theory presumed today's sessionId-first reader; with sessionRef-first, the already-persisted identity is what gets compared. Validated 2026-07-27.)
 
@@ -506,7 +521,7 @@ In the `freshclaude: SIGKILL restore rebinds with history rehydrated and status 
 
 3. Leave the leg's assertions otherwise intact — with `leafDurableIdentity` now sessionRef-first, the pre-kill capture and post-reload comparison both read the durable UUID. If any *additional* leg-G assertion still hardcodes `content.sessionId` semantics, fix it to the sessionRef-first reader — never delete an assertion.
 
-- [ ] **Step 3: Run leg G alone — GREEN (STOP-gate)**
+- [x] **Step 3: Run leg G alone — GREEN (STOP-gate)**
 
 ```bash
 npm run test:e2e -- --project=rust-chromium specs/restore-contract-wall-rust.spec.ts -g 'freshclaude: SIGKILL restore rebinds'
@@ -514,7 +529,7 @@ npm run test:e2e -- --project=rust-chromium specs/restore-contract-wall-rust.spe
 
 Expected: 1 passed (as a NORMAL expectation now). This plus Task 1 Step 5's saved output is the wall leg's red→green proof. **If leg G still fails after the reader fix, the corrected diagnosis is incomplete** — capture the failure output (which assertion, what identity values were compared) and **STOP and report**; any remedy would be a production change, out of this lane's fence.
 
-- [ ] **Step 4: Run the FULL wall — prove no other pin flips unexpectedly**
+- [x] **Step 4: Run the FULL wall — prove no other pin flips unexpectedly**
 
 ```bash
 npm run test:e2e -- --project=rust-chromium specs/restore-contract-wall-rust.spec.ts
@@ -528,7 +543,7 @@ Decision protocol against the Task 1 pin inventory + full-wall baseline:
 
 Expected end state: full wall green (any remaining `test.fail` pins failing as expected; per the campaign, if this was the last gap, ZERO pins remain and every test passes plainly).
 
-- [ ] **Step 5: Run the sibling parity spec (adjacent coverage)**
+- [x] **Step 5: Run the sibling parity spec (adjacent coverage)**
 
 ```bash
 npm run test:e2e -- --project=rust-chromium specs/freshclaude-restart-parity-rust.spec.ts
@@ -536,7 +551,7 @@ npm run test:e2e -- --project=rust-chromium specs/freshclaude-restart-parity-rus
 
 Expected: PASS (untouched by this lane; it already reads sessionRef-first).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add test/e2e-browser/specs/restore-contract-wall-rust.spec.ts
@@ -556,7 +571,7 @@ git commit -m "test(e2e): flip P0.2 wall pin -- durable identity reader is sessi
 - Consumes: everything above.
 - Produces: pushed branch + final report. **NO PR** (policy: not approved — stop before `gh pr create`).
 
-- [ ] **Step 1: Lint clean**
+- [x] **Step 1: Lint clean**
 
 ```bash
 npm run lint
@@ -564,7 +579,13 @@ npm run lint
 
 Expected: clean. Fix any findings in OUR files only; re-run.
 
-- [ ] **Step 2: Typecheck + full coordinated suite**
+**Reconciled (council fix round, 2026-07-28):** `npm run lint` reports 9 pre-existing
+warnings (react-hooks/exhaustive-deps) in files this branch never touches
+(SetupWizard.tsx, ContextMenuProvider.tsx, FreshAgentView.tsx, BrowserPane.tsx,
+DirectoryPicker.tsx, ExtensionPane.tsx, IntersectionDragOverlay.tsx) — 0 errors,
+0 findings in this branch's files.
+
+- [x] **Step 2: Typecheck + full coordinated suite**
 
 ```bash
 npm run test:status
@@ -573,13 +594,24 @@ FRESHELL_TEST_SUMMARY="lane D4 freshclaude identity persistence" env -u FRESHELL
 
 Expected: PASS. Wait on the coordinator gate if held (3 sibling lanes). This lane changed no production code, so unit fallout should be zero; any failure is either pre-existing (check against Task 1 Step 4's baseline) or caused by our test files. Fix root causes in our fenced files; if a failure demands a change OUTSIDE the fence, STOP and report.
 
-- [ ] **Step 3: Final e2e sweep**
+**Reconciled (council fix round, 2026-07-28):** typecheck verified via
+`tsc -p tsconfig.server.json` (part of the e2e build step) and the client vite
+build, both clean. Full coordinated suite (`FRESHELL_TEST_SUMMARY="council fix
+round freshclaude-identity-persistence" npm test`) passed: client + server +
+electron configs, `full-suite success exit=0` per `npm run test:status`.
+
+- [x] **Step 3: Final e2e sweep**
 
 ```bash
 npm run test:e2e -- --project=rust-chromium specs/restore-contract-wall-rust.spec.ts specs/freshclaude-identity-persistence-rust.spec.ts specs/freshclaude-restart-parity-rust.spec.ts
 ```
 
 Expected: all green. Save the full-wall output — it is the headline evidence.
+
+**Reconciled (council fix round, 2026-07-28):** the full wall (15/15 legs) and
+both freshclaude-identity-persistence-rust.spec.ts tests ran green (individually
+verified with the council's B1/B2 fixes applied); see the fix round's final
+report for exact counts and commit SHAs.
 
 - [ ] **Step 4: Push the branch — and STOP**
 
@@ -589,6 +621,10 @@ git push -u origin freshclaude-identity-persistence
 ```
 
 **Do NOT run `gh pr create`.** PR is not approved for this lane.
+
+**Not done (honest, council fix round, 2026-07-28):** explicitly instructed NOT
+to push this round. Branch sits committed, unpushed, awaiting the caller's
+push/PR approval.
 
 - [ ] **Step 5: Final report (deliverable text, not a commit)**
 
