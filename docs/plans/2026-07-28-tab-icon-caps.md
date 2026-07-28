@@ -72,12 +72,30 @@ shares or duplicates the cap logic:
 - `src/components/panes/PaneHeader.tsx` — renders exactly one RepoIcon +
   one PaneIcon per pane header; a cap is not applicable. **Do not touch.**
 
-Test-suite audit confirmed exactly two tests pin the old cap of 6 and must
-change in lockstep with the constant:
-`test/unit/client/components/TabItem.test.tsx:240-254` and
+Test-suite audit (re-confirmed by an independent validation sweep of all
+pane-icon/repo-icon testid consumers, all `+N` text assertions, and all
+loop-built >=4-pane fixtures) confirmed exactly two tests pin the old cap
+of 6 and must change in lockstep with the constant:
+`test/unit/client/components/TabItem.test.tsx:240-260` and
 `test/unit/client/components/TabBar.test.tsx:1392-1447`. Nothing else in
 `test/` (including `test/e2e*`) renders >3 panes in one tab while asserting
-icon counts or `+N` text.
+icon counts or `+N` text. There are no snapshot tests anywhere under `test/`.
+
+**Anchor trust note:** all line anchors in this plan were re-verified
+against HEAD `0a6657f1`. If any anchor does not match what you see, locate
+the target by symbol/test name (quoted in each step), never by line number
+alone, and proceed.
+
+**Verified baseline (recorded at `0a6657f1`, do not re-litigate):**
+`npm run typecheck:client` exits 0; `npm run test:unit` passes 4144/4144
+(353 files); `npm run lint` exits 0 with 0 errors and exactly **9
+pre-existing warnings** (all `react-hooks/exhaustive-deps`, in 8 files,
+**none** in `TabItem.tsx`). Two known noise sources, neither attributable
+to this change: (a) vitest runs with `sequence.shuffle: true`, and (b)
+`test/unit/client/store/storage-migration.fresh-agent.test.ts` has a
+<500ms wall-clock perf budget that can fail spuriously under machine load
+— if either produces an unexpected failure unrelated to tab icons, re-run
+once before investigating.
 
 **E2E coverage note:** this change is pure presentation logic inside
 `TabItem`, already covered end-to-end by the existing
@@ -93,14 +111,14 @@ for this cap; no new e2e file is warranted for a constant change.
 **Files:**
 - Modify: `src/components/TabItem.tsx:27` (constant) and `:85-88` (usages)
 - Test: `test/unit/client/components/TabItem.test.tsx` (modify the test at
-  `:240-254`, add three tests after it)
+  `:240-260`, add three tests after it)
 - Test: `test/unit/client/components/TabBar.test.tsx` (modify the test
   `'caps at 6 icons and shows overflow indicator'` at `:1392-1447`)
 
 **Interfaces:**
 - Consumes: existing `TabItem` props (`paneEntries`, `busyPaneIds`,
   `iconsOnTabs`) and the test fixtures already in each file:
-  `createPaneEntries(contents: PaneContent[])` (TabItem.test.tsx:113-118,
+  `createPaneEntries(contents: PaneContent[])` (TabItem.test.tsx:46-51,
   1-based `pane-N` ids) and the mocked `data-testid="pane-icon"` /
   `getByText('+N')` selectors.
 - Produces: module-private `const MAX_PANE_ICONS = 3` in
@@ -111,7 +129,7 @@ for this cap; no new e2e file is warranted for a constant change.
 
 - [ ] **Step 1: Update the existing hidden-busy overflow test to the new cap**
 
-In `test/unit/client/components/TabItem.test.tsx`, the test at `:240-254`
+In `test/unit/client/components/TabItem.test.tsx`, the test at `:240-260`
 (`'shows blue overflow indicator when the exact busy terminal is hidden
 beyond the visible icon cap'`) builds 7 panes with `pane-7` busy and asserts
 `getByText('+1')`. With a cap of 3, 7 panes overflow by 4. Change only the
@@ -225,6 +243,12 @@ Expected: FAIL with exactly 4 failing tests —
 `'shows no overflow badge at exactly 3 panes'` PASSES already (3 ≤ 6) —
 it is a boundary guard, expected green in the red run.
 
+(Both files are verified green at baseline — 83/83 — so all 4 failures are
+attributable to the new expectations. Vitest shuffles test order per run;
+if an *unrelated* test fails intermittently, re-run once before
+investigating. If the failure set differs from the 4 above in a way that
+involves icon counts or `+N` text, STOP and re-audit before proceeding.)
+
 - [ ] **Step 5: Implement — rename the constant and set it to 3**
 
 In `src/components/TabItem.tsx`, replace line 27:
@@ -304,11 +328,37 @@ against Task 1's code. They pin the locked decision so any future change
 loudly. Step 3 then makes the cap explicit as the REFACTOR phase, with the
 suite staying green. Do not skip the tests just because they start green.
 
+This structure complies with the repo rule (`AGENTS.md:7`: "We use
+Red-Green-Refactor TDD for all changes but the most trivial... We never
+skip the tests, and never skip the refactor."): adding a guard for an
+invariant that already structurally holds is a *refactor*, refactors are
+definitionally performed green, and characterization-before-refactor is
+the canonical safe-refactor technique. The genuine RED driver for this
+task family is Task 1 Step 4. Prior repo plans use the same pre-argued
+green-task pattern. If a reviewer nonetheless rejects the green-first
+structure, the sanctioned fallback is: fold this task's steps into Task 1
+as an extension of its refactor phase (same tests, same guard, one task)
+— do not drop the tests or the guard.
+
+**Open interpretation note (recorded decision):** repo icons derive from
+the *visible* pane slice — a repo whose panes are ALL hidden beyond the
+pane cap shows no repo icon (a 4-repo tab can show as few as 1 repo
+icon). This is today's verified behavior and this plan deliberately
+preserves it (the goal statement says "keeping existing... semantics").
+The alternative reading — "first 3 distinct repos across ALL panes" —
+was considered and rejected as an unrequested behavior change. If the
+user later wants the alternative, it is a contained `renderIcons()`
+change (derive repo groups from all `paneEntries` instead of `visible`)
+plus updating the test
+`'does not render repo icons for repos whose panes are all hidden beyond the pane cap'`,
+which is a characterization test of current behavior, pending
+confirmation — not a spec.
+
 - [ ] **Step 1: Add repo-icon cap tests to the `describe('repo icons')` block**
 
 In `test/unit/client/components/TabItem.test.tsx`, inside
-`describe('repo icons', ...)` (after the existing `repoIcons` fixture
-around `:270` and after the last existing test in the block), first add an
+`describe('repo icons', ...)` (the existing `repoIcons` fixture is at
+`:395`; add after the last existing test in the block), first add an
 extended fixture next to the existing `repoIcons` const:
 
 ```tsx
@@ -372,6 +422,12 @@ then add these three tests at the end of the block:
       expect(screen.queryByText(/^\+\d+$/)).toBeNull()
     })
 ```
+
+(Selector note for the silent-truncation test: `getAllByText(/^\+\d+$/)`
+is expected to match exactly the one badge span — Testing Library matches
+direct text nodes only. If it ever yields ≠1 match, scope the query with
+`within(...)` on the icon row or match on the badge's class instead — a
+test-local fix, NOT a production bug.)
 
 - [ ] **Step 2: Run the test file — expect all three new tests to PASS**
 
@@ -472,8 +528,14 @@ Expected: exits 0, no errors.
 FRESHELL_TEST_SUMMARY="tab-icon-caps: verify pane/repo icon caps" npm run test:unit
 ```
 
-Expected: PASS, 0 failures. (This is a broad coordinated run — if another
-agent holds the coordinator gate, wait; never kill a foreign holder.)
+Expected: PASS, 0 failures — the recorded baseline is 4144/4144 across 353
+files. (This is a broad coordinated run — if another agent holds the
+coordinator gate, wait; never kill a foreign holder.) Known baseline noise:
+`test/unit/client/store/storage-migration.fresh-agent.test.ts` has a
+<500ms perf budget that can fail spuriously under machine load, and vitest
+shuffles test order per run — if the ONLY failure is that perf test or an
+intermittent failure clearly unrelated to tab icons, re-run once before
+attributing it to this change.
 
 - [ ] **Step 3: Lint (jsx-a11y CI gate)**
 
@@ -481,7 +543,11 @@ agent holds the coordinator gate, wait; never kill a foreign holder.)
 npm run lint
 ```
 
-Expected: no NEW warnings or errors relative to `origin/main` (the change
+Expected: exit 0 with 0 errors. NOTE: eslint's exit code ignores warnings,
+so "no new warnings" must be checked against the recorded baseline: exactly
+**9 pre-existing warnings**, all `react-hooks/exhaustive-deps`, in 8 files,
+**none** in `TabItem.tsx`. The gate is: total warnings still 9, and no
+warning mentions `TabItem.tsx` or any file this change touched (the change
 adds no interactive elements or roles, so nothing new should appear). If a
 new warning points at the modified lines, fix it (`npm run lint:fix` for
 mechanical fixes), re-run Steps 1-3, and commit the fix:
