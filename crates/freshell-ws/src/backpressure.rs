@@ -261,6 +261,7 @@ mod tests {
             terminal_id: "t".to_string(),
             attach_request_id: None,
             source: None,
+            runtime: None,
         });
         assert!(
             q.route(output).is_none(),

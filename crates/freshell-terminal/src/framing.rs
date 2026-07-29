@@ -111,6 +111,7 @@ pub fn frame_to_terminal_output(
         terminal_id: terminal_id.to_string(),
         attach_request_id: None,
         source: Some(source),
+        runtime: None,
     })
 }
 

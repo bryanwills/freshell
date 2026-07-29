@@ -315,6 +315,7 @@ impl FreshOpencodeState {
                     runtime_provider: PROVIDER.to_string(),
                     session_id: cached.placeholder_id.clone(),
                     session_type: SESSION_TYPE.to_string(),
+                    runtime: None,
                     session_ref: Some(SessionLocator {
                         provider: PROVIDER.to_string(),
                         session_id: cached.placeholder_id,
@@ -387,6 +388,7 @@ impl FreshOpencodeState {
             runtime_provider: PROVIDER.to_string(),
             session_id: placeholder.clone(),
             session_type: SESSION_TYPE.to_string(),
+            runtime: None,
             session_ref: Some(SessionLocator {
                 provider: PROVIDER.to_string(),
                 session_id: placeholder,
@@ -483,6 +485,7 @@ impl FreshOpencodeState {
             runtime_provider: PROVIDER.to_string(),
             session_id: durable_id.clone(),
             session_type: SESSION_TYPE.to_string(),
+            runtime: None,
             session_ref: Some(SessionLocator {
                 provider: PROVIDER.to_string(),
                 session_id: durable_id,
@@ -620,6 +623,7 @@ impl FreshOpencodeState {
                     provider: PROVIDER.to_string(),
                     session_id: durable_id.clone(),
                     session_type: SESSION_TYPE.to_string(),
+                    runtime: None,
                     session_ref: Some(SessionLocator {
                         provider: PROVIDER.to_string(),
                         session_id: durable_id.clone(),
@@ -1251,6 +1255,7 @@ fn event_frame(session_id: &str, inner: Value) -> ServerMessage {
         provider: PROVIDER.to_string(),
         session_id: session_id.to_string(),
         session_type: SESSION_TYPE.to_string(),
+        runtime: None,
     })
 }
 

@@ -1,4 +1,4 @@
-//! Server → client messages (`ServerMessage`, 52 discriminants).
+//! Server → client messages (`ServerMessage`, 60 discriminants).
 //!
 //! These are TypeScript-typed (not runtime-validated) on the wire; their frozen
 //! shape authority is `port/contract/ws-server-messages.schema.json`.
@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::common::{
-    AgentProvider, AmplifierActivityRecord, ClaudeActivityRecord, CodexActivityRecord,
-    CodexDurability, ErrorCode, OpencodeActivityRecord, SessionLocator, TerminalMetaRecord,
-    TurnCompletionSnapshot,
+    AgentProvider, AgentRuntimeKind, AmplifierActivityRecord, ClaudeActivityRecord,
+    CodexActivityRecord, CodexDurability, ErrorCode, OpencodeActivityRecord, RuntimeDescriptor,
+    SessionLocator, TerminalMetaRecord, TurnCompletionSnapshot,
 };
 use crate::settings::ServerSettings;
 
@@ -17,6 +17,12 @@ use crate::settings::ServerSettings;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ServerMessage {
+    #[serde(rename = "agent.restart.failed")]
+    AgentRestartFailed(AgentRestartFailed),
+    #[serde(rename = "agent.restart.replaced")]
+    AgentRestartReplaced(AgentRestartReplaced),
+    #[serde(rename = "agent.restart.started")]
+    AgentRestartStarted(AgentRestartStarted),
     // Extension surface (not in the frozen T0 inventory — see
     // `EXTENSION_SERVER_MESSAGE_TYPES`): the amplifier activity family the
     // frozen client already consumes, mirroring the legacy zod schemas.
@@ -146,7 +152,10 @@ pub enum ServerMessage {
 
 /// The exact `type` discriminants of every server→client message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const SERVER_MESSAGE_TYPES: [&str; 57] = [
+pub const SERVER_MESSAGE_TYPES: [&str; 60] = [
+    "agent.restart.failed",
+    "agent.restart.replaced",
+    "agent.restart.started",
     "amplifier.activity.list.response",
     "amplifier.activity.updated",
     "claude.activity.list.response",
@@ -255,6 +264,84 @@ pub enum RuntimeStatus {
 pub enum TerminalRunStatus {
     Running,
     Exited,
+}
+
+/// Machine-readable terminal result for an `agent.restart` transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AgentRestartFailureCode {
+    Unresumable,
+    RuntimeNotFound,
+    StaleGeneration,
+    RequestIdConflict,
+    PreflightFailed,
+    ShutdownFailed,
+    ReplacementFailed,
+}
+
+/// Old-runtime descriptor flattened with `old*` wire names on a committed
+/// replacement event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OldRuntimeDescriptor {
+    pub old_runtime_id: String,
+    pub old_generation: u64,
+}
+
+impl From<RuntimeDescriptor> for OldRuntimeDescriptor {
+    fn from(value: RuntimeDescriptor) -> Self {
+        Self {
+            old_runtime_id: value.runtime_id,
+            old_generation: value.generation,
+        }
+    }
+}
+
+impl OldRuntimeDescriptor {
+    pub fn as_runtime_descriptor(&self) -> RuntimeDescriptor {
+        RuntimeDescriptor {
+            runtime_id: self.old_runtime_id.clone(),
+            generation: self.old_generation,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRestartStarted {
+    pub request_id: String,
+    pub provider: String,
+    pub session_id: String,
+    pub kind: AgentRuntimeKind,
+    #[serde(flatten)]
+    pub runtime: RuntimeDescriptor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRestartReplaced {
+    pub request_id: String,
+    pub provider: String,
+    pub session_id: String,
+    pub kind: AgentRuntimeKind,
+    #[serde(flatten)]
+    pub old_runtime: OldRuntimeDescriptor,
+    #[serde(flatten)]
+    pub runtime: RuntimeDescriptor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRestartFailed {
+    pub request_id: String,
+    pub provider: String,
+    pub session_id: String,
+    pub kind: AgentRuntimeKind,
+    #[serde(flatten)]
+    pub runtime: RuntimeDescriptor,
+    pub code: AgentRestartFailureCode,
+    pub message: String,
+    pub retryable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -631,6 +718,8 @@ pub struct FreshAgentCreated {
     pub session_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<SessionLocator>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -641,6 +730,8 @@ pub struct FreshAgentEvent {
     pub provider: String,
     pub session_id: String,
     pub session_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -688,6 +779,8 @@ pub struct FreshAgentSessionMaterialized {
     pub session_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<SessionLocator>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeDescriptor>,
 }
 
 // --- pane.reconcile.result ----------------------------------------------------
@@ -730,6 +823,9 @@ pub struct PaneVerdict {
     /// merely flags the duplicate `terminalId`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duplicate: Option<String>,
+    /// Live runtime fence for attach/reconcile verdicts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeDescriptor>,
 }
 
 /// Sent ONLY in response to `pane.reconcile.request` — the server never
@@ -920,6 +1016,8 @@ pub struct TerminalAttachReady {
     pub requested_since_seq: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<SessionLocator>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -965,6 +1063,8 @@ pub struct TerminalCreated {
     pub restore_error: Option<TerminalRestoreError>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<SessionLocator>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -972,6 +1072,8 @@ pub struct TerminalCreated {
 pub struct TerminalExit {
     pub exit_code: i64,
     pub terminal_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1000,6 +1102,8 @@ pub struct InventoryTerminal {
     pub runtime_status: Option<RuntimeStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<SessionLocator>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1029,6 +1133,8 @@ pub struct TerminalOutput {
     pub attach_request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<OutputSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1056,6 +1162,8 @@ pub struct TerminalOutputBatch {
     pub source: OutputSource,
     pub stream_id: String,
     pub terminal_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1068,6 +1176,8 @@ pub struct TerminalOutputGap {
     pub to_seq: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attach_request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

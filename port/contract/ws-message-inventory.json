@@ -1,7 +1,8 @@
 {
   "clientToServer": {
-    "count": 29,
+    "count": 30,
     "types": [
+      "agent.restart",
       "amplifier.activity.list",
       "claude.activity.list",
       "client.diagnostic",
@@ -36,8 +37,11 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `npm run contract:generate`. `type` discriminants for every message in each direction, resolved from the ClientMessage and ServerMessage union types via the TypeScript type checker.",
   "generator": "port/contract/generate-ws-contract.ts",
   "serverToClient": {
-    "count": 57,
+    "count": 60,
     "types": [
+      "agent.restart.failed",
+      "agent.restart.replaced",
+      "agent.restart.started",
       "amplifier.activity.list.response",
       "amplifier.activity.updated",
       "claude.activity.list.response",

@@ -1,4 +1,4 @@
-//! Client → server messages (`ClientMessage`, 27 discriminants).
+//! Client → server messages (`ClientMessage`, 30 discriminants).
 //!
 //! These are the Zod-validated inbound surface. Deserialization is
 //! accept-and-strip (no `deny_unknown_fields`), mirroring the runtime.
@@ -8,14 +8,17 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 use crate::common::{
-    double_option, AgentProvider, CodexDurability, PermissionMode, Sandbox, SessionLocator,
-    SessionType, Shell, StringOrNumber, TerminalAttachIntent, TerminalAttachPriority,
+    double_option, AgentProvider, AgentRuntimeKind, CodexDurability, PermissionMode, Sandbox,
+    SessionLocator, SessionType, Shell, StringOrNumber, TerminalAttachIntent,
+    TerminalAttachPriority,
 };
 
 /// A message sent from a client to the server.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
+    #[serde(rename = "agent.restart")]
+    AgentRestart(AgentRestart),
     #[serde(rename = "hello")]
     Hello(Hello),
     #[serde(rename = "ping")]
@@ -81,7 +84,8 @@ pub enum ClientMessage {
 
 /// The exact `type` discriminants of every client→server message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const CLIENT_MESSAGE_TYPES: [&str; 29] = [
+pub const CLIENT_MESSAGE_TYPES: [&str; 30] = [
+    "agent.restart",
     "amplifier.activity.list",
     "claude.activity.list",
     "client.diagnostic",
@@ -169,6 +173,19 @@ pub struct Hello {
 }
 
 // --- client.diagnostic ------------------------------------------------------
+
+/// Fenced request to restart one Rust-owned coding-agent runtime while
+/// retaining its canonical durable conversation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRestart {
+    pub request_id: String,
+    pub provider: String,
+    pub session_id: String,
+    pub kind: AgentRuntimeKind,
+    pub live_id: String,
+    pub expected_generation: u64,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -218,6 +218,7 @@ impl FreshClaudeState {
             provider: PROVIDER.to_string(),
             session_id: session_id.to_string(),
             session_type: session_type.to_string(),
+            runtime: None,
         }));
     }
 
@@ -274,6 +275,7 @@ impl FreshClaudeState {
                     runtime_provider: PROVIDER.to_string(),
                     session_id: cached.session_id,
                     session_type: session_type.to_string(),
+                    runtime: None,
                     session_ref: None,
                 }));
                 return;
@@ -505,6 +507,7 @@ impl FreshClaudeState {
             runtime_provider: PROVIDER.to_string(),
             session_id: created,
             session_type: session_type.to_string(),
+            runtime: None,
             session_ref: None,
         }));
     }
@@ -553,6 +556,7 @@ impl FreshClaudeState {
             runtime_provider: PROVIDER.to_string(),
             session_id: durable.to_string(),
             session_type: session_type.to_string(),
+            runtime: None,
             session_ref: Some(freshell_protocol::SessionLocator {
                 provider: PROVIDER.to_string(),
                 session_id: durable.to_string(),
@@ -1243,6 +1247,7 @@ fn sdk_line_to_frame(value: &Value, session_id: &str, session_type: &str) -> Opt
         provider: PROVIDER.to_string(),
         session_id: session_id.to_string(),
         session_type: session_type.to_string(),
+        runtime: None,
     });
     serde_json::to_string(&msg).ok()
 }
@@ -1328,6 +1333,7 @@ fn status_snapshot_frame(
         provider: PROVIDER.to_string(),
         session_id: session_id.to_string(),
         session_type: session_type.to_string(),
+        runtime: None,
     })
 }
 
@@ -1353,6 +1359,7 @@ fn lost_session_frame(session_id: &str, session_type: SessionType) -> ServerMess
         provider: PROVIDER.to_string(),
         session_id: session_id.to_string(),
         session_type: session_type_str(session_type).to_string(),
+        runtime: None,
     })
 }
 

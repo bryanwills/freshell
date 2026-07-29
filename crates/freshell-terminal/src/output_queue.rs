@@ -179,6 +179,7 @@ impl OutputQueue {
                 stream_id: gap.stream_id,
                 terminal_id: gap.terminal_id,
                 attach_request_id: gap.attach_request_id,
+                runtime: None,
             }));
         }
         for item in self.items.drain(..) {

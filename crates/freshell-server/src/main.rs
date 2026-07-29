@@ -632,6 +632,7 @@ async fn main() -> ExitCode {
         spawn_gate: std::sync::Arc::clone(&spawn_gate),
         shutdown_started: std::sync::Arc::clone(&shutdown_started),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
+        restart: freshell_ws::restart::RestartCoordinator::new(),
         pane_ledger: std::sync::Arc::clone(&pane_ledger),
     };
 

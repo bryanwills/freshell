@@ -280,6 +280,7 @@ impl TerminalShared {
             description: self.description.clone(),
             runtime_status: None,
             session_ref: None,
+            runtime: None,
         }
     }
 }
@@ -1110,6 +1111,7 @@ impl TerminalRegistry {
             replay_reset_reason: None,
             requested_since_seq: Some(since_seq),
             session_ref,
+            runtime: None,
         });
         sink(ready);
 
@@ -1143,6 +1145,7 @@ impl TerminalRegistry {
             let exit = ServerMessage::TerminalExit(TerminalExit {
                 exit_code: s.exit_code.unwrap_or(0),
                 terminal_id: terminal_id.to_string(),
+                runtime: None,
             });
             sink(exit);
             s.subscribers.remove(&conn_id);
@@ -1412,6 +1415,7 @@ impl TerminalRegistry {
             let exit = ServerMessage::TerminalExit(TerminalExit {
                 exit_code: 0,
                 terminal_id: terminal_id.to_string(),
+                runtime: None,
             });
             for sub in s.subscribers.values() {
                 (sub.sink)(exit.clone());
@@ -1537,6 +1541,7 @@ impl TerminalRegistry {
         let exit = ServerMessage::TerminalExit(TerminalExit {
             exit_code,
             terminal_id: terminal_id.to_string(),
+            runtime: None,
         });
         for sub in s.subscribers.values() {
             (sub.sink)(exit.clone());

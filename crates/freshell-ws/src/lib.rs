@@ -39,6 +39,7 @@ pub mod origin;
 pub mod pane_ledger;
 pub mod reconcile;
 pub mod reconcile_freshagent;
+pub mod restart;
 pub mod screenshot;
 pub mod spawn_gate;
 pub mod tabs;
@@ -216,6 +217,9 @@ pub struct WsState {
     /// (legacy `createdByRequestId` parity — see
     /// [`crate::create_dedupe::CreateDedupe`]).
     pub create_dedupe: std::sync::Arc<crate::create_dedupe::CreateDedupe>,
+    /// Server-owned runtime generations plus idempotent restart transaction
+    /// results. Shared by every connection in this boot.
+    pub restart: crate::restart::RestartCoordinator,
     /// Server-wide PTY spawn gate (restart-storm / WSL-outage RCA §6.3
     /// protection). One per server process, shared across all WS
     /// connections. See [`crate::spawn_gate::SpawnGate`].
@@ -467,6 +471,9 @@ pub fn build_handshake_with_capabilities(
         terminals,
         terminal_meta: Vec::new(),
     }));
+    for message in &mut messages {
+        state.restart.observe_server_message(message);
+    }
     messages
 }
 
@@ -798,6 +805,7 @@ mod tests {
             spawn_gate: std::sync::Arc::new(crate::spawn_gate::SpawnGate::new(4, 64)),
             shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
+            restart: crate::restart::RestartCoordinator::new(),
             config_fallback: None,
             opencode_locator: None,
             codex_locator: None,

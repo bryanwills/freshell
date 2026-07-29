@@ -1650,6 +1650,7 @@ async fn send_keys(
                     provider: PROVIDER.to_string(),
                     session_id: durable_id.clone(),
                     session_type: SESSION_TYPE.to_string(),
+                    runtime: None,
                 }));
             }
         }
@@ -1667,6 +1668,7 @@ async fn send_keys(
                 provider: PROVIDER.to_string(),
                 session_id: durable_id.clone(),
                 session_type: SESSION_TYPE.to_string(),
+                runtime: None,
                 session_ref: Some(session_ref.clone()),
             },
         ));
@@ -2374,6 +2376,7 @@ mod tests {
             provider: PROVIDER.to_string(),
             session_id: "ses_123".to_string(),
             session_type: SESSION_TYPE.to_string(),
+            runtime: None,
             session_ref: Some(SessionLocator {
                 provider: PROVIDER.to_string(),
                 session_id: "ses_123".to_string(),

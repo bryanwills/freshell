@@ -3,8 +3,163 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `npm run contract:generate`. Each entry is a JSON Schema for one server→client message shape, keyed by its `type` discriminant and synthesized from the ServerMessage union via the TypeScript type checker. Opaque values (unknown / index signatures / any) are intentionally permissive — see nondeterministic-fields.md. The wire contract is frozen for the Rust port.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-  "messageCount": 57,
+  "messageCount": 60,
   "messages": {
+    "agent.restart.failed": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "enum": [
+            "UNRESUMABLE",
+            "RUNTIME_NOT_FOUND",
+            "STALE_GENERATION",
+            "REQUEST_ID_CONFLICT",
+            "PREFLIGHT_FAILED",
+            "SHUTDOWN_FAILED",
+            "REPLACEMENT_FAILED"
+          ],
+          "type": "string"
+        },
+        "generation": {
+          "type": "number"
+        },
+        "kind": {
+          "enum": [
+            "terminal",
+            "fresh-agent"
+          ],
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "runtimeId": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "type": {
+          "const": "agent.restart.failed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "generation",
+        "kind",
+        "message",
+        "provider",
+        "requestId",
+        "retryable",
+        "runtimeId",
+        "sessionId",
+        "type"
+      ],
+      "type": "object"
+    },
+    "agent.restart.replaced": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "generation": {
+          "type": "number"
+        },
+        "kind": {
+          "enum": [
+            "terminal",
+            "fresh-agent"
+          ],
+          "type": "string"
+        },
+        "oldGeneration": {
+          "type": "number"
+        },
+        "oldRuntimeId": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "runtimeId": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "type": {
+          "const": "agent.restart.replaced",
+          "type": "string"
+        }
+      },
+      "required": [
+        "generation",
+        "kind",
+        "oldGeneration",
+        "oldRuntimeId",
+        "provider",
+        "requestId",
+        "runtimeId",
+        "sessionId",
+        "type"
+      ],
+      "type": "object"
+    },
+    "agent.restart.started": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "generation": {
+          "type": "number"
+        },
+        "kind": {
+          "enum": [
+            "terminal",
+            "fresh-agent"
+          ],
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "runtimeId": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "type": {
+          "const": "agent.restart.started",
+          "type": "string"
+        }
+      },
+      "required": [
+        "generation",
+        "kind",
+        "provider",
+        "requestId",
+        "runtimeId",
+        "sessionId",
+        "type"
+      ],
+      "type": "object"
+    },
     "amplifier.activity.list.response": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -901,6 +1056,22 @@
         "requestId": {
           "type": "string"
         },
+        "runtime": {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "type": "number"
+            },
+            "runtimeId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "generation",
+            "runtimeId"
+          ],
+          "type": "object"
+        },
         "runtimeProvider": {
           "type": "string"
         },
@@ -948,6 +1119,22 @@
         "event": true,
         "provider": {
           "type": "string"
+        },
+        "runtime": {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "type": "number"
+            },
+            "runtimeId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "generation",
+            "runtimeId"
+          ],
+          "type": "object"
         },
         "sessionId": {
           "type": "string"
@@ -1097,6 +1284,22 @@
         },
         "provider": {
           "type": "string"
+        },
+        "runtime": {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "type": "number"
+            },
+            "runtimeId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "generation",
+            "runtimeId"
+          ],
+          "type": "object"
         },
         "sessionId": {
           "type": "string"
@@ -1284,6 +1487,22 @@
               },
               "reason": {
                 "type": "string"
+              },
+              "runtime": {
+                "additionalProperties": false,
+                "properties": {
+                  "generation": {
+                    "type": "number"
+                  },
+                  "runtimeId": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "generation",
+                  "runtimeId"
+                ],
+                "type": "object"
               },
               "sessionRef": {
                 "additionalProperties": false,
@@ -2039,6 +2258,22 @@
         "requestedSinceSeq": {
           "type": "number"
         },
+        "runtime": {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "type": "number"
+            },
+            "runtimeId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "generation",
+            "runtimeId"
+          ],
+          "type": "object"
+        },
         "sessionRef": {
           "additionalProperties": false,
           "properties": {
@@ -2241,6 +2476,22 @@
           ],
           "type": "object"
         },
+        "runtime": {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "type": "number"
+            },
+            "runtimeId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "generation",
+            "runtimeId"
+          ],
+          "type": "object"
+        },
         "sessionRef": {
           "additionalProperties": false,
           "properties": {
@@ -2297,6 +2548,22 @@
       "properties": {
         "exitCode": {
           "type": "number"
+        },
+        "runtime": {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "type": "number"
+            },
+            "runtimeId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "generation",
+            "runtimeId"
+          ],
+          "type": "object"
         },
         "terminalId": {
           "type": "string"
@@ -2585,6 +2852,22 @@
               "mode": {
                 "type": "string"
               },
+              "runtime": {
+                "additionalProperties": false,
+                "properties": {
+                  "generation": {
+                    "type": "number"
+                  },
+                  "runtimeId": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "generation",
+                  "runtimeId"
+                ],
+                "type": "object"
+              },
               "runtimeStatus": {
                 "enum": [
                   "running",
@@ -2758,6 +3041,22 @@
         "data": {
           "type": "string"
         },
+        "runtime": {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "type": "number"
+            },
+            "runtimeId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "generation",
+            "runtimeId"
+          ],
+          "type": "object"
+        },
         "seqEnd": {
           "type": "number"
         },
@@ -2801,6 +3100,22 @@
         },
         "data": {
           "type": "string"
+        },
+        "runtime": {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "type": "number"
+            },
+            "runtimeId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "generation",
+            "runtimeId"
+          ],
+          "type": "object"
         },
         "segments": {
           "items": {
@@ -2902,6 +3217,22 @@
             "replay_budget_exceeded"
           ],
           "type": "string"
+        },
+        "runtime": {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "type": "number"
+            },
+            "runtimeId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "generation",
+            "runtimeId"
+          ],
+          "type": "object"
         },
         "streamId": {
           "type": "string"

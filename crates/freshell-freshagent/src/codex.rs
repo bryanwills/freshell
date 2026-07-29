@@ -402,6 +402,7 @@ impl FreshCodexState {
             provider: PROVIDER.to_string(),
             session_id: session_id.to_string(),
             session_type: SESSION_TYPE.to_string(),
+            runtime: None,
         }));
     }
 
@@ -473,6 +474,7 @@ impl FreshCodexState {
                     runtime_provider: PROVIDER.to_string(),
                     session_id: cached.session_id.clone(),
                     session_type: SESSION_TYPE.to_string(),
+                    runtime: None,
                     session_ref: Some(SessionLocator {
                         provider: PROVIDER.to_string(),
                         session_id: cached.session_id,
@@ -965,6 +967,7 @@ impl FreshCodexState {
             runtime_provider: PROVIDER.to_string(),
             session_id: thread_id.clone(),
             session_type: SESSION_TYPE.to_string(),
+            runtime: None,
             session_ref: Some(SessionLocator {
                 provider: PROVIDER.to_string(),
                 session_id: thread_id,
@@ -1028,6 +1031,7 @@ impl FreshCodexState {
             runtime_provider: PROVIDER.to_string(),
             session_id: thread_id.to_string(),
             session_type: SESSION_TYPE.to_string(),
+            runtime: None,
             session_ref: Some(SessionLocator {
                 provider: PROVIDER.to_string(),
                 session_id: thread_id.to_string(),
@@ -1924,6 +1928,7 @@ impl FreshCodexState {
                 provider: PROVIDER.to_string(),
                 session_id: new_thread_id.clone(),
                 session_type: SESSION_TYPE.to_string(),
+                runtime: None,
                 session_ref: Some(SessionLocator {
                     provider: PROVIDER.to_string(),
                     session_id: new_thread_id.clone(),
@@ -3420,6 +3425,7 @@ fn adapter_event_to_frame(event: &CodexAdapterEvent, thread_id: &str) -> Option<
         provider: PROVIDER.to_string(),
         session_id: thread_id.to_string(),
         session_type: SESSION_TYPE.to_string(),
+        runtime: None,
     });
     serde_json::to_string(&msg).ok()
 }
@@ -3438,6 +3444,7 @@ fn lost_session_frame(session_id: &str) -> ServerMessage {
         provider: PROVIDER.to_string(),
         session_id: session_id.to_string(),
         session_type: SESSION_TYPE.to_string(),
+        runtime: None,
     })
 }
 

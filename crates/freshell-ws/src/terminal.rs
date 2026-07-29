@@ -170,7 +170,9 @@ pub async fn run(
     let conn_sink: FrameSink = {
         let tx = conn_tx.clone();
         let output_queue = Arc::clone(&output_queue);
-        Arc::new(move |msg| {
+        let restart = state.restart.clone();
+        Arc::new(move |mut msg| {
+            restart.observe_server_message(&mut msg);
             if let Some(msg) = output_queue.route(msg) {
                 let _ = tx.send(msg);
             }
@@ -375,6 +377,7 @@ pub async fn run(
                 match frame {
                     // A pre-serialized server→client frame — forward it verbatim.
                     Ok(json) => {
+                        let json = state.restart.observe_serialized(&json);
                         if ws_tx.send(Message::Text(json.into())).await.is_err() {
                             close_reason = "send_error";
                             break;
@@ -1441,7 +1444,7 @@ pub(crate) async fn handle_create(
                     create_request_id = %create.request_id,
                     "terminal.create.adopted"
                 );
-                let created = ServerMessage::TerminalCreated(TerminalCreated {
+                let mut created = ServerMessage::TerminalCreated(TerminalCreated {
                     created_at: now_ms(),
                     request_id: create.request_id,
                     terminal_id: existing.clone(),
@@ -1449,7 +1452,9 @@ pub(crate) async fn handle_create(
                     cwd: state.registry.probe(&existing).and_then(|row| row.cwd),
                     restore_error: None,
                     session_ref: state.identity.session_ref_for(&existing),
+                    runtime: None,
                 });
+                state.restart.observe_server_message(&mut created);
                 return out.send(&created).await;
             }
             if state.registry.begin_keyed_create(&create.request_id) {
@@ -1505,7 +1510,7 @@ pub(crate) async fn handle_create(
                             session_id = %locator.session_id,
                             "terminal.create.session_ref_attached"
                         );
-                        let created = ServerMessage::TerminalCreated(TerminalCreated {
+                        let mut created = ServerMessage::TerminalCreated(TerminalCreated {
                             created_at: now_ms(),
                             request_id: create.request_id,
                             terminal_id: terminal_id.clone(),
@@ -1516,7 +1521,9 @@ pub(crate) async fn handle_create(
                                 .identity
                                 .session_ref_for(&terminal_id)
                                 .or(Some(locator)),
+                            runtime: None,
                         });
+                        state.restart.observe_server_message(&mut created);
                         return out.send(&created).await;
                     }
                     SessionRefClaim::Held { retry_after_ms } => {
@@ -2520,7 +2527,7 @@ pub(crate) async fn handle_create(
     let dedupe_terminal_id = terminal_id.clone();
     let dedupe_restore = create.restore;
 
-    let created = ServerMessage::TerminalCreated(TerminalCreated {
+    let mut created = ServerMessage::TerminalCreated(TerminalCreated {
         created_at: now_ms(),
         request_id: create.request_id,
         terminal_id,
@@ -2531,7 +2538,9 @@ pub(crate) async fn handle_create(
         // The canonical create-time identity, from the SAME registry every other
         // identity-stamped frame reads (shell creates have no entry -> `None`).
         session_ref: state.identity.session_ref_for(&terminal_id_for_meta),
+        runtime: None,
     });
+    state.restart.observe_server_message(&mut created);
     // Record the settled create (server-wide requestId dedupe) and forward
     // the frame to any cross-connection waiters BEFORE the origin reply —
     // both are non-blocking sink pushes, so ordering here is cosmetic.
@@ -3379,12 +3388,13 @@ async fn handle_pane_reconcile(
             }
         };
     }
-    let result = ServerMessage::PaneReconcileResult(freshell_protocol::PaneReconcileResult {
+    let mut result = ServerMessage::PaneReconcileResult(freshell_protocol::PaneReconcileResult {
         reconcile_id: request.reconcile_id,
         boot_id: state.boot_id.as_ref().clone(),
         server_instance_id: state.server_instance_id.as_ref().clone(),
         verdicts,
     });
+    state.restart.observe_server_message(&mut result);
     send(ws_tx, &result).await
 }
 
@@ -4728,6 +4738,7 @@ mod terminals_changed_tests {
             spawn_gate: std::sync::Arc::new(crate::spawn_gate::SpawnGate::new(4, 64)),
             shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
+            restart: crate::restart::RestartCoordinator::new(),
             config_fallback: None,
             opencode_locator: None,
             codex_locator: None,
@@ -4940,6 +4951,7 @@ mod terminal_meta_created_tests {
             spawn_gate: std::sync::Arc::new(crate::spawn_gate::SpawnGate::new(4, 64)),
             shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
+            restart: crate::restart::RestartCoordinator::new(),
             config_fallback: None,
             opencode_locator: None,
             codex_locator: None,
