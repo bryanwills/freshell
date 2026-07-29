@@ -29,13 +29,16 @@
 - Modify: `crates/freshell-protocol/src/server_messages.rs`
 - Modify: `crates/freshell-protocol/tests/roundtrip.rs`
 - Modify: `crates/freshell-ws/src/lib.rs`
+- Modify: `shared/ws-protocol.ts`
+- Modify: `shared/ws-version.ts` if this needs negotiated-version treatment
+- Regenerate: `port/contract/ws-protocol.schema.json` and the generated contract inventory with `npm run contract:generate`
 - Create: `crates/freshell-ws/src/restart.rs`
 - Test: `crates/freshell-ws/tests/restart_protocol.rs`
 
 **Interfaces:**
 - Produces `agent.restart` with request ID, provider, durable session ID, runtime kind, live runtime identity, and expected runtime generation.
 - Produces broadcast `agent.restart.started`, `agent.restart.replaced`, and `agent.restart.failed` server messages with durable locator, replacement runtime identity, and replacement generation.
-- Produces a server-owned runtime descriptor `{ runtimeId, generation }` on every terminal/fresh-agent create, attach, inventory, reconciliation, and reconnect surface so clients can make a fenced request.
+- Produces a server-owned runtime descriptor `{ runtimeId, generation }` on every terminal/fresh-agent create, attach, inventory, reconciliation, and reconnect surface so clients can make a fenced request. The matrix is terminal `created`, `attach.ready`, inventory and pane-reconcile responses; and fresh-agent `created`, attach/snapshot/reconcile responses plus all runtime-addressed status, snapshot, approval, question, and stream events. Old-generation terminal output/exit and fresh-agent frames are fenced at the client.
 
 - [ ] **Step 1: Write failing Rust protocol and transaction tests**
 
@@ -79,17 +82,17 @@ pub struct AgentRestart {
 }
 ```
 
-Store the descriptor in one Rust runtime-ownership registry and return it in create/attach/inventory/reconcile responses. The event payload must include `requestId`, canonical provider/session, old and replacement generation, and a typed failure code. It must never identify arbitrary panes; clients match the durable runtime identity locally.
+Store the descriptor in one Rust runtime-ownership registry and return it in the matrix above. The event payload must include `requestId`, canonical provider/session, old and replacement generation, and a typed failure code. It must never identify arbitrary panes; clients match the durable runtime identity locally. Update the TypeScript wire authority, Rust discriminant inventories, and generated schema/contracts together; bump the wire version only if compatibility negotiation requires it.
 
 - [ ] **Step 4: Verify green**
 
-Run: `cargo test -p freshell-protocol --test roundtrip && cargo test -p freshell-ws --test restart_protocol`
+Run: `npm run contract:generate && cargo test -p freshell-protocol --test roundtrip && cargo test -p freshell-protocol --test version && cargo test -p freshell-ws --test restart_protocol`
 
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
-Run: `git add crates/freshell-protocol crates/freshell-ws && git commit -m "feat: define Rust agent restart transaction"`
+Run: `git add crates/freshell-protocol crates/freshell-ws shared/ws-protocol.ts shared/ws-version.ts port/contract && git commit -m "feat: define Rust agent restart transaction"`
 
 ### Task 2: Implement Rust provider-safe restart teardown and recovery
 
@@ -213,7 +216,7 @@ Expected: FAIL because restart frames/state do not exist.
 // retain sessionRef, cwd, and settings. Ignore older/equal generations and stale old-runtime frames.
 ```
 
-The replacement is created once by the Rust server; client panes attach/rebind only. Do not add Node backend paths.
+The replacement is created once by the Rust server; client panes attach/rebind only. Do not add Node backend paths. Register one central WebSocket subscription or middleware that folds each replacement exactly once into Redux before effects run: it updates every matching pane's `runtimeId` and numeric `runtimeGeneration`, then sends `terminal.attach` or `freshAgent.attach` for that replacement. The existing per-view `terminal.created` and `freshAgent.created` handlers remain request-ID scoped and must neither mint nor overwrite the replacement runtime.
 Apply the same generation transition to `freshAgentSlice`: remove stale snapshot/stream/approval/question state for the old runtime and accept only replacement-generation events.
 
 - [ ] **Step 4: Verify green**
@@ -224,7 +227,7 @@ Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
-Run: `git add src/lib/ws-client.ts src/lib/pane-utils.ts src/store/paneTypes.ts src/store/panesSlice.ts src/components/TerminalView.tsx src/components/fresh-agent/FreshAgentView.tsx test/unit/client/store/panesSlice.restart-runtime.test.ts test/unit/client/restart-runtime-ws.test.ts && git commit -m "feat: replace all runtime restart viewers"`
+Run: `git add src/lib/ws-client.ts src/lib/pane-utils.ts src/store/paneTypes.ts src/store/panesSlice.ts src/store/freshAgentSlice.ts src/components/TerminalView.tsx src/components/fresh-agent/FreshAgentView.tsx test/unit/client/store/panesSlice.restart-runtime.test.ts test/unit/client/store/freshAgentSlice.restart-runtime.test.ts test/unit/client/restart-runtime-ws.test.ts && git commit -m "feat: replace all runtime restart viewers"`
 
 ### Task 4: Present Restart pane and prevent duplicate session openings
 
@@ -308,13 +311,13 @@ Create: `test/e2e-browser/specs/restart-resumable-pane-rust.spec.ts`
 
 The test must start a scratch Rust server, open two browser clients/panes on one built-in durable session, invoke `Restart pane` in one client, assert one replacement runtime/generation, both viewers attach to it, and an unrelated pane is unchanged.
 
-Run: `cargo test -p freshell-ws --test restart_protocol && npm run test:vitest -- run test/e2e/pane-context-menu-stability.test.tsx test/unit/client/store/panesSlice.restart-runtime.test.ts test/unit/client/restart-runtime-ws.test.ts test/unit/client/components/context-menu/restart-pane-actions.test.ts test/unit/client/components/context-menu/session-open-actions.test.ts --config config/vitest/vitest.config.ts`
+Run: `cargo test -p freshell-ws --test restart_protocol && npm run test:vitest -- run test/e2e/pane-context-menu-stability.test.tsx test/unit/client/store/panesSlice.restart-runtime.test.ts test/unit/client/restart-runtime-ws.test.ts test/unit/client/components/context-menu/restart-pane-actions.test.ts test/unit/client/components/context-menu/session-open-actions.test.ts --config config/vitest/vitest.config.ts && npm run test:e2e:chromium -- test/e2e-browser/specs/restart-resumable-pane-rust.spec.ts --workers=1`
 
 Expected: PASS.
 
 - [ ] **Step 2: Run the coordinated project checks**
 
-Run: `FRESHELL_TEST_SUMMARY='Rust agent restart and duplicate session prevention' npm test && npm run lint && npm run build && cargo test --workspace`
+Run: `FRESHELL_TEST_SUMMARY='Rust agent restart and duplicate session prevention' npm test && npm run lint && npm run build && cargo test --workspace && npm run test:e2e:chromium -- test/e2e-browser/specs/restart-resumable-pane-rust.spec.ts --workers=1`
 
 Expected: PASS.
 
