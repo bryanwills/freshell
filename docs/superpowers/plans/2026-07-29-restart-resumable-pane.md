@@ -39,6 +39,7 @@
 - Produces `agent.restart` with request ID, provider, durable session ID, runtime kind, live runtime identity, and expected runtime generation.
 - Produces broadcast `agent.restart.started`, `agent.restart.replaced`, and `agent.restart.failed` server messages with durable locator, replacement runtime identity, and replacement generation.
 - Produces a server-owned runtime descriptor `{ runtimeId, generation }` on every terminal/fresh-agent create, attach, inventory, reconciliation, and reconnect surface so clients can make a fenced request. The matrix is terminal `created`, `attach.ready`, inventory and pane-reconcile responses; and fresh-agent `created`, attach/snapshot/reconcile responses plus all runtime-addressed status, snapshot, approval, question, and stream events. Old-generation terminal output/exit and fresh-agent frames are fenced at the client.
+- Keeps a client in-flight request until its terminal `replaced` or `failed` result. On reconnect after `ready`, resend the byte-identical request ID and fingerprint; the server replays its persisted terminal result and never runs the transaction twice.
 
 - [ ] **Step 1: Write failing Rust protocol and transaction tests**
 
@@ -61,6 +62,9 @@ async fn unresumable_restart_fails_without_stopping_the_live_runtime() {
 
 #[tokio::test]
 async fn runtime_generation_is_stable_across_attach_and_reconnect_and_changes_on_replacement() { /* create → attach → reconnect → restart */ }
+
+#[tokio::test]
+async fn resend_after_requester_disconnect_replays_the_stored_terminal_result() { /* same requestId/fingerprint, no second teardown */ }
 ```
 
 - [ ] **Step 2: Verify red**
@@ -200,6 +204,8 @@ it('clears stale fresh-agent snapshot, approval, question, and activity state be
   dispatch(applyAgentRestartReplaced(freshCodexReplacement))
   expect(selectFreshState('codex', 's1')).toMatchObject({ generation: 8, pendingApprovals: {}, pendingQuestions: {} })
 })
+
+it('resends an in-flight restart after ready and folds the stored terminal result once', () => { /* disconnect → ready → same requestId → one replacement */ })
 ```
 
 - [ ] **Step 2: Verify red**
@@ -323,6 +329,6 @@ Expected: PASS.
 
 - [ ] **Step 3: Inspect and commit verification corrections**
 
-Run: `git diff --check origin/main...HEAD && git status --short && git add -A && git commit -m "test: verify Rust agent restart flow"`
+Run: `git diff --check origin/main...HEAD && git status --short && git add crates/freshell-protocol crates/freshell-ws crates/freshell-terminal crates/freshell-freshagent shared src test docs/index.html test/e2e-browser/specs/restart-resumable-pane-rust.spec.ts port/contract && git commit -m "test: verify Rust agent restart flow"`
 
-Expected: diff check is silent; commit only if verification required changes.
+Expected: diff check is silent; commit only if verification changed one of those scoped feature files. Never use `git add -A` in this shared worktree.
