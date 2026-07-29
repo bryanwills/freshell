@@ -4,7 +4,7 @@
 
 **Goal:** Replace the right-click Refresh action with a safe, runtime-scoped Restart action for resumable coding-agent panes, while preventing a durable session from being opened twice in the current Freshell workspace.
 
-**Architecture:** The browser asks the production Rust server to restart a durable provider session using an immutable runtime generation and session locator. The Rust server serializes the operation, preflights resumption, stops the old runtime without final-close semantics, and broadcasts a correlated replacement event to every viewer of that runtime/session. Client reducers generation-fence that event and replace every matching terminal or fresh-agent pane with a new create request that uses existing provider-specific resume creation. Separately, the UI removes duplicate-opening actions whenever the current workspace already has that provider/session open.
+**Architecture:** The browser asks the production Rust server to restart a durable provider session using an immutable runtime generation and session locator. The Rust server serializes the operation, captures the authoritative resume plan, stops the old runtime without final-close semantics, creates one provider-specific replacement itself, and broadcasts that committed replacement to every viewer. Client reducers generation-fence the event and attach every matching local pane to the server-created replacement. Separately, the UI removes duplicate-opening actions whenever the current workspace already has that provider/session open.
 
 **Tech Stack:** React 18, Redux Toolkit, TypeScript, Rust, Axum/WebSocket, `freshell-protocol`, `freshell-ws`, `freshell-terminal`, `freshell-freshagent`, Vitest, Rust integration tests.
 
@@ -13,9 +13,10 @@
 - The Node server is being retired; target the Rust server for all work. Do not modify Node-server implementation or add Node-server tests.
 - `Restart pane` targets the selected pane’s underlying agent runtime/session. Every current viewer of that same runtime/session follows its replacement; unrelated panes and sessions remain untouched.
 - Offer `Restart pane` only to resumable terminal/fresh-agent panes with provider-matching canonical durable identity. Shell/browser/editor/extension/non-resumable panes retain `Refresh pane`.
+- Restart is limited to built-in providers that implement the tested Rust restart contract. Arbitrary/custom extension panes retain `Refresh pane` even when their manifest exposes resume arguments.
 - The Rust restart transaction must be ordered, idempotent, generation/race fenced, recoverable on failure, and emit structured logs.
 - Preflight resume eligibility before stopping a live runtime. If it cannot be resumed, leave the runtime running and return a visible failure.
-- Preserve durable session identity and relevant provider routing/settings across restart; use existing provider-specific create/resume paths rather than duplicating CLI arguments or SDK resume behavior.
+- Preserve durable session identity and relevant provider routing/settings across restart; the Rust server uses existing provider-specific create/resume paths rather than duplicating CLI arguments or SDK resume behavior.
 - Do not silently close duplicate or cross-client views. Normal sidebar selection focuses an existing pane. Sidebar context menus hide `Open in new tab` and `Open in this tab` for already-open sessions; `Open all sessions` opens only sessions not already open and reports when none remain.
 - Add Rust protocol/integration coverage plus client unit/e2e coverage. Update `docs/index.html`.
 
@@ -33,7 +34,7 @@
 
 **Interfaces:**
 - Produces `agent.restart` with request ID, provider, durable session ID, runtime kind, live runtime identity, and expected runtime generation.
-- Produces broadcast `agent.restart.started`, `agent.restart.replaced`, and `agent.restart.failed` server messages with durable locator and replacement generation.
+- Produces broadcast `agent.restart.started`, `agent.restart.replaced`, and `agent.restart.failed` server messages with durable locator, replacement runtime identity, and replacement generation.
 
 - [ ] **Step 1: Write failing Rust protocol and transaction tests**
 
@@ -156,14 +157,14 @@ Run: `git add crates/freshell-ws crates/freshell-terminal crates/freshell-fresha
 
 **Interfaces:**
 - Consumes the Rust `agent.restart.*` frames.
-- Produces `requestAgentRestart`, generation-fenced replacement state, and a new create request for every local pane whose provider/durable session matches the replaced runtime.
+- Produces `requestAgentRestart`, generation-fenced replacement state, and an attach/rebind to the one server-created runtime for every local pane whose provider/durable session matches the replaced runtime.
 
 - [ ] **Step 1: Write failing reducer and transport tests**
 
 ```ts
-it('replaces every local viewer of the restarted runtime and no unrelated pane', () => {
+it('rebinds every local viewer to the server-created replacement and no unrelated pane', () => {
   dispatch(applyAgentRestartReplaced({ provider: 'claude', sessionId: 's1', oldGeneration: 7, generation: 8 }))
-  expect(createRequestIdsFor('claude', 's1')).toHaveLength(2)
+  expect(terminalIdsFor('claude', 's1')).toEqual(['replacement-1', 'replacement-1'])
   expect(contentFor('pane-other').createRequestId).toBe('unchanged')
 })
 
@@ -183,12 +184,12 @@ Expected: FAIL because restart frames/state do not exist.
 - [ ] **Step 3: Implement durable-session matching and generation fences**
 
 ```ts
-// Match only pane content whose sessionRef provider/session equals the broadcast locator.
-// Set restart generation before clearing live identities; mint one createRequestId per
-// matching pane and retain sessionRef, cwd, and settings. Ignore older/equal generations.
+// Match only pane content whose provider/session/kind/flavor equals the broadcast locator.
+// Set restart generation before replacing live identities with the server-created runtime;
+// retain sessionRef, cwd, and settings. Ignore older/equal generations and stale old-runtime frames.
 ```
 
-Existing `terminal.create` and `freshAgent.create` builders must perform the actual resume; do not add Node backend paths.
+The replacement is created once by the Rust server; client panes attach/rebind only. Do not add Node backend paths.
 
 - [ ] **Step 4: Verify green**
 
