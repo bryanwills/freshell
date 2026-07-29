@@ -35,6 +35,7 @@
 **Interfaces:**
 - Produces `agent.restart` with request ID, provider, durable session ID, runtime kind, live runtime identity, and expected runtime generation.
 - Produces broadcast `agent.restart.started`, `agent.restart.replaced`, and `agent.restart.failed` server messages with durable locator, replacement runtime identity, and replacement generation.
+- Produces a server-owned runtime descriptor `{ runtimeId, generation }` on every terminal/fresh-agent create, attach, inventory, reconciliation, and reconnect surface so clients can make a fenced request.
 
 - [ ] **Step 1: Write failing Rust protocol and transaction tests**
 
@@ -54,6 +55,9 @@ async fn unresumable_restart_fails_without_stopping_the_live_runtime() {
     assert_eq!(next(&mut ws).await["type"], "agent.restart.failed");
     assert!(terminal_is_running("term-1").await);
 }
+
+#[tokio::test]
+async fn runtime_generation_is_stable_across_attach_and_reconnect_and_changes_on_replacement() { /* create → attach → reconnect → restart */ }
 ```
 
 - [ ] **Step 2: Verify red**
@@ -75,7 +79,7 @@ pub struct AgentRestart {
 }
 ```
 
-The event payload must include `requestId`, canonical provider/session, old and replacement generation, and a typed failure code. It must never identify arbitrary panes; clients match the durable runtime identity locally.
+Store the descriptor in one Rust runtime-ownership registry and return it in create/attach/inventory/reconcile responses. The event payload must include `requestId`, canonical provider/session, old and replacement generation, and a typed failure code. It must never identify arbitrary panes; clients match the durable runtime identity locally.
 
 - [ ] **Step 4: Verify green**
 
@@ -102,6 +106,7 @@ Run: `git add crates/freshell-protocol crates/freshell-ws && git commit -m "feat
 **Interfaces:**
 - Consumes `AgentRestart` and a provider-specific durable existence/resume preflight.
 - Produces `shutdown_for_restart` completion only after old-session routes are quiescent; retains restartable durable identity while avoiding normal final-close retirement.
+- Produces a persisted/replayable transaction result keyed by request ID plus canonical request fingerprint; a different payload reusing a request ID is rejected.
 
 - [ ] **Step 1: Add failing provider-matrix tests**
 
@@ -114,6 +119,18 @@ async fn fresh_agent_restart_quiesces_old_route_before_same_session_resume() { /
 
 #[tokio::test]
 async fn duplicate_restart_request_replays_one_terminal_result() { /* one shutdown, one replacement generation */ }
+
+#[tokio::test]
+async fn concurrent_distinct_restart_requests_share_one_transaction_and_reconnect_replays_its_terminal_result() { /* two clients */ }
+
+#[tokio::test]
+async fn replacement_spawn_failure_enters_retryable_recovery_without_losing_the_durable_session() { /* injected provider failure → retry → replacement */ }
+
+#[test]
+fn restart_eligibility_matrix_accepts_only_supported_builtins_with_matching_canonical_identity() {
+    // terminal Claude/Codex/OpenCode/Amplifier and fresh Claude/Kilroy/Codex/OpenCode;
+    // reject mismatched provider, missing identity, unsupported built-in, and custom extension.
+}
 ```
 
 - [ ] **Step 2: Verify red**
@@ -131,7 +148,7 @@ trait RestartableRuntime {
 }
 ```
 
-Keep durable locator, cwd, and provider settings in `ResumePlan`; reserve the session/runtime generation while shutdown runs; suppress expected-exit auto-resume; emit replacement only after child/session route retirement. On failure after a successful preflight, retain a recoverable state and broadcast failure rather than silently starting a different session.
+Keep durable locator, cwd, and provider settings in `ResumePlan`; reserve the session/runtime generation while shutdown runs; suppress expected-exit auto-resume; emit replacement only after child/session route retirement. Persist `preflighted`, `retired`, `replacement-failed`, and `replaced` transaction states. A replacement failure keeps the durable ResumePlan and a retryable transaction result, releases only the old runtime lease, and accepts an idempotent retry; it never silently starts a different session.
 
 - [ ] **Step 4: Verify green**
 
@@ -150,10 +167,12 @@ Run: `git add crates/freshell-ws crates/freshell-terminal crates/freshell-fresha
 - Modify: `src/lib/pane-utils.ts`
 - Modify: `src/store/paneTypes.ts`
 - Modify: `src/store/panesSlice.ts`
+- Modify: `src/store/freshAgentSlice.ts`
 - Modify: `src/components/TerminalView.tsx`
 - Modify: `src/components/fresh-agent/FreshAgentView.tsx`
 - Test: `test/unit/client/store/panesSlice.restart-runtime.test.ts`
 - Test: `test/unit/client/restart-runtime-ws.test.ts`
+- Test: `test/unit/client/store/freshAgentSlice.restart-runtime.test.ts`
 
 **Interfaces:**
 - Consumes the Rust `agent.restart.*` frames.
@@ -173,6 +192,11 @@ it('drops stale restart events and never creates twice for a duplicate replaceme
   deliverRestartReplaced({ oldGeneration: 7, generation: 8 })
   expect(createMessages()).toHaveLength(1)
 })
+
+it('clears stale fresh-agent snapshot, approval, question, and activity state before accepting the replacement generation', () => {
+  dispatch(applyAgentRestartReplaced(freshCodexReplacement))
+  expect(selectFreshState('codex', 's1')).toMatchObject({ generation: 8, pendingApprovals: {}, pendingQuestions: {} })
+})
 ```
 
 - [ ] **Step 2: Verify red**
@@ -190,6 +214,7 @@ Expected: FAIL because restart frames/state do not exist.
 ```
 
 The replacement is created once by the Rust server; client panes attach/rebind only. Do not add Node backend paths.
+Apply the same generation transition to `freshAgentSlice`: remove stale snapshot/stream/approval/question state for the old runtime and accept only replacement-generation events.
 
 - [ ] **Step 4: Verify green**
 
@@ -232,6 +257,11 @@ it('hides both duplicate-open actions when the session is already open anywhere'
   expect(labelsFor(openSessionContext)).not.toContain('Open in this tab')
 })
 
+it('keeps Refresh pane for a custom extension even when it advertises resume arguments', () => {
+  expect(labelsFor(resumableCustomExtension)).toContain('Refresh pane')
+  expect(labelsFor(resumableCustomExtension)).not.toContain('Restart pane')
+})
+
 it('open all sessions opens only missing sessions and reports when every session is already open', () => {
   expect(openedSessionIds()).toEqual(['not-open'])
   expect(notice()).toMatch(/already open/i)
@@ -272,7 +302,11 @@ Run: `git add src/components/context-menu src/components/Sidebar.tsx src/store/t
 - Test: `test/e2e/pane-context-menu-stability.test.tsx`
 - Test: all focused restart and duplicate-session tests above
 
-- [ ] **Step 1: Add and run a Rust-backed browser smoke test**
+- [ ] **Step 1: Add and run a live Rust/browser smoke test**
+
+Create: `test/e2e-browser/specs/restart-resumable-pane-rust.spec.ts`
+
+The test must start a scratch Rust server, open two browser clients/panes on one built-in durable session, invoke `Restart pane` in one client, assert one replacement runtime/generation, both viewers attach to it, and an unrelated pane is unchanged.
 
 Run: `cargo test -p freshell-ws --test restart_protocol && npm run test:vitest -- run test/e2e/pane-context-menu-stability.test.tsx test/unit/client/store/panesSlice.restart-runtime.test.ts test/unit/client/restart-runtime-ws.test.ts test/unit/client/components/context-menu/restart-pane-actions.test.ts test/unit/client/components/context-menu/session-open-actions.test.ts --config config/vitest/vitest.config.ts`
 
