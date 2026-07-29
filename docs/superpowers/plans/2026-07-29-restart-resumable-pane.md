@@ -1,250 +1,290 @@
-# Restart Resumable Pane Implementation Plan
+# Restart Resumable Agent Runtime Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Let a context menu restart only its clicked resumable coding-agent pane, ending its live runtime and reopening the same durable conversation through the existing provider resume path.
+**Goal:** Replace the right-click Refresh action with a safe, runtime-scoped Restart action for resumable coding-agent panes, while preventing a durable session from being opened twice in the current Freshell workspace.
 
-**Architecture:** Add a pane-scoped restart intent with a snapshot of the matched pane’s canonical provider/session identity. Terminal and fresh-agent lifecycle code will consume it through an acknowledged server operation that terminates the current runtime before re-minting that same leaf’s create request; their existing creation paths remain responsible for provider-specific resume. Menu definitions select this intent only when an agent pane has a provider-matching durable session reference; all other panes keep the non-destructive refresh action.
+**Architecture:** The browser asks the production Rust server to restart a durable provider session using an immutable runtime generation and session locator. The Rust server serializes the operation, preflights resumption, stops the old runtime without final-close semantics, and broadcasts a correlated replacement event to every viewer of that runtime/session. Client reducers generation-fence that event and replace every matching terminal or fresh-agent pane with a new create request that uses existing provider-specific resume creation. Separately, the UI removes duplicate-opening actions whenever the current workspace already has that provider/session open.
 
-**Tech Stack:** React 18, Redux Toolkit, TypeScript, WebSocket, node-pty, Vitest, Testing Library.
+**Tech Stack:** React 18, Redux Toolkit, TypeScript, Rust, Axum/WebSocket, `freshell-protocol`, `freshell-ws`, `freshell-terminal`, `freshell-freshagent`, Vitest, Rust integration tests.
 
 ## Global Constraints
 
-- The action affects exactly the right-clicked pane, never its tab or sibling panes.
-- `Restart pane` appears only for terminal and fresh-agent coding-agent panes with a provider-matching canonical durable session reference and provider resume support.
-- Shutdown must finish before the normal resume create path begins; resume arguments/adapters must not be duplicated.
-- Shells, browsers, editors, extensions, non-resumable providers, and panes without canonical identity retain `Refresh pane`.
-- Preserve existing `Refresh pane` behavior.
-- Cover menu selection, pane isolation, terminal restart, fresh-agent restart, and non-eligible fallback behavior.
+- The Node server is being retired; target the Rust server for all work. Do not modify Node-server implementation or add Node-server tests.
+- `Restart pane` targets the selected pane’s underlying agent runtime/session. Every current viewer of that same runtime/session follows its replacement; unrelated panes and sessions remain untouched.
+- Offer `Restart pane` only to resumable terminal/fresh-agent panes with provider-matching canonical durable identity. Shell/browser/editor/extension/non-resumable panes retain `Refresh pane`.
+- The Rust restart transaction must be ordered, idempotent, generation/race fenced, recoverable on failure, and emit structured logs.
+- Preflight resume eligibility before stopping a live runtime. If it cannot be resumed, leave the runtime running and return a visible failure.
+- Preserve durable session identity and relevant provider routing/settings across restart; use existing provider-specific create/resume paths rather than duplicating CLI arguments or SDK resume behavior.
+- Do not silently close duplicate or cross-client views. Normal sidebar selection focuses an existing pane. Sidebar context menus hide `Open in new tab` and `Open in this tab` for already-open sessions; `Open all sessions` opens only sessions not already open and reports when none remain.
+- Add Rust protocol/integration coverage plus client unit/e2e coverage. Update `docs/index.html`.
 
 ---
 
-### Task 1: Represent and queue a pane-scoped restart request
+### Task 1: Define the Rust restart transaction protocol and lifecycle contract
 
 **Files:**
-- Modify: `src/store/paneTypes.ts`
-- Modify: `src/lib/pane-utils.ts`
-- Modify: `src/store/panesSlice.ts`
-- Test: `test/unit/client/store/panesSlice.restart-pane.test.ts`
+- Modify: `crates/freshell-protocol/src/client_messages.rs`
+- Modify: `crates/freshell-protocol/src/server_messages.rs`
+- Modify: `crates/freshell-protocol/tests/roundtrip.rs`
+- Modify: `crates/freshell-ws/src/lib.rs`
+- Create: `crates/freshell-ws/src/restart.rs`
+- Test: `crates/freshell-ws/tests/restart_protocol.rs`
 
 **Interfaces:**
-- Produces `PaneRestartTarget`, `buildPaneRestartTarget(content, extensions)`, `paneRestartTargetMatchesContent(target, content)`, `requestPaneRestart({ tabId, paneId })`, and `consumePaneRestartRequest({ tabId, paneId, requestId })`.
+- Produces `agent.restart` with request ID, provider, durable session ID, runtime kind, live runtime identity, and expected runtime generation.
+- Produces broadcast `agent.restart.started`, `agent.restart.replaced`, and `agent.restart.failed` server messages with durable locator and replacement generation.
 
-- [ ] **Step 1: Write failing target/reducer tests**
+- [ ] **Step 1: Write failing Rust protocol and transaction tests**
 
-```ts
-it('queues a restart only for the requested matching terminal leaf', () => {
-  const next = reducer(twoPaneState(), requestPaneRestart({ tabId: 'tab-1', paneId: 'pane-2' }))
-  expect(next.restartRequestsByPane['tab-1']['pane-2'].target).toMatchObject({
-    kind: 'terminal', provider: 'claude', sessionId: 'session-2', terminalId: 'term-2',
-  })
-  expect(next.restartRequestsByPane['tab-1']['pane-1']).toBeUndefined()
-})
+```rust
+#[tokio::test]
+async fn restart_preflights_before_stopping_the_selected_runtime() {
+    let mut ws = running_resumable_terminal().await;
+    send(&mut ws, restart("r1", "claude", "durable-1", "term-1", 7)).await;
+    assert_eq!(next(&mut ws).await["type"], "agent.restart.started");
+    assert_eq!(next(&mut ws).await["type"], "agent.restart.replaced");
+}
+
+#[tokio::test]
+async fn unresumable_restart_fails_without_stopping_the_live_runtime() {
+    let mut ws = running_terminal_with_missing_durable_artifact().await;
+    send(&mut ws, restart("r1", "claude", "missing", "term-1", 7)).await;
+    assert_eq!(next(&mut ws).await["type"], "agent.restart.failed");
+    assert!(terminal_is_running("term-1").await);
+}
 ```
 
 - [ ] **Step 2: Verify red**
 
-Run: `npm run test:vitest -- run test/unit/client/store/panesSlice.restart-pane.test.ts --config config/vitest/vitest.config.ts`
+Run: `cargo test -p freshell-protocol --test roundtrip && cargo test -p freshell-ws --test restart_protocol`
 
-Expected: FAIL because restart targets/actions do not exist.
+Expected: FAIL because no restart frames or transaction exist.
 
-- [ ] **Step 3: Implement target and reducer**
+- [ ] **Step 3: Implement typed, correlated protocol contracts**
 
-```ts
-type PaneRestartTarget = {
-  kind: 'terminal' | 'fresh-agent'
-  createRequestId: string
-  provider: string
-  sessionId: string
-  terminalId?: string
-  liveSessionId?: string
+```rust
+pub struct AgentRestart {
+    pub request_id: String,
+    pub provider: String,
+    pub session_id: String,
+    pub kind: AgentRuntimeKind,
+    pub live_id: String,
+    pub expected_generation: u64,
 }
-// Require matching sessionRef plus live identity, queue it under
-// restartRequestsByPane[tabId][paneId], and clear stale requests on content changes.
 ```
+
+The event payload must include `requestId`, canonical provider/session, old and replacement generation, and a typed failure code. It must never identify arbitrary panes; clients match the durable runtime identity locally.
 
 - [ ] **Step 4: Verify green**
 
-Run: `npm run test:vitest -- run test/unit/client/store/panesSlice.restart-pane.test.ts --config config/vitest/vitest.config.ts`
+Run: `cargo test -p freshell-protocol --test roundtrip && cargo test -p freshell-ws --test restart_protocol`
 
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
-Run: `git add src/store/paneTypes.ts src/lib/pane-utils.ts src/store/panesSlice.ts test/unit/client/store/panesSlice.restart-pane.test.ts && git commit -m "feat: queue pane-scoped restart requests"`
+Run: `git add crates/freshell-protocol crates/freshell-ws && git commit -m "feat: define Rust agent restart transaction"`
 
-### Task 2: Make runtime termination and resume creation one ordered protocol
+### Task 2: Implement Rust provider-safe restart teardown and recovery
+
+**Files:**
+- Modify: `crates/freshell-ws/src/terminal.rs`
+- Modify: `crates/freshell-ws/src/auto_resume.rs`
+- Modify: `crates/freshell-terminal/src/registry.rs`
+- Modify: `crates/freshell-freshagent/src/lib.rs`
+- Modify: `crates/freshell-freshagent/src/claude.rs`
+- Modify: `crates/freshell-freshagent/src/codex.rs`
+- Modify: `crates/freshell-freshagent/src/opencode_ws.rs`
+- Test: `crates/freshell-ws/tests/restart_protocol.rs`
+
+**Interfaces:**
+- Consumes `AgentRestart` and a provider-specific durable existence/resume preflight.
+- Produces `shutdown_for_restart` completion only after old-session routes are quiescent; retains restartable durable identity while avoiding normal final-close retirement.
+
+- [ ] **Step 1: Add failing provider-matrix tests**
+
+```rust
+#[tokio::test]
+async fn terminal_restart_preserves_session_binding_and_suppresses_auto_resume() { /* fixture proves old exit cannot auto-resume */ }
+
+#[tokio::test]
+async fn fresh_agent_restart_quiesces_old_route_before_same_session_resume() { /* fixture proves old sidecar/session route is not reused */ }
+
+#[tokio::test]
+async fn duplicate_restart_request_replays_one_terminal_result() { /* one shutdown, one replacement generation */ }
+```
+
+- [ ] **Step 2: Verify red**
+
+Run: `cargo test -p freshell-ws --test restart_protocol`
+
+Expected: FAIL because final-close/interrupt behavior is not restart-safe.
+
+- [ ] **Step 3: Implement restart-specific lifecycle primitives**
+
+```rust
+trait RestartableRuntime {
+    async fn preflight_resume(&self, locator: &SessionLocator) -> Result<ResumePlan, RestartError>;
+    async fn shutdown_for_restart(&self, expected_generation: u64) -> Result<RetiredRuntime, RestartError>;
+}
+```
+
+Keep durable locator, cwd, and provider settings in `ResumePlan`; reserve the session/runtime generation while shutdown runs; suppress expected-exit auto-resume; emit replacement only after child/session route retirement. On failure after a successful preflight, retain a recoverable state and broadcast failure rather than silently starting a different session.
+
+- [ ] **Step 4: Verify green**
+
+Run: `cargo test -p freshell-ws --test restart_protocol && cargo test -p freshell-terminal && cargo test -p freshell-freshagent`
+
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+Run: `git add crates/freshell-ws crates/freshell-terminal crates/freshell-freshagent && git commit -m "feat: restart Rust agent runtimes safely"`
+
+### Task 3: Fold runtime replacement in all matching client panes
 
 **Files:**
 - Modify: `src/lib/ws-client.ts`
-- Modify: `server/ws-handler.ts`
-- Modify: `server/terminal-registry.ts` (if a registry helper is needed)
-- Modify: `server/fresh-agent/runtime-manager.ts` (if a manager helper is needed)
-- Test: `test/integration/server/pane-restart-protocol.test.ts`
-
-**Interfaces:**
-- Consumes an authenticated pane identity, current terminal/fresh-agent live identity, and canonical session reference.
-- Produces a success/failure acknowledgement only after terminal kill or fresh-agent interruption has completed.
-
-- [ ] **Step 1: Write failing protocol tests**
-
-```ts
-it('kills the named terminal before acknowledging restart', async () => {
-  await sendRestart({ tabId: 'tab-1', paneId: 'pane-2', terminalId: 'term-2' })
-  expect(events).toEqual(['kill:term-2', 'restart-ack'])
-  expect(registry.killAndWait).not.toHaveBeenCalledWith('term-1')
-})
-```
-
-- [ ] **Step 2: Verify red**
-
-Run: `npm run test:vitest -- run test/integration/server/pane-restart-protocol.test.ts --config config/vitest/vitest.server.config.ts`
-
-Expected: FAIL because the restart protocol does not exist.
-
-- [ ] **Step 3: Implement an acknowledged restart operation**
-
-```ts
-// Validate and authorize the immutable target using existing ownership checks.
-// Await registry.killAndWait or runtimeManager.interrupt, log JSONL outcome,
-// then send pane.restart.ready with the restart request ID.
-```
-
-- [ ] **Step 4: Verify green**
-
-Run: `npm run test:vitest -- run test/integration/server/pane-restart-protocol.test.ts --config config/vitest/vitest.server.config.ts`
-
-Expected: PASS.
-
-- [ ] **Step 5: Commit**
-
-Run: `git add src/lib/ws-client.ts server/ws-handler.ts server/terminal-registry.ts server/fresh-agent/runtime-manager.ts test/integration/server/pane-restart-protocol.test.ts && git commit -m "feat: add ordered pane restart protocol"`
-
-### Task 3: Consume a ready restart in terminal and fresh-agent lifecycle code
-
-**Files:**
+- Modify: `src/lib/pane-utils.ts`
+- Modify: `src/store/paneTypes.ts`
+- Modify: `src/store/panesSlice.ts`
 - Modify: `src/components/TerminalView.tsx`
 - Modify: `src/components/fresh-agent/FreshAgentView.tsx`
-- Modify: `src/store/panesSlice.ts`
-- Test: `test/unit/client/components/TerminalView.restart-pane.test.tsx`
-- Test: `test/unit/client/components/fresh-agent/FreshAgentView.restart-pane.test.tsx`
+- Test: `test/unit/client/store/panesSlice.restart-runtime.test.ts`
+- Test: `test/unit/client/restart-runtime-ws.test.ts`
 
 **Interfaces:**
-- Consumes the matched restart request and `pane.restart.ready` acknowledgement.
-- Produces a new `createRequestId`, clears only the live runtime identity, retains `sessionRef`/resume identity, and consumes the request.
+- Consumes the Rust `agent.restart.*` frames.
+- Produces `requestAgentRestart`, generation-fenced replacement state, and a new create request for every local pane whose provider/durable session matches the replaced runtime.
 
-- [ ] **Step 1: Write failing view tests**
+- [ ] **Step 1: Write failing reducer and transport tests**
 
-```tsx
-it('recreates only the restarted terminal with its same canonical session reference', async () => {
-  dispatch(requestPaneRestart({ tabId: 'tab-1', paneId: 'pane-2' }))
-  deliverRestartReady('pane-2')
-  await waitFor(() => expect(lastTerminalCreate()).toMatchObject({
-    mode: 'claude', sessionRef: { provider: 'claude', sessionId: 'session-2' }, restore: true,
-  }))
-  expect(lastTerminalCreate()).not.toMatchObject({ paneId: 'pane-1' })
+```ts
+it('replaces every local viewer of the restarted runtime and no unrelated pane', () => {
+  dispatch(applyAgentRestartReplaced({ provider: 'claude', sessionId: 's1', oldGeneration: 7, generation: 8 }))
+  expect(createRequestIdsFor('claude', 's1')).toHaveLength(2)
+  expect(contentFor('pane-other').createRequestId).toBe('unchanged')
+})
+
+it('drops stale restart events and never creates twice for a duplicate replacement event', () => {
+  deliverRestartReplaced({ oldGeneration: 7, generation: 8 })
+  deliverRestartReplaced({ oldGeneration: 7, generation: 8 })
+  expect(createMessages()).toHaveLength(1)
 })
 ```
 
 - [ ] **Step 2: Verify red**
 
-Run: `npm run test:vitest -- run test/unit/client/components/TerminalView.restart-pane.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.restart-pane.test.tsx --config config/vitest/vitest.config.ts`
+Run: `npm run test:vitest -- run test/unit/client/store/panesSlice.restart-runtime.test.ts test/unit/client/restart-runtime-ws.test.ts --config config/vitest/vitest.config.ts`
 
-Expected: FAIL because views only handle refresh requests.
+Expected: FAIL because restart frames/state do not exist.
 
-- [ ] **Step 3: Implement matched, resume-preserving replacement**
+- [ ] **Step 3: Implement durable-session matching and generation fences**
 
 ```ts
-// On pane.restart.ready, match target/current content, mint a new createRequestId,
-// clear terminalId or fresh sessionId, set status:'creating' and
-// pendingReconcile:'respawn', retaining canonical sessionRef. Existing creation
-// functions then use their normal provider resume routes.
+// Match only pane content whose sessionRef provider/session equals the broadcast locator.
+// Set restart generation before clearing live identities; mint one createRequestId per
+// matching pane and retain sessionRef, cwd, and settings. Ignore older/equal generations.
 ```
+
+Existing `terminal.create` and `freshAgent.create` builders must perform the actual resume; do not add Node backend paths.
 
 - [ ] **Step 4: Verify green**
 
-Run: `npm run test:vitest -- run test/unit/client/components/TerminalView.restart-pane.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.restart-pane.test.tsx --config config/vitest/vitest.config.ts`
+Run: `npm run test:vitest -- run test/unit/client/store/panesSlice.restart-runtime.test.ts test/unit/client/restart-runtime-ws.test.ts --config config/vitest/vitest.config.ts`
 
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
-Run: `git add src/components/TerminalView.tsx src/components/fresh-agent/FreshAgentView.tsx src/store/panesSlice.ts test/unit/client/components/TerminalView.restart-pane.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.restart-pane.test.tsx && git commit -m "feat: resume panes after ordered restart"`
+Run: `git add src/lib/ws-client.ts src/lib/pane-utils.ts src/store/paneTypes.ts src/store/panesSlice.ts src/components/TerminalView.tsx src/components/fresh-agent/FreshAgentView.tsx test/unit/client/store/panesSlice.restart-runtime.test.ts test/unit/client/restart-runtime-ws.test.ts && git commit -m "feat: replace all runtime restart viewers"`
 
-### Task 4: Replace the eligible context-menu item and document it
+### Task 4: Present Restart pane and prevent duplicate session openings
 
 **Files:**
 - Modify: `src/components/context-menu/menu-defs.ts`
 - Modify: `src/components/context-menu/ContextMenuProvider.tsx`
-- Modify: `test/e2e/pane-context-menu-stability.test.tsx`
-- Create: `test/unit/client/components/context-menu/restart-pane-actions.test.ts`
+- Modify: `src/components/Sidebar.tsx`
+- Modify: `src/store/tabsSlice.ts`
+- Modify: `src/lib/session-utils.ts`
 - Modify: `docs/index.html`
+- Test: `test/unit/client/components/context-menu/restart-pane-actions.test.ts`
+- Test: `test/unit/client/components/context-menu/session-open-actions.test.ts`
+- Test: `test/e2e/pane-context-menu-stability.test.tsx`
 
 **Interfaces:**
-- Consumes `buildPaneRestartTarget` and `requestPaneRestart`.
-- Produces `MenuActions.restartPane(tabId, paneId)` and `restart-pane`/`Restart pane` for eligible pane, terminal, and fresh-agent contexts.
+- Consumes resumable pane eligibility and `findPaneForSession` across the current workspace.
+- Produces `restartPane` context action and open-session menu actions only when no matching provider/durable session is currently open.
 
-- [ ] **Step 1: Write failing menu tests**
+- [ ] **Step 1: Write failing UI tests**
 
 ```ts
-it('replaces Refresh pane with Restart pane for resumable terminal and fresh-agent panes', () => {
-  expect(labelsFor(resumableClaudeTerminal)).toContain('Restart pane')
-  expect(labelsFor(resumableFreshCodex)).toContain('Restart pane')
-  expect(labelsFor(resumableClaudeTerminal)).not.toContain('Refresh pane')
+it('shows Restart pane instead of Refresh pane only for a resumable agent pane', () => {
+  expect(labelsFor(resumableTerminal)).toContain('Restart pane')
+  expect(labelsFor(resumableFreshAgent)).toContain('Restart pane')
+  expect(labelsFor(shellPane)).toContain('Refresh pane')
 })
 
-it('keeps Refresh pane for shell, browser, and unbound/non-resumable agent panes', () => {
-  expect(labelsFor(shellPane)).toContain('Refresh pane')
-  expect(labelsFor(browserPane)).toContain('Refresh pane')
-  expect(labelsFor(unboundAgentPane)).toContain('Refresh pane')
+it('hides both duplicate-open actions when the session is already open anywhere', () => {
+  expect(labelsFor(openSessionContext)).not.toContain('Open in new tab')
+  expect(labelsFor(openSessionContext)).not.toContain('Open in this tab')
+})
+
+it('open all sessions opens only missing sessions and reports when every session is already open', () => {
+  expect(openedSessionIds()).toEqual(['not-open'])
+  expect(notice()).toMatch(/already open/i)
 })
 ```
 
 - [ ] **Step 2: Verify red**
 
-Run: `npm run test:vitest -- run test/unit/client/components/context-menu/restart-pane-actions.test.ts test/e2e/pane-context-menu-stability.test.tsx --config config/vitest/vitest.config.ts`
+Run: `npm run test:vitest -- run test/unit/client/components/context-menu/restart-pane-actions.test.ts test/unit/client/components/context-menu/session-open-actions.test.ts test/e2e/pane-context-menu-stability.test.tsx --config config/vitest/vitest.config.ts`
 
-Expected: FAIL because menu definitions always select Refresh pane.
+Expected: FAIL because Refresh/open actions are unconditional.
 
-- [ ] **Step 3: Implement shared lifecycle-item selection**
+- [ ] **Step 3: Implement menu policy and duplicate filtering**
 
 ```ts
-const lifecycleItem = restartTarget
-  ? { type: 'item', id: 'restart-pane', label: 'Restart pane', onSelect: () => actions.restartPane(tabId, paneId) }
-  : { type: 'item', id: 'refresh-pane', label: 'Refresh pane', onSelect: () => actions.refreshPane(tabId, paneId), disabled: !canRefreshPane }
+const alreadyOpen = Boolean(findPaneForSession(state, { provider, sessionId }, localServerInstanceId))
+const lifecycleItem = resumableRuntime
+  ? restartPaneItem(tabId, paneId)
+  : refreshPaneItem(tabId, paneId)
 ```
 
-Use the helper in pane header, terminal body, and fresh-agent menu targets. Add the equivalent static user-facing note to `docs/index.html`.
+Use `alreadyOpen` consistently in sidebar-session context menus, `Open all sessions`, and action callbacks (callbacks must re-check current state). Keep normal sidebar selection’s focus-existing behavior. Document the new Restart action and duplicate-open behavior in `docs/index.html`.
 
 - [ ] **Step 4: Verify green and lint**
 
-Run: `npm run test:vitest -- run test/unit/client/components/context-menu/restart-pane-actions.test.ts test/e2e/pane-context-menu-stability.test.tsx --config config/vitest/vitest.config.ts && npm run lint`
+Run: `npm run test:vitest -- run test/unit/client/components/context-menu/restart-pane-actions.test.ts test/unit/client/components/context-menu/session-open-actions.test.ts test/e2e/pane-context-menu-stability.test.tsx --config config/vitest/vitest.config.ts && npm run lint`
 
 Expected: PASS with no lint errors.
 
 - [ ] **Step 5: Commit**
 
-Run: `git add src/components/context-menu/menu-defs.ts src/components/context-menu/ContextMenuProvider.tsx test/e2e/pane-context-menu-stability.test.tsx test/unit/client/components/context-menu/restart-pane-actions.test.ts docs/index.html && git commit -m "feat: show restart action for resumable panes"`
+Run: `git add src/components/context-menu src/components/Sidebar.tsx src/store/tabsSlice.ts src/lib/session-utils.ts docs/index.html test/unit/client/components/context-menu test/e2e/pane-context-menu-stability.test.tsx && git commit -m "feat: restart panes and prevent duplicate sessions"`
 
-### Task 5: Verify the integrated feature
+### Task 5: Verify end-to-end behavior and Rust/client compatibility
 
 **Files:**
-- Test: all restart tests above
+- Test: `crates/freshell-ws/tests/restart_protocol.rs`
+- Test: `test/e2e/pane-context-menu-stability.test.tsx`
+- Test: all focused restart and duplicate-session tests above
 
-- [ ] **Step 1: Run focused regression coverage**
+- [ ] **Step 1: Add and run a Rust-backed browser smoke test**
 
-Run client: `npm run test:vitest -- run test/unit/client/store/panesSlice.restart-pane.test.ts test/unit/client/components/TerminalView.restart-pane.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.restart-pane.test.tsx test/unit/client/components/context-menu/restart-pane-actions.test.ts test/e2e/pane-context-menu-stability.test.tsx --config config/vitest/vitest.config.ts`
-
-Run server: `npm run test:vitest -- run test/integration/server/pane-restart-protocol.test.ts --config config/vitest/vitest.server.config.ts`
+Run: `cargo test -p freshell-ws --test restart_protocol && npm run test:vitest -- run test/e2e/pane-context-menu-stability.test.tsx test/unit/client/store/panesSlice.restart-runtime.test.ts test/unit/client/restart-runtime-ws.test.ts test/unit/client/components/context-menu/restart-pane-actions.test.ts test/unit/client/components/context-menu/session-open-actions.test.ts --config config/vitest/vitest.config.ts`
 
 Expected: PASS.
 
-- [ ] **Step 2: Run coordinated suite and build**
+- [ ] **Step 2: Run the coordinated project checks**
 
-Run: `FRESHELL_TEST_SUMMARY='restart resumable pane feature' npm test && npm run build && git diff --check origin/main...HEAD`
+Run: `FRESHELL_TEST_SUMMARY='Rust agent restart and duplicate session prevention' npm test && npm run lint && npm run build && cargo test --workspace`
 
-Expected: all commands succeed and diff check is silent.
+Expected: PASS.
 
-- [ ] **Step 3: Commit verification corrections if needed**
+- [ ] **Step 3: Inspect and commit verification corrections**
 
-Run: `git add -A && git commit -m "test: verify resumable pane restart flow"`
+Run: `git diff --check origin/main...HEAD && git status --short && git add -A && git commit -m "test: verify Rust agent restart flow"`
+
+Expected: diff check is silent; commit only if verification required changes.
