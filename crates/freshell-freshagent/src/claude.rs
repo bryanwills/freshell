@@ -60,7 +60,10 @@ use freshell_protocol::{
     FreshAgentSend, FreshAgentSendAccepted, ServerMessage, SessionType,
 };
 
-use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySink};
+use crate::{
+    FreshAgentCreateDedup, FreshAgentCreateOutcome, FreshRuntimeIdentity,
+    SharedFreshRuntimeRegistry, SharedPaneIdentitySink,
+};
 
 /// The runtime provider (`AGENT_SESSION_TYPES.claude.provider`).
 const PROVIDER: &str = "claude";
@@ -112,6 +115,7 @@ pub struct FreshClaudeState {
     /// Task 13b: cross-kind liveness -- true when a live terminal PTY owns
     /// `(provider, session_id)`. Wired by `main.rs`; defaults to always-false.
     terminal_liveness: crate::TerminalLivenessProbe,
+    runtime_identity: FreshRuntimeIdentity,
 }
 
 /// The cached result of a completed claude/kilroy `freshAgent.create`, keyed by
@@ -122,10 +126,12 @@ pub struct FreshClaudeState {
 #[derive(Clone)]
 struct ClaudeCreateRecord {
     session_id: String,
+    runtime: freshell_protocol::RuntimeDescriptor,
 }
 
 /// One live freshclaude session: the Node sidecar it drives + its stdout consumer.
 struct ClaudeSession {
+    runtime: freshell_protocol::RuntimeDescriptor,
     /// stdin of the Node sidecar (write `create`/`send`/`shutdown` requests).
     stdin: ChildStdin,
     /// The owned Node sidecar child (SIGKILL backstop; `kill_on_drop`).
@@ -165,7 +171,12 @@ impl FreshClaudeState {
             identity_sink: Arc::new(std::sync::OnceLock::new()),
             leases: Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
             terminal_liveness: Arc::new(|_, _| false),
+            runtime_identity: FreshRuntimeIdentity::default(),
         }
+    }
+
+    pub fn set_runtime_registry(&self, registry: SharedFreshRuntimeRegistry) {
+        self.runtime_identity.set_registry(registry);
     }
 
     /// Wire the cross-kind terminal-liveness probe (Task 13b; called by `main.rs`
@@ -275,7 +286,7 @@ impl FreshClaudeState {
                     runtime_provider: PROVIDER.to_string(),
                     session_id: cached.session_id,
                     session_type: session_type.to_string(),
-                    runtime: None,
+                    runtime: Some(cached.runtime),
                     session_ref: None,
                 }));
                 return;
@@ -421,6 +432,10 @@ impl FreshClaudeState {
                 return;
             }
         };
+        let durable_runtime_key = resume_sid.as_deref().unwrap_or(&created);
+        let runtime = self
+            .runtime_identity
+            .mint_and_register(PROVIDER, durable_runtime_key);
 
         // Start the stdout consumer (the completion edge normalization lives here).
         // `Some(settings)` => the consumer records a binding row at `sdk.session.init`.
@@ -432,6 +447,7 @@ impl FreshClaudeState {
             created.clone(),
             Some(settings),
             Arc::clone(&broadcast_id),
+            runtime.clone(),
         );
 
         // V5 interleaving 2 (Task 12): on the create-resume path, insert
@@ -448,6 +464,7 @@ impl FreshClaudeState {
         self.sessions.lock().await.insert(
             created.clone(),
             ClaudeSession {
+                runtime: runtime.clone(),
                 stdin,
                 child,
                 ownership_id: ownership_id.clone(),
@@ -495,6 +512,7 @@ impl FreshClaudeState {
                 &request_id,
                 ClaudeCreateRecord {
                     session_id: created.clone(),
+                    runtime: runtime.clone(),
                 },
             )
             .await;
@@ -507,7 +525,7 @@ impl FreshClaudeState {
             runtime_provider: PROVIDER.to_string(),
             session_id: created,
             session_type: session_type.to_string(),
-            runtime: None,
+            runtime: Some(runtime),
             session_ref: None,
         }));
     }
@@ -542,11 +560,22 @@ impl FreshClaudeState {
     /// (send/attach route to it via Task 10b's `cli_index` resolution) under the
     /// loser's own `requestId` — no spawn, no second writer.
     async fn adopt_live_create(&self, request_id: &str, durable: &str, session_type: &str) {
+        let runtime = if let Some(key) = self.resolve_session_key(durable).await {
+            self.sessions
+                .lock()
+                .await
+                .get(&key)
+                .map(|session| session.runtime.clone())
+        } else {
+            None
+        }
+        .unwrap_or_else(|| self.runtime_identity.mint_and_register(PROVIDER, durable));
         self.create_dedup
             .record_success(
                 request_id,
                 ClaudeCreateRecord {
                     session_id: durable.to_string(),
+                    runtime: runtime.clone(),
                 },
             )
             .await;
@@ -556,7 +585,7 @@ impl FreshClaudeState {
             runtime_provider: PROVIDER.to_string(),
             session_id: durable.to_string(),
             session_type: session_type.to_string(),
-            runtime: None,
+            runtime: Some(runtime),
             session_ref: Some(freshell_protocol::SessionLocator {
                 provider: PROVIDER.to_string(),
                 session_id: durable.to_string(),
@@ -892,25 +921,27 @@ impl FreshClaudeState {
         let Some(map_key) = self.cli_index.lock().await.get(durable).cloned() else {
             return false;
         };
-        let rebound = {
+        let runtime = {
             let guard = self.sessions.lock().await;
             match guard.get(&map_key) {
                 Some(session) => {
                     *session.broadcast_id.lock().expect("broadcast id lock") = durable.to_string();
-                    true
+                    Some(session.runtime.clone())
                 }
-                None => false,
+                None => None,
             }
         };
-        if rebound {
+        if let Some(runtime) = runtime {
             self.broadcast(&status_snapshot_frame(
                 durable,
                 durable,
                 "idle",
                 session_type,
+                Some(&runtime),
             ));
+            return true;
         }
-        rebound
+        false
     }
 
     /// The not-tracked resume (codex `ensure_session_resumable` analog, file-store
@@ -1013,6 +1044,7 @@ impl FreshClaudeState {
                 return Err(ResumeClaudeError::Transient(err));
             }
         };
+        let runtime = self.runtime_identity.mint_and_register(PROVIDER, durable);
 
         let session_type = session_type_str(msg.session_type).to_string();
         // Register under the CLIENT's id: the consumer stamps the map key on every
@@ -1031,10 +1063,12 @@ impl FreshClaudeState {
             sidecar_session_id.clone(),
             recovered,
             Arc::clone(&broadcast_id),
+            runtime.clone(),
         );
         self.sessions.lock().await.insert(
             msg.session_id.clone(),
             ClaudeSession {
+                runtime: runtime.clone(),
                 stdin,
                 child,
                 ownership_id,
@@ -1075,6 +1109,7 @@ impl FreshClaudeState {
             durable,
             "idle",
             &session_type,
+            Some(&runtime),
         ));
         Ok(())
     }
@@ -1118,6 +1153,7 @@ impl FreshClaudeState {
         sidecar_session_id: String,
         settings: Option<crate::identity_sink::FreshAgentSettings>,
         broadcast_id: Arc<std::sync::Mutex<String>>,
+        runtime: freshell_protocol::RuntimeDescriptor,
     ) -> tokio::task::JoinHandle<()> {
         let broadcast_tx = self.broadcast_tx.clone();
         let sessions = self.sessions.clone();
@@ -1145,6 +1181,9 @@ impl FreshClaudeState {
                         if let Some(session) = sessions.lock().await.get_mut(&session_id) {
                             session.cli_session_id = Some(cli_id.to_string());
                         }
+                        state
+                            .runtime_identity
+                            .register(PROVIDER, cli_id, &runtime.runtime_id);
                         // P1.13: binding row keyed by the DURABLE cliSessionId, with
                         // the FULL create-settings snapshot — AWAITED here (this arm
                         // runs on the async consumer task) so the row is durable
@@ -1187,7 +1226,9 @@ impl FreshClaudeState {
                 // Task 10b: stamp the envelope from the SHARED handle (not the captured
                 // map key) so an attach-by-durable rebind flips live event routing.
                 let stamp = broadcast_id.lock().expect("broadcast id lock").clone();
-                if let Some(frame) = sdk_line_to_frame(&value, &stamp, &session_type) {
+                if let Some(frame) =
+                    sdk_line_to_frame(&value, &stamp, &session_type, Some(&runtime))
+                {
                     let _ = broadcast_tx.send(frame);
                 }
             }
@@ -1233,7 +1274,12 @@ impl FreshClaudeState {
 /// which passes unknown types through unchanged and thus never surfaces them as fresh-agent
 /// events), preserving every other field, then wraps it in the envelope. Control lines
 /// (`created` / `create.failed`) and unknown types return `None`.
-fn sdk_line_to_frame(value: &Value, session_id: &str, session_type: &str) -> Option<String> {
+fn sdk_line_to_frame(
+    value: &Value,
+    session_id: &str,
+    session_type: &str,
+    runtime: Option<&freshell_protocol::RuntimeDescriptor>,
+) -> Option<String> {
     let sdk_type = value.get("type").and_then(Value::as_str)?;
     let fresh_type = normalize_sdk_type(sdk_type)?;
 
@@ -1247,7 +1293,7 @@ fn sdk_line_to_frame(value: &Value, session_id: &str, session_type: &str) -> Opt
         provider: PROVIDER.to_string(),
         session_id: session_id.to_string(),
         session_type: session_type.to_string(),
-        runtime: None,
+        runtime: runtime.cloned(),
     });
     serde_json::to_string(&msg).ok()
 }
@@ -1321,6 +1367,7 @@ fn status_snapshot_frame(
     timeline_session_id: &str,
     status: &str,
     session_type: &str,
+    runtime: Option<&freshell_protocol::RuntimeDescriptor>,
 ) -> ServerMessage {
     ServerMessage::FreshAgentEvent(FreshAgentEvent {
         event: json!({
@@ -1333,7 +1380,7 @@ fn status_snapshot_frame(
         provider: PROVIDER.to_string(),
         session_id: session_id.to_string(),
         session_type: session_type.to_string(),
-        runtime: None,
+        runtime: runtime.cloned(),
     })
 }
 
@@ -1616,6 +1663,10 @@ pub(crate) mod tests {
         st.sessions.lock().await.insert(
             session_id.to_string(),
             ClaudeSession {
+                runtime: freshell_protocol::RuntimeDescriptor {
+                    runtime_id: format!("fresh-runtime-test-{session_id}"),
+                    generation: 1,
+                },
                 stdin,
                 child,
                 ownership_id: format!("test-{session_id}"),
@@ -1935,7 +1986,8 @@ pub(crate) mod tests {
             "cwd": "/tmp/x",
             "tools": [{ "name": "Read" }],
         });
-        let frame = sdk_line_to_frame(&line, "nano_placeholder_1234567", "freshclaude").unwrap();
+        let frame =
+            sdk_line_to_frame(&line, "nano_placeholder_1234567", "freshclaude", None).unwrap();
         let wire: Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(wire["type"], "freshAgent.event");
         assert_eq!(wire["provider"], "claude");
@@ -1953,7 +2005,7 @@ pub(crate) mod tests {
     fn turn_complete_frame_carries_the_success_edge() {
         // The status-guarded chime the sidecar emits ONLY on result subtype=success.
         let line = json!({ "type": "sdk.turn.complete", "sessionId": "s-1", "at": 42 });
-        let frame = sdk_line_to_frame(&line, "s-1", "freshclaude").unwrap();
+        let frame = sdk_line_to_frame(&line, "s-1", "freshclaude", None).unwrap();
         let wire: Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(wire["type"], "freshAgent.event");
         assert_eq!(wire["event"]["type"], "freshAgent.turn.complete");
@@ -1966,13 +2018,15 @@ pub(crate) mod tests {
         assert!(sdk_line_to_frame(
             &json!({ "type": "created", "sessionId": "x" }),
             "x",
-            "freshclaude"
+            "freshclaude",
+            None,
         )
         .is_none());
         assert!(sdk_line_to_frame(
             &json!({ "type": "create.failed", "message": "boom" }),
             "x",
-            "freshclaude"
+            "freshclaude",
+            None,
         )
         .is_none());
     }
@@ -1991,7 +2045,7 @@ pub(crate) mod tests {
         ];
         let frames: Vec<Value> = death_stream
             .iter()
-            .filter_map(|l| sdk_line_to_frame(l, "s", "freshclaude"))
+            .filter_map(|l| sdk_line_to_frame(l, "s", "freshclaude", None))
             .map(|f| serde_json::from_str(&f).unwrap())
             .collect();
         let inner_types: Vec<&str> = frames
@@ -2007,6 +2061,7 @@ pub(crate) mod tests {
             &json!({ "type": "sdk.turn.complete", "sessionId": "s", "at": 1 }),
             "s",
             "freshclaude",
+            None,
         )
         .unwrap();
         assert_eq!(

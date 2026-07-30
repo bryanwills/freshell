@@ -919,6 +919,7 @@ export type TerminalSessionAssociatedMessage = {
   type: 'terminal.session.associated'
   terminalId: string
   sessionRef: SessionLocator
+  runtime?: RuntimeDescriptor
   /**
    * Present ONLY on a server-authoritative mid-session rebind (the CLI under
    * this pane switched/forked to a new session). Names the session id this

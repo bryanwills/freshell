@@ -202,6 +202,22 @@ async fn main() -> ExitCode {
     // (`freshell_ws::build_handshake`), mirroring the original's
     // per-connection `configFallback` (`server/index.ts:372-380`).
     let config_fallback = settings_store.config_fallback();
+    let restart = match home
+        .as_ref()
+        .map(|root| root.join(".freshell").join("restart-transactions.json"))
+    {
+        Some(path) => match freshell_ws::restart::RestartCoordinator::new_persistent(path) {
+            Ok(coordinator) => coordinator,
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    "agent.restart.persistence.load_failed: restart replay durability disabled"
+                );
+                freshell_ws::restart::RestartCoordinator::new()
+            }
+        },
+        None => freshell_ws::restart::RestartCoordinator::new(),
+    };
 
     // The shared server→client broadcast bus (pre-serialized frames). REST handlers
     // (fresh-agent create/send) push here; every `/ws` connection fans it out to its
@@ -259,6 +275,11 @@ async fn main() -> ExitCode {
     let mut fresh_opencode_state =
         freshell_freshagent::FreshOpencodeState::new(fresh_agent_state.clone());
     fresh_opencode_state.set_session_leases(Arc::clone(&fresh_agent_leases));
+    let fresh_runtime_registry: freshell_freshagent::SharedFreshRuntimeRegistry =
+        Arc::new(restart.clone());
+    fresh_codex_state.set_runtime_registry(Arc::clone(&fresh_runtime_registry));
+    fresh_claude_state.set_runtime_registry(Arc::clone(&fresh_runtime_registry));
+    fresh_opencode_state.set_runtime_registry(fresh_runtime_registry);
 
     // The shared, connection-independent terminal registry: terminals are owned by
     // `terminalId` here (not by the socket that created them), so a second/reconnected
@@ -632,7 +653,7 @@ async fn main() -> ExitCode {
         spawn_gate: std::sync::Arc::clone(&spawn_gate),
         shutdown_started: std::sync::Arc::clone(&shutdown_started),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
-        restart: freshell_ws::restart::RestartCoordinator::new(),
+        restart: restart.clone(),
         pane_ledger: std::sync::Arc::clone(&pane_ledger),
     };
 

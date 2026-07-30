@@ -76,7 +76,8 @@ use freshell_protocol::{
 };
 
 use crate::{
-    FreshAgentCreateDedup, FreshAgentCreateOutcome, FreshAgentState, SharedPaneIdentitySink,
+    FreshAgentCreateDedup, FreshAgentCreateOutcome, FreshAgentState, FreshRuntimeIdentity,
+    SharedFreshRuntimeRegistry, SharedPaneIdentitySink,
 };
 
 /// The opencode fresh-agent `sessionType` (`AGENT_SESSION_TYPES.opencode`).
@@ -120,6 +121,7 @@ pub struct FreshOpencodeState {
     /// Task 13b: cross-kind liveness -- true when a live terminal PTY owns
     /// `(provider, session_id)`. Wired by `main.rs`; defaults to always-false.
     terminal_liveness: crate::TerminalLivenessProbe,
+    runtime_identity: FreshRuntimeIdentity,
 }
 
 /// The cached result of a completed opencode `freshAgent.create`, keyed by `requestId` in
@@ -130,11 +132,13 @@ pub struct FreshOpencodeState {
 #[derive(Clone)]
 struct OpencodeCreateRecord {
     placeholder_id: String,
+    runtime: freshell_protocol::RuntimeDescriptor,
 }
 
 /// One live (or not-yet-materialized) freshopencode WS session.
 struct OpencodeSession {
     placeholder_id: String,
+    runtime: freshell_protocol::RuntimeDescriptor,
     /// `None` until the first `freshAgent.send` materializes it (`adapter.ts:349`).
     real_session_id: Option<String>,
     cwd: Option<String>,
@@ -182,12 +186,14 @@ enum ResumeOpencodeError {
 impl OpencodeSession {
     fn new(
         placeholder_id: String,
+        runtime: freshell_protocol::RuntimeDescriptor,
         cwd: Option<String>,
         model: Option<String>,
         effort: Option<String>,
     ) -> Self {
         Self {
             placeholder_id,
+            runtime,
             real_session_id: None,
             cwd,
             model,
@@ -212,7 +218,12 @@ impl FreshOpencodeState {
             identity_sink: Arc::new(std::sync::OnceLock::new()),
             leases: Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
             terminal_liveness: Arc::new(|_, _| false),
+            runtime_identity: FreshRuntimeIdentity::default(),
         }
+    }
+
+    pub fn set_runtime_registry(&self, registry: SharedFreshRuntimeRegistry) {
+        self.runtime_identity.set_registry(registry);
     }
 
     /// Wire the cross-kind terminal-liveness probe (Task 13b; called by `main.rs`
@@ -315,7 +326,7 @@ impl FreshOpencodeState {
                     runtime_provider: PROVIDER.to_string(),
                     session_id: cached.placeholder_id.clone(),
                     session_type: SESSION_TYPE.to_string(),
-                    runtime: None,
+                    runtime: Some(cached.runtime),
                     session_ref: Some(SessionLocator {
                         provider: PROVIDER.to_string(),
                         session_id: cached.placeholder_id,
@@ -346,8 +357,17 @@ impl FreshOpencodeState {
         let model = normalize_opencode_model(msg.model.as_deref());
         let effort = normalize_opencode_effort(model.as_deref(), msg.effort.as_deref());
         let placeholder = format!("freshopencode-{request_id}");
+        let runtime = self
+            .runtime_identity
+            .mint_and_register(PROVIDER, &placeholder);
 
-        let session = OpencodeSession::new(placeholder.clone(), msg.cwd.clone(), model, effort);
+        let session = OpencodeSession::new(
+            placeholder.clone(),
+            runtime.clone(),
+            msg.cwd.clone(),
+            model,
+            effort,
+        );
         self.sessions
             .lock()
             .await
@@ -361,6 +381,7 @@ impl FreshOpencodeState {
                 &request_id,
                 OpencodeCreateRecord {
                     placeholder_id: placeholder.clone(),
+                    runtime: runtime.clone(),
                 },
             )
             .await;
@@ -388,7 +409,7 @@ impl FreshOpencodeState {
             runtime_provider: PROVIDER.to_string(),
             session_id: placeholder.clone(),
             session_type: SESSION_TYPE.to_string(),
-            runtime: None,
+            runtime: Some(runtime),
             session_ref: Some(SessionLocator {
                 provider: PROVIDER.to_string(),
                 session_id: placeholder,
@@ -475,17 +496,19 @@ impl FreshOpencodeState {
                 &request_id,
                 OpencodeCreateRecord {
                     placeholder_id: durable_id.clone(),
+                    runtime: session_arc.lock().await.runtime.clone(),
                 },
             )
             .await;
 
+        let runtime = session_arc.lock().await.runtime.clone();
         self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
             provider: PROVIDER.to_string(),
             request_id,
             runtime_provider: PROVIDER.to_string(),
             session_id: durable_id.clone(),
             session_type: SESSION_TYPE.to_string(),
-            runtime: None,
+            runtime: Some(runtime),
             session_ref: Some(SessionLocator {
                 provider: PROVIDER.to_string(),
                 session_id: durable_id,
@@ -551,9 +574,10 @@ impl FreshOpencodeState {
             .real_session_id
             .clone()
             .unwrap_or_else(|| session.placeholder_id.clone());
-        self.broadcast(&event_frame(
+        self.broadcast(&runtime_event_frame(
             &busy_session_id,
             snapshot_event(&busy_session_id, "running"),
+            &session.runtime,
         ));
 
         let acked_session_id = if let Some(real_id) = session.real_session_id.clone() {
@@ -573,6 +597,9 @@ impl FreshOpencodeState {
             };
             let durable_id = created.id;
             session.real_session_id = Some(durable_id.clone());
+            session.runtime =
+                self.runtime_identity
+                    .register(PROVIDER, &durable_id, &session.runtime.runtime_id);
             if let Some(dir) = created.directory.filter(|d| !d.is_empty()) {
                 session.cwd = Some(dir);
             } else if let Some(cwd) = cwd.clone() {
@@ -623,7 +650,7 @@ impl FreshOpencodeState {
                     provider: PROVIDER.to_string(),
                     session_id: durable_id.clone(),
                     session_type: SESSION_TYPE.to_string(),
-                    runtime: None,
+                    runtime: Some(session.runtime.clone()),
                     session_ref: Some(SessionLocator {
                         provider: PROVIDER.to_string(),
                         session_id: durable_id.clone(),
@@ -638,6 +665,7 @@ impl FreshOpencodeState {
                 manager.clone(),
                 durable_id.clone(),
                 session.turn_errored.clone(),
+                session.runtime.clone(),
             ));
             durable_id
         };
@@ -701,6 +729,7 @@ impl FreshOpencodeState {
         let turn_aborted = session.turn_aborted.clone();
         let turn_errored = session.turn_errored.clone();
         let last_turn_complete_at = session.last_turn_complete_at.clone();
+        let runtime = session.runtime.clone();
 
         let turn_task = tokio::spawn(async move {
             // `run_turn` (freshell-opencode/serve.rs) prompts + awaits idle against the
@@ -718,7 +747,11 @@ impl FreshOpencodeState {
 
             // `emitStatus(state, 'idle')` (adapter.ts:371/384) -- unconditional, whether
             // the turn succeeded or the promptAsync/idle-wait itself errored.
-            fresh_agent.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
+            fresh_agent.broadcast(&runtime_event_frame(
+                &real_id,
+                snapshot_event(&real_id, "idle"),
+                &runtime,
+            ));
 
             // adapter.ts:377 -- a positive completion requires the idle-wait to have
             // actually succeeded AND the turn to have been neither interrupted
@@ -736,7 +769,11 @@ impl FreshOpencodeState {
                     *guard = Some(at);
                     at
                 };
-                fresh_agent.broadcast(&event_frame(&real_id, turn_complete_event(&real_id, at)));
+                fresh_agent.broadcast(&runtime_event_frame(
+                    &real_id,
+                    turn_complete_event(&real_id, at),
+                    &runtime,
+                ));
             }
         });
         session.turn_task = Some(turn_task);
@@ -932,6 +969,7 @@ impl FreshOpencodeState {
                         manager,
                         real_id,
                         session.turn_errored.clone(),
+                        session.runtime.clone(),
                     ));
                 }
             }
@@ -1084,8 +1122,12 @@ impl FreshOpencodeState {
             .or(serve_dir)
             .or_else(|| cwd.map(str::to_string));
 
+        let runtime = self
+            .runtime_identity
+            .mint_and_register(PROVIDER, session_id);
         let mut session = OpencodeSession::new(
             session_id.to_string(),
+            runtime.clone(),
             cwd.clone(),
             rec.model.clone(),
             rec.effort.clone(),
@@ -1095,6 +1137,7 @@ impl FreshOpencodeState {
             manager,
             session_id.to_string(),
             session.turn_errored.clone(),
+            runtime,
         ));
         let session_arc = Arc::new(TokioMutex::new(session));
 
@@ -1159,6 +1202,7 @@ impl FreshOpencodeState {
         manager: OpencodeServeManager,
         real_id: String,
         turn_errored: Arc<AtomicBool>,
+        runtime: freshell_protocol::RuntimeDescriptor,
     ) -> tokio::task::JoinHandle<()> {
         let fresh_agent = self.fresh_agent.clone();
         let mut rx = manager.subscribe(&real_id);
@@ -1196,7 +1240,7 @@ impl FreshOpencodeState {
                                 error_event(session_id, message)
                             }
                         };
-                        fresh_agent.broadcast(&event_frame(&real_id, inner));
+                        fresh_agent.broadcast(&runtime_event_frame(&real_id, inner, &runtime));
                     }
                     // The sidecar was lost; `run_turn`'s own `await_idle` independently
                     // surfaces `ServeError::SidecarLost`, which already excludes the
@@ -1257,6 +1301,18 @@ fn event_frame(session_id: &str, inner: Value) -> ServerMessage {
         session_type: SESSION_TYPE.to_string(),
         runtime: None,
     })
+}
+
+fn runtime_event_frame(
+    session_id: &str,
+    inner: Value,
+    runtime: &freshell_protocol::RuntimeDescriptor,
+) -> ServerMessage {
+    let mut frame = event_frame(session_id, inner);
+    if let ServerMessage::FreshAgentEvent(event) = &mut frame {
+        event.runtime = Some(runtime.clone());
+    }
+    frame
 }
 
 /// `{type:'sdk.session.snapshot',...} → freshAgent.session.snapshot` (sdk-events.ts:49-50;

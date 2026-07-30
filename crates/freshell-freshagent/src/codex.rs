@@ -68,7 +68,10 @@ use freshell_protocol::{
     FreshAgentSend, FreshAgentSessionMaterialized, ServerMessage, SessionLocator,
 };
 
-use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySink};
+use crate::{
+    FreshAgentCreateDedup, FreshAgentCreateOutcome, FreshRuntimeIdentity,
+    SharedFreshRuntimeRegistry, SharedPaneIdentitySink,
+};
 
 /// The codex fresh-agent `sessionType` (`AGENT_SESSION_TYPES.codex`).
 const SESSION_TYPE: &str = "freshcodex";
@@ -159,6 +162,7 @@ pub struct FreshCodexState {
     /// Task 13b: cross-kind liveness -- true when a live terminal PTY owns
     /// `(provider, session_id)`. Wired by `main.rs`; defaults to always-false.
     terminal_liveness: crate::TerminalLivenessProbe,
+    runtime_identity: FreshRuntimeIdentity,
 }
 
 /// The cached result of a completed codex `freshAgent.create`, keyed by `requestId` in
@@ -169,11 +173,13 @@ pub struct FreshCodexState {
 #[derive(Clone)]
 struct CodexCreateRecord {
     session_id: String,
+    runtime: freshell_protocol::RuntimeDescriptor,
 }
 
 /// One live freshcodex session: the app-server client, its owned sidecar, and the
 /// normalized create-time settings a later `send` re-uses.
 struct CodexSession {
+    runtime: freshell_protocol::RuntimeDescriptor,
     client: Arc<CodexAppServerClient>,
     /// Normalized model (`normalizeFreshcodexModel`), reused verbatim on `send`.
     model: String,
@@ -294,7 +300,12 @@ impl FreshCodexState {
             identity_sink: Arc::new(std::sync::OnceLock::new()),
             leases: Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
             terminal_liveness: Arc::new(|_, _| false),
+            runtime_identity: FreshRuntimeIdentity::default(),
         }
+    }
+
+    pub fn set_runtime_registry(&self, registry: SharedFreshRuntimeRegistry) {
+        self.runtime_identity.set_registry(registry);
     }
 
     /// Wire the cross-kind terminal-liveness probe (Task 13b; called by `main.rs`
@@ -474,7 +485,7 @@ impl FreshCodexState {
                     runtime_provider: PROVIDER.to_string(),
                     session_id: cached.session_id.clone(),
                     session_type: SESSION_TYPE.to_string(),
-                    runtime: None,
+                    runtime: Some(cached.runtime),
                     session_ref: Some(SessionLocator {
                         provider: PROVIDER.to_string(),
                         session_id: cached.session_id,
@@ -844,6 +855,9 @@ impl FreshCodexState {
         // Legacy `activeTurnByThread` mirror for THIS session (adapter.ts:295) -- set on
         // `handle_send`, read/cleared by `handle_interrupt`, cleared by the consumer below.
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let runtime = self
+            .runtime_identity
+            .mint_and_register(PROVIDER, &thread_id);
 
         // ORDERING FIX (wireshape-oracle flake, ~1-in-3): the app-server can already have
         // pushed a `ThreadStarted` notification onto `notifs` (the fake app-server
@@ -863,6 +877,7 @@ impl FreshCodexState {
             thread_id.clone(),
             active_turn.clone(),
             Some(created_rx),
+            runtime.clone(),
         );
 
         // The exit-watcher owns the sidecar child: a REQUESTED kill (via `kill_tx`) tears it
@@ -878,11 +893,13 @@ impl FreshCodexState {
             kill_rx,
             exited.clone(),
             Arc::clone(&self.leases),
+            runtime.clone(),
         );
 
         self.sessions.lock().await.insert(
             thread_id.clone(),
             CodexSession {
+                runtime: runtime.clone(),
                 client,
                 model: model.clone(),
                 effort: effort.clone(),
@@ -956,6 +973,7 @@ impl FreshCodexState {
                 &request_id,
                 CodexCreateRecord {
                     session_id: thread_id.clone(),
+                    runtime: runtime.clone(),
                 },
             )
             .await;
@@ -967,7 +985,7 @@ impl FreshCodexState {
             runtime_provider: PROVIDER.to_string(),
             session_id: thread_id.clone(),
             session_type: SESSION_TYPE.to_string(),
-            runtime: None,
+            runtime: Some(runtime),
             session_ref: Some(SessionLocator {
                 provider: PROVIDER.to_string(),
                 session_id: thread_id,
@@ -1017,11 +1035,19 @@ impl FreshCodexState {
     /// `freshAgent.created` naming the live durable threadId under the loser's own
     /// `requestId` — no spawn, no rollout clobber.
     async fn adopt_live_create(&self, request_id: &str, thread_id: &str) {
+        let runtime = self
+            .sessions
+            .lock()
+            .await
+            .get(thread_id)
+            .map(|session| session.runtime.clone())
+            .unwrap_or_else(|| self.runtime_identity.mint_and_register(PROVIDER, thread_id));
         self.create_dedup
             .record_success(
                 request_id,
                 CodexCreateRecord {
                     session_id: thread_id.to_string(),
+                    runtime: runtime.clone(),
                 },
             )
             .await;
@@ -1031,7 +1057,7 @@ impl FreshCodexState {
             runtime_provider: PROVIDER.to_string(),
             session_id: thread_id.to_string(),
             session_type: SESSION_TYPE.to_string(),
-            runtime: None,
+            runtime: Some(runtime),
             session_ref: Some(SessionLocator {
                 provider: PROVIDER.to_string(),
                 session_id: thread_id.to_string(),
@@ -1406,7 +1432,13 @@ impl FreshCodexState {
             status,
             revision: None,
         };
-        if let Some(frame) = adapter_event_to_frame(&event, &session_id) {
+        let runtime = self
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .map(|session| session.runtime.clone());
+        if let Some(frame) = adapter_event_to_frame(&event, &session_id, runtime.as_ref()) {
             let _ = self.broadcast_tx.send(frame);
         }
     }
@@ -1715,7 +1747,15 @@ impl FreshCodexState {
 
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         let exited = Arc::new(AtomicBool::new(false));
-        let consumer = self.spawn_consumer(notifs, session_id.to_string(), active_turn.clone());
+        let runtime = self
+            .runtime_identity
+            .mint_and_register(PROVIDER, session_id);
+        let consumer = self.spawn_consumer(
+            notifs,
+            session_id.to_string(),
+            active_turn.clone(),
+            runtime.clone(),
+        );
         let (kill_tx, kill_rx) = oneshot::channel();
         let watcher = spawn_exit_watcher(
             child,
@@ -1725,6 +1765,7 @@ impl FreshCodexState {
             kill_rx,
             exited.clone(),
             Arc::clone(&self.leases),
+            runtime.clone(),
         );
 
         // `HashMap::insert` on an existing key overwrites in place, dropping the old (dead
@@ -1738,6 +1779,7 @@ impl FreshCodexState {
             guard.insert(
                 session_id.to_string(),
                 CodexSession {
+                    runtime,
                     client,
                     model: model.clone(),
                     effort: effort.clone(),
@@ -1852,7 +1894,15 @@ impl FreshCodexState {
 
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         let exited = Arc::new(AtomicBool::new(false));
-        let consumer = self.spawn_consumer(notifs, new_thread_id.clone(), active_turn.clone());
+        let runtime = self
+            .runtime_identity
+            .mint_and_register(PROVIDER, &new_thread_id);
+        let consumer = self.spawn_consumer(
+            notifs,
+            new_thread_id.clone(),
+            active_turn.clone(),
+            runtime.clone(),
+        );
         let (kill_tx, kill_rx) = oneshot::channel();
         let watcher = spawn_exit_watcher(
             child,
@@ -1862,6 +1912,7 @@ impl FreshCodexState {
             kill_rx,
             exited.clone(),
             Arc::clone(&self.leases),
+            runtime.clone(),
         );
 
         {
@@ -1870,6 +1921,7 @@ impl FreshCodexState {
             guard.insert(
                 new_thread_id.clone(),
                 CodexSession {
+                    runtime: runtime.clone(),
                     client,
                     model: model.clone(),
                     effort: effort.clone(),
@@ -1928,7 +1980,7 @@ impl FreshCodexState {
                 provider: PROVIDER.to_string(),
                 session_id: new_thread_id.clone(),
                 session_type: SESSION_TYPE.to_string(),
-                runtime: None,
+                runtime: Some(runtime),
                 session_ref: Some(SessionLocator {
                     provider: PROVIDER.to_string(),
                     session_id: new_thread_id.clone(),
@@ -2071,8 +2123,9 @@ impl FreshCodexState {
         notifs: tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
         thread_id: String,
         active_turn: Arc<StdMutex<Option<String>>>,
+        runtime: freshell_protocol::RuntimeDescriptor,
     ) -> tokio::task::JoinHandle<()> {
-        self.spawn_consumer_after(notifs, thread_id, active_turn, None)
+        self.spawn_consumer_after(notifs, thread_id, active_turn, None, runtime)
     }
 
     /// Like [`Self::spawn_consumer`], but if `gate` is given, the consumer's first
@@ -2090,6 +2143,7 @@ impl FreshCodexState {
         thread_id: String,
         active_turn: Arc<StdMutex<Option<String>>>,
         gate: Option<oneshot::Receiver<()>>,
+        runtime: freshell_protocol::RuntimeDescriptor,
     ) -> tokio::task::JoinHandle<()> {
         let broadcast_tx = self.broadcast_tx.clone();
         tokio::spawn(async move {
@@ -2105,7 +2159,7 @@ impl FreshCodexState {
                     if let CodexAdapterEvent::TurnComplete { session_id, .. } = &event {
                         tracing::info!(session_id = %session_id, "freshagent.turn.complete");
                     }
-                    let frame = adapter_event_to_frame(&event, &thread_id);
+                    let frame = adapter_event_to_frame(&event, &thread_id, Some(&runtime));
                     if let Some(frame) = frame {
                         let _ = broadcast_tx.send(frame);
                     }
@@ -2457,7 +2511,13 @@ impl FreshCodexState {
 
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         let exited = Arc::new(AtomicBool::new(false));
-        let consumer = self.spawn_consumer(notifs, thread_id.to_string(), active_turn.clone());
+        let runtime = self.runtime_identity.mint_and_register(PROVIDER, thread_id);
+        let consumer = self.spawn_consumer(
+            notifs,
+            thread_id.to_string(),
+            active_turn.clone(),
+            runtime.clone(),
+        );
         let (kill_tx, kill_rx) = oneshot::channel();
         let watcher = spawn_exit_watcher(
             child,
@@ -2467,12 +2527,14 @@ impl FreshCodexState {
             kill_rx,
             exited.clone(),
             Arc::clone(&self.leases),
+            runtime.clone(),
         );
         {
             let mut guard = self.sessions.lock().await;
             guard.insert(
                 thread_id.to_string(),
                 CodexSession {
+                    runtime,
                     client: client.clone(),
                     // P1.13 (Task 5, R3): the ledger record's settings snapshot -- blank
                     // only when no record was recoverable (never-recorded historical
@@ -2568,6 +2630,10 @@ impl FreshCodexState {
         let consumer = tokio::spawn(async {});
         let (kill_tx, kill_rx) = oneshot::channel();
         let exited = Arc::new(AtomicBool::new(false));
+        let runtime = freshell_protocol::RuntimeDescriptor {
+            runtime_id: format!("fresh-runtime-test-{thread_id}"),
+            generation: 1,
+        };
         let watcher = spawn_exit_watcher(
             child,
             format!("codex-sidecar-test-snapshot-router-{thread_id}"),
@@ -2576,10 +2642,12 @@ impl FreshCodexState {
             kill_rx,
             exited.clone(),
             Arc::clone(&self.leases),
+            runtime.clone(),
         );
         self.sessions.lock().await.insert(
             thread_id.to_string(),
             CodexSession {
+                runtime,
                 client,
                 model: "gpt-5.3-codex-spark".to_string(),
                 effort: None,
@@ -3273,6 +3341,7 @@ fn spawn_exit_watcher(
     kill_rx: oneshot::Receiver<()>,
     exited: Arc<AtomicBool>,
     leases: Arc<crate::session_lease::FreshAgentSessionLeases>,
+    runtime: freshell_protocol::RuntimeDescriptor,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // `biased` + the REQUESTED-kill arm listed FIRST: a `freshAgent.kill` signals
@@ -3311,7 +3380,9 @@ fn spawn_exit_watcher(
                     session_id: thread_id.clone(),
                     status: CodexStatus::Exited,
                 };
-                if let Some(frame) = adapter_event_to_frame(&event, &thread_id) {
+                if let Some(frame) =
+                    adapter_event_to_frame(&event, &thread_id, Some(&runtime))
+                {
                     let _ = broadcast_tx.send(frame);
                 }
             }
@@ -3391,7 +3462,11 @@ fn reduce_notification(
 
 /// Map an adapter event to a `freshAgent.event` wire frame (sdk-events.ts normalization:
 /// `sdk.*` → `freshAgent.*`). Returns the pre-serialized JSON, or `None` on a serialize error.
-fn adapter_event_to_frame(event: &CodexAdapterEvent, thread_id: &str) -> Option<String> {
+fn adapter_event_to_frame(
+    event: &CodexAdapterEvent,
+    thread_id: &str,
+    runtime: Option<&freshell_protocol::RuntimeDescriptor>,
+) -> Option<String> {
     let inner = match event {
         CodexAdapterEvent::StatusSnapshot {
             session_id,
@@ -3425,7 +3500,7 @@ fn adapter_event_to_frame(event: &CodexAdapterEvent, thread_id: &str) -> Option<
         provider: PROVIDER.to_string(),
         session_id: thread_id.to_string(),
         session_type: SESSION_TYPE.to_string(),
-        runtime: None,
+        runtime: runtime.cloned(),
     });
     serde_json::to_string(&msg).ok()
 }
@@ -3938,6 +4013,7 @@ pub(crate) mod tests {
                 at: 42,
             },
             "t-1",
+            None,
         )
         .unwrap();
         let wire: Value = serde_json::from_str(&frame).unwrap();
@@ -3958,6 +4034,7 @@ pub(crate) mod tests {
                 revision: None,
             },
             "t-1",
+            None,
         )
         .unwrap();
         let wire: Value = serde_json::from_str(&frame).unwrap();
@@ -3983,7 +4060,7 @@ pub(crate) mod tests {
         );
         let inner_types: Vec<String> = events
             .iter()
-            .filter_map(|e| adapter_event_to_frame(e, "t-1"))
+            .filter_map(|e| adapter_event_to_frame(e, "t-1", None))
             .map(|f| {
                 serde_json::from_str::<Value>(&f).unwrap()["event"]["type"]
                     .as_str()
@@ -4077,6 +4154,10 @@ pub(crate) mod tests {
         let consumer = tokio::spawn(async {});
         let (kill_tx, kill_rx) = oneshot::channel();
         let exited = Arc::new(AtomicBool::new(false));
+        let runtime = freshell_protocol::RuntimeDescriptor {
+            runtime_id: format!("fresh-runtime-test-{thread_id}"),
+            generation: 1,
+        };
         let watcher = spawn_exit_watcher(
             child,
             ownership_id.to_string(),
@@ -4085,10 +4166,12 @@ pub(crate) mod tests {
             kill_rx,
             exited.clone(),
             Arc::clone(&state.leases),
+            runtime.clone(),
         );
         state.sessions.lock().await.insert(
             thread_id.to_string(),
             CodexSession {
+                runtime,
                 client,
                 model: "gpt-5.3-codex-spark".to_string(),
                 effort: None,
@@ -4129,7 +4212,16 @@ pub(crate) mod tests {
         child: tokio::process::Child,
         ownership_id: &str,
     ) -> tokio::sync::broadcast::Receiver<String> {
-        let consumer = state.spawn_consumer(notifs, thread_id.to_string(), active_turn.clone());
+        let runtime = freshell_protocol::RuntimeDescriptor {
+            runtime_id: format!("fresh-runtime-test-{thread_id}"),
+            generation: 1,
+        };
+        let consumer = state.spawn_consumer(
+            notifs,
+            thread_id.to_string(),
+            active_turn.clone(),
+            runtime.clone(),
+        );
         let (kill_tx, kill_rx) = oneshot::channel();
         let exited = Arc::new(AtomicBool::new(false));
         let watcher = spawn_exit_watcher(
@@ -4140,10 +4232,12 @@ pub(crate) mod tests {
             kill_rx,
             exited.clone(),
             Arc::clone(&state.leases),
+            runtime.clone(),
         );
         state.sessions.lock().await.insert(
             thread_id.to_string(),
             CodexSession {
+                runtime,
                 client,
                 model: "gpt-5.3-codex-spark".to_string(),
                 effort: None,

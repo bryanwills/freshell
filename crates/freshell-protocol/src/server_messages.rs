@@ -1195,6 +1195,8 @@ pub struct TerminalReplaced {
 pub struct TerminalSessionAssociated {
     pub session_ref: SessionLocator,
     pub terminal_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeDescriptor>,
     /// Present only on a server-authoritative mid-session rebind; names the
     /// session id this association supersedes. Optional+additive on the wire
     /// (WS_PROTOCOL_VERSION deliberately not bumped -- see plan

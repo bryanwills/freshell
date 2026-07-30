@@ -693,6 +693,20 @@ async fn handle_client_text(
             handle_detach(&detach.terminal_id, ws_tx, state, conn_id).await
         }
         ClientMessage::TerminalKill(kill) => handle_kill(kill, ws_tx, state).await,
+        ClientMessage::AgentRestart(request) => {
+            let restart = state.restart.clone();
+            let broadcast_tx = Arc::clone(&state.broadcast_tx);
+            tokio::spawn(async move {
+                restart
+                    .execute_registered(request, |message| {
+                        if let Ok(frame) = serde_json::to_string(message) {
+                            let _ = broadcast_tx.send(frame);
+                        }
+                    })
+                    .await;
+            });
+            true
+        }
         // freshAgent.create / freshAgent.send (codex + claude slices): dispatch to the
         // shared provider state as a DETACHED task so the cold sidecar spawn + the live
         // turn never block this connection's select loop (which must keep fanning out

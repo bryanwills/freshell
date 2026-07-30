@@ -42,6 +42,7 @@ pub mod codex;
 pub mod identity_sink;
 pub mod opencode_ws;
 pub mod pane_ops;
+pub mod runtime_identity;
 pub mod session_lease;
 pub mod snapshot;
 pub mod spawn_gate;
@@ -58,6 +59,9 @@ pub use identity_sink::{
     SinkWrite,
 };
 pub use opencode_ws::FreshOpencodeState;
+pub use runtime_identity::{
+    FreshRuntimeIdentity, FreshRuntimeRegistry, SharedFreshRuntimeRegistry,
+};
 pub use snapshot::SnapshotState;
 pub use spawn_gate::{SpawnGate, SpawnGateError};
 

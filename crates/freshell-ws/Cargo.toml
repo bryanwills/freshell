@@ -76,6 +76,7 @@ freshell-codex = { path = "../freshell-codex", features = ["real-transport"] }
 # `freshell-server` installs (`crates/freshell-server/src/logging.rs`) --
 # this crate only emits events, it never installs its own subscriber.
 tracing = "0.1"
+async-trait = "0.1"
 # tabs-sync snapshot generation ids (continuity trio): SHA-256 over the
 # canonical `records` serialization, truncated to 128 bits. Same version the
 # workspace already resolves via crates/freshell-terminal/Cargo.toml:36.

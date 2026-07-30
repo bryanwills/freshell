@@ -1,12 +1,17 @@
+mod common;
+
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use freshell_protocol::{
-    AgentRestart, AgentRestartFailureCode, AgentRuntimeKind, FreshAgentCreated, FreshAgentEvent,
-    InventoryTerminal, RuntimeDescriptor, ServerMessage, SessionLocator, TerminalAttachReady,
-    TerminalCreated, TerminalExit, TerminalInventory, TerminalOutput, TerminalRunStatus,
+    AgentRestart, AgentRestartFailureCode, AgentRuntimeKind, ClientMessage, FreshAgentCreated,
+    FreshAgentEvent, InventoryTerminal, RuntimeDescriptor, ServerMessage, SessionLocator,
+    TerminalAttachReady, TerminalCreated, TerminalExit, TerminalInventory, TerminalOutput,
+    TerminalRunStatus, TerminalSessionAssociated,
 };
 use freshell_ws::restart::{RestartCoordinator, RestartFailure, RestartRuntime, RuntimeLocator};
+use futures_util::SinkExt;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 struct FakeRuntime {
     events: Mutex<Vec<&'static str>>,
@@ -38,6 +43,7 @@ impl FakeRuntime {
     }
 }
 
+#[async_trait::async_trait]
 impl RestartRuntime for FakeRuntime {
     type ResumePlan = ();
 
@@ -85,6 +91,7 @@ struct OrderedRuntime {
     phase: Arc<AtomicUsize>,
 }
 
+#[async_trait::async_trait]
 impl RestartRuntime for OrderedRuntime {
     type ResumePlan = ();
 
@@ -280,6 +287,36 @@ async fn request_id_reuse_with_a_different_fingerprint_is_rejected() {
 }
 
 #[test]
+fn late_terminal_association_binds_the_existing_live_runtime_to_the_durable_locator() {
+    let coordinator = RestartCoordinator::new();
+    let descriptor = coordinator.register_live(AgentRuntimeKind::Terminal, "term-late");
+    let mut associated = ServerMessage::TerminalSessionAssociated(TerminalSessionAssociated {
+        terminal_id: "term-late".to_string(),
+        session_ref: SessionLocator {
+            provider: "opencode".to_string(),
+            session_id: "durable-late".to_string(),
+        },
+        previous_session_id: None,
+        runtime: None,
+    });
+
+    coordinator.observe_server_message(&mut associated);
+
+    assert_eq!(
+        coordinator.runtime_for_locator(&RuntimeLocator::new(
+            AgentRuntimeKind::Terminal,
+            "opencode",
+            "durable-late",
+        )),
+        Some(descriptor.clone())
+    );
+    let ServerMessage::TerminalSessionAssociated(associated) = associated else {
+        unreachable!()
+    };
+    assert_eq!(associated.runtime, Some(descriptor));
+}
+
+#[test]
 fn terminal_lifecycle_surfaces_share_one_server_owned_descriptor() {
     let coordinator = RestartCoordinator::new();
     let session_ref = SessionLocator {
@@ -464,4 +501,286 @@ fn fresh_agent_create_and_stream_frames_share_one_descriptor() {
         unreachable!()
     };
     assert_eq!(event.runtime, Some(expected));
+}
+
+#[test]
+fn fresh_agent_replacement_uses_a_distinct_live_identity_and_fences_old_frames() {
+    let coordinator = RestartCoordinator::new();
+    let session_ref = SessionLocator {
+        provider: "claude".to_string(),
+        session_id: "durable-1".to_string(),
+    };
+    let old = RuntimeDescriptor {
+        runtime_id: "fresh-runtime-old".to_string(),
+        generation: 1,
+    };
+    let replacement = RuntimeDescriptor {
+        runtime_id: "fresh-runtime-new".to_string(),
+        generation: 2,
+    };
+    for (request_id, runtime) in [
+        ("create-old", old.clone()),
+        ("create-new", replacement.clone()),
+    ] {
+        let mut created = ServerMessage::FreshAgentCreated(FreshAgentCreated {
+            provider: "claude".to_string(),
+            request_id: request_id.to_string(),
+            runtime_provider: "claude".to_string(),
+            session_id: "durable-1".to_string(),
+            session_type: "freshclaude".to_string(),
+            session_ref: Some(session_ref.clone()),
+            runtime: Some(runtime),
+        });
+        coordinator.observe_server_message(&mut created);
+    }
+
+    let mut queued_old = ServerMessage::FreshAgentEvent(FreshAgentEvent {
+        event: serde_json::json!({"type": "freshAgent.stream", "delta": "old"}),
+        provider: "claude".to_string(),
+        session_id: "durable-1".to_string(),
+        session_type: "freshclaude".to_string(),
+        runtime: Some(old.clone()),
+    });
+    coordinator.observe_server_message(&mut queued_old);
+
+    let ServerMessage::FreshAgentEvent(queued_old) = queued_old else {
+        unreachable!()
+    };
+    assert_eq!(queued_old.runtime, Some(old));
+    assert_eq!(
+        coordinator.runtime_for_locator(&RuntimeLocator::new(
+            AgentRuntimeKind::FreshAgent,
+            "claude",
+            "durable-1",
+        )),
+        Some(replacement)
+    );
+}
+
+#[tokio::test]
+async fn terminal_result_replays_after_coordinator_reopens_from_disk() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("restart-state.json");
+    let coordinator = RestartCoordinator::new_persistent(path.clone()).unwrap();
+    coordinator.register_initial(locator(), "term-1");
+    let request = restart("durable-r1", "term-1", 1);
+    coordinator
+        .execute(request.clone(), &FakeRuntime::resumable("term-2"))
+        .await;
+    drop(coordinator);
+
+    let reopened = RestartCoordinator::new_persistent(path).unwrap();
+    let runtime = FakeRuntime::resumable("must-not-run");
+    let replay = reopened.execute(request, &runtime).await;
+
+    assert!(replay.replayed);
+    assert!(matches!(
+        replay.messages.as_slice(),
+        [ServerMessage::AgentRestartReplaced(_)]
+    ));
+    assert_eq!(runtime.shutdowns.load(Ordering::SeqCst), 0);
+}
+
+struct ReplacementFails;
+
+#[async_trait::async_trait]
+impl RestartRuntime for ReplacementFails {
+    type ResumePlan = ();
+
+    async fn preflight(&self, _request: &AgentRestart) -> Result<(), RestartFailure> {
+        Ok(())
+    }
+
+    async fn shutdown_for_restart(
+        &self,
+        _request: &AgentRestart,
+        _plan: &(),
+    ) -> Result<(), RestartFailure> {
+        Ok(())
+    }
+
+    async fn create_replacement(
+        &self,
+        _request: &AgentRestart,
+        _plan: (),
+    ) -> Result<String, RestartFailure> {
+        Err(RestartFailure::new(
+            AgentRestartFailureCode::ReplacementFailed,
+            "replacement failed",
+            true,
+        ))
+    }
+}
+
+#[tokio::test]
+async fn retryable_post_shutdown_failure_is_durable_without_claiming_old_runtime_current() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("restart-state.json");
+    let coordinator = RestartCoordinator::new_persistent(path.clone()).unwrap();
+    coordinator.register_initial(locator(), "term-1");
+    coordinator
+        .execute(restart("pending-r1", "term-1", 1), &ReplacementFails)
+        .await;
+    assert_eq!(coordinator.runtime_for_locator(&locator()), None);
+    drop(coordinator);
+
+    let reopened = RestartCoordinator::new_persistent(path).unwrap();
+    assert_eq!(reopened.runtime_for_locator(&locator()), None);
+    assert_eq!(reopened.pending_recoveries().len(), 1);
+    assert_eq!(reopened.pending_recoveries()[0].request_id, "pending-r1");
+}
+
+struct ConcurrentRuntime {
+    entered: Arc<tokio::sync::Barrier>,
+    replacement: &'static str,
+}
+
+#[async_trait::async_trait]
+impl RestartRuntime for ConcurrentRuntime {
+    type ResumePlan = ();
+
+    async fn preflight(&self, _request: &AgentRestart) -> Result<(), RestartFailure> {
+        self.entered.wait().await;
+        Ok(())
+    }
+
+    async fn shutdown_for_restart(
+        &self,
+        _request: &AgentRestart,
+        _plan: &(),
+    ) -> Result<(), RestartFailure> {
+        Ok(())
+    }
+
+    async fn create_replacement(
+        &self,
+        _request: &AgentRestart,
+        _plan: (),
+    ) -> Result<String, RestartFailure> {
+        Ok(self.replacement.to_string())
+    }
+}
+
+#[tokio::test]
+async fn unrelated_provider_runtimes_restart_concurrently() {
+    let coordinator = RestartCoordinator::new();
+    let second_locator = RuntimeLocator::new(AgentRuntimeKind::Terminal, "codex", "durable-2");
+    coordinator.register_initial(locator(), "term-1");
+    coordinator.register_initial(second_locator, "term-2");
+    let entered = Arc::new(tokio::sync::Barrier::new(2));
+    let first = ConcurrentRuntime {
+        entered: Arc::clone(&entered),
+        replacement: "term-1b",
+    };
+    let second = ConcurrentRuntime {
+        entered,
+        replacement: "term-2b",
+    };
+    let second_request = AgentRestart {
+        request_id: "r2".to_string(),
+        provider: "codex".to_string(),
+        session_id: "durable-2".to_string(),
+        kind: AgentRuntimeKind::Terminal,
+        live_id: "term-2".to_string(),
+        expected_generation: 1,
+    };
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        tokio::join!(
+            coordinator.execute(restart("r1", "term-1", 1), &first),
+            coordinator.execute(second_request, &second),
+        );
+    })
+    .await
+    .expect("unrelated runtime locks must not serialize each other");
+}
+
+#[tokio::test]
+async fn connected_websocket_dispatches_restart_started_replaced_and_failed() {
+    let (url, registry, state) = common::spawn_server_with_specs_and_state(vec![]).await;
+    state
+        .restart
+        .set_runtime(Arc::new(FakeRuntime::resumable("term-ws-2")));
+    state.restart.register_initial(locator(), "term-ws-1");
+    let (mut ws, _) = common::connect_and_capture_inventory(&url).await;
+
+    ws.send(WsMessage::Text(
+        serde_json::to_string(&ClientMessage::AgentRestart(restart(
+            "ws-r1",
+            "term-ws-1",
+            1,
+        )))
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let started = common::next_frame_of_type(&mut ws, "agent.restart.started").await;
+    let replaced = common::next_frame_of_type(&mut ws, "agent.restart.replaced").await;
+    assert_eq!(started["requestId"], "ws-r1");
+    assert_eq!(replaced["runtimeId"], "term-ws-2");
+
+    let failed_locator =
+        RuntimeLocator::new(AgentRuntimeKind::Terminal, "claude", "durable-failed");
+    state
+        .restart
+        .register_initial(failed_locator, "term-ws-failed");
+    state
+        .restart
+        .set_runtime(Arc::new(FakeRuntime::unresumable()));
+    let failed_request = AgentRestart {
+        request_id: "ws-r2".to_string(),
+        provider: "claude".to_string(),
+        session_id: "durable-failed".to_string(),
+        kind: AgentRuntimeKind::Terminal,
+        live_id: "term-ws-failed".to_string(),
+        expected_generation: 1,
+    };
+    ws.send(WsMessage::Text(
+        serde_json::to_string(&ClientMessage::AgentRestart(failed_request))
+            .unwrap()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let failed = common::next_frame_of_type(&mut ws, "agent.restart.failed").await;
+    assert_eq!(failed["requestId"], "ws-r2");
+    assert_eq!(failed["code"], "UNRESUMABLE");
+
+    registry.kill_all();
+}
+
+#[tokio::test]
+async fn fresh_agent_runtime_is_registered_before_created_broadcast() {
+    let coordinator = RestartCoordinator::new();
+    let (broadcast_tx, mut broadcast_rx) = tokio::sync::broadcast::channel(16);
+    let auth = Arc::new("test-token".to_string());
+    let state = freshell_freshagent::FreshOpencodeState::new(
+        freshell_freshagent::FreshAgentState::new(auth, Arc::new(broadcast_tx)),
+    );
+    state.set_runtime_registry(Arc::new(coordinator.clone()));
+    let create: freshell_protocol::FreshAgentCreate = serde_json::from_value(serde_json::json!({
+        "requestId": "fresh-create-1",
+        "sessionType": "freshopencode",
+        "provider": "opencode"
+    }))
+    .unwrap();
+
+    state.handle_create(create).await;
+
+    let raw = broadcast_rx.recv().await.unwrap();
+    let created: ServerMessage = serde_json::from_str(&raw).unwrap();
+    let ServerMessage::FreshAgentCreated(created) = created else {
+        panic!("expected freshAgent.created")
+    };
+    let runtime = created.runtime.expect("runtime is stamped at creation");
+    assert!(runtime.runtime_id.starts_with("fresh-runtime-"));
+    assert_eq!(
+        coordinator.runtime_for_locator(&RuntimeLocator::new(
+            AgentRuntimeKind::FreshAgent,
+            "opencode",
+            "freshopencode-fresh-create-1",
+        )),
+        Some(runtime)
+    );
 }

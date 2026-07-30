@@ -5,15 +5,17 @@
 //! generations, preflight-before-shutdown ordering, and terminal-result replay.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use freshell_protocol::{
     AgentRestart, AgentRestartFailed, AgentRestartFailureCode, AgentRestartReplaced,
     AgentRestartStarted, AgentRuntimeKind, OldRuntimeDescriptor, RuntimeDescriptor, ServerMessage,
 };
+use serde::{Deserialize, Serialize};
 
 /// Canonical durable identity of one restartable runtime.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RuntimeLocator {
     pub kind: AgentRuntimeKind,
     pub provider: String,
@@ -42,10 +44,41 @@ impl RuntimeLocator {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredResult {
     fingerprint: AgentRestart,
     terminal: ServerMessage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingRestartRecovery {
+    pub request_id: String,
+    pub request: AgentRestart,
+    pub old_runtime: RuntimeDescriptor,
+    pub last_failure: Option<AgentRestartFailed>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedGeneration {
+    locator: RuntimeLocator,
+    generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedResult {
+    request_id: String,
+    result: StoredResult,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedOwnership {
+    #[serde(default)]
+    generations: Vec<PersistedGeneration>,
+    #[serde(default)]
+    results: Vec<PersistedResult>,
+    #[serde(default)]
+    pending_recoveries: Vec<PendingRestartRecovery>,
 }
 
 #[derive(Debug, Default)]
@@ -54,7 +87,11 @@ struct RuntimeOwnership {
     /// Exact descriptor for every observed live runtime id, including retired
     /// generations whose already-queued output/exit frames still need fencing.
     descriptor_by_live: HashMap<(AgentRuntimeKind, String), RuntimeDescriptor>,
+    locator_by_live: HashMap<(AgentRuntimeKind, String), RuntimeLocator>,
+    fresh_event_aliases: HashMap<(String, String), RuntimeDescriptor>,
+    last_generation: HashMap<RuntimeLocator, u64>,
     results: HashMap<String, StoredResult>,
+    pending_recoveries: HashMap<String, PendingRestartRecovery>,
 }
 
 /// Error returned by a provider-specific restart adapter.
@@ -76,7 +113,7 @@ impl RestartFailure {
 }
 
 /// Existing provider-specific resume paths implement this seam in Task 2.
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait RestartRuntime: Send + Sync {
     type ResumePlan: Send;
 
@@ -107,16 +144,221 @@ pub struct RestartOutcome {
     pub replayed: bool,
 }
 
+struct UnavailableRestartRuntime;
+
+#[async_trait::async_trait]
+impl RestartRuntime for UnavailableRestartRuntime {
+    type ResumePlan = ();
+
+    async fn preflight(&self, _request: &AgentRestart) -> Result<(), RestartFailure> {
+        Err(RestartFailure::new(
+            AgentRestartFailureCode::Unresumable,
+            "no restart adapter is registered for this runtime",
+            false,
+        ))
+    }
+
+    async fn shutdown_for_restart(
+        &self,
+        _request: &AgentRestart,
+        _plan: &(),
+    ) -> Result<(), RestartFailure> {
+        unreachable!("unavailable restart adapter never passes preflight")
+    }
+
+    async fn create_replacement(
+        &self,
+        _request: &AgentRestart,
+        _plan: (),
+    ) -> Result<String, RestartFailure> {
+        unreachable!("unavailable restart adapter never passes preflight")
+    }
+}
+
 /// One server-owned registry for runtime descriptors and restart results.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct RestartCoordinator {
     ownership: Arc<Mutex<RuntimeOwnership>>,
-    execution: Arc<tokio::sync::Mutex<()>>,
+    persistence_path: Option<Arc<PathBuf>>,
+    locator_locks: Arc<Mutex<HashMap<RuntimeLocator, Arc<tokio::sync::Mutex<()>>>>>,
+    request_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    registered_runtime: Arc<std::sync::RwLock<Option<Arc<dyn RestartRuntime<ResumePlan = ()>>>>>,
+}
+
+impl Default for RestartCoordinator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RestartCoordinator {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            ownership: Arc::new(Mutex::new(RuntimeOwnership::default())),
+            persistence_path: None,
+            locator_locks: Arc::new(Mutex::new(HashMap::new())),
+            request_locks: Arc::new(Mutex::new(HashMap::new())),
+            registered_runtime: Arc::new(std::sync::RwLock::new(None)),
+        }
+    }
+
+    pub fn new_persistent(path: impl Into<PathBuf>) -> std::io::Result<Self> {
+        let path = path.into();
+        let ownership = Self::load_persisted(&path)?;
+        Ok(Self {
+            ownership: Arc::new(Mutex::new(ownership)),
+            persistence_path: Some(Arc::new(path)),
+            locator_locks: Arc::new(Mutex::new(HashMap::new())),
+            request_locks: Arc::new(Mutex::new(HashMap::new())),
+            registered_runtime: Arc::new(std::sync::RwLock::new(None)),
+        })
+    }
+
+    fn load_persisted(path: &Path) -> std::io::Result<RuntimeOwnership> {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(RuntimeOwnership::default())
+            }
+            Err(error) => return Err(error),
+        };
+        let persisted: PersistedOwnership = serde_json::from_slice(&bytes).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid restart transaction state: {error}"),
+            )
+        })?;
+        Ok(RuntimeOwnership {
+            last_generation: persisted
+                .generations
+                .into_iter()
+                .map(|entry| (entry.locator, entry.generation))
+                .collect(),
+            results: persisted
+                .results
+                .into_iter()
+                .map(|entry| (entry.request_id, entry.result))
+                .collect(),
+            pending_recoveries: persisted
+                .pending_recoveries
+                .into_iter()
+                .map(|entry| (entry.request_id.clone(), entry))
+                .collect(),
+            ..RuntimeOwnership::default()
+        })
+    }
+
+    fn persist_locked(&self, ownership: &RuntimeOwnership) -> std::io::Result<()> {
+        let Some(path) = self.persistence_path.as_deref() else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let state = PersistedOwnership {
+            generations: ownership
+                .last_generation
+                .iter()
+                .map(|(locator, generation)| PersistedGeneration {
+                    locator: locator.clone(),
+                    generation: *generation,
+                })
+                .collect(),
+            results: ownership
+                .results
+                .iter()
+                .map(|(request_id, result)| PersistedResult {
+                    request_id: request_id.clone(),
+                    result: result.clone(),
+                })
+                .collect(),
+            pending_recoveries: ownership.pending_recoveries.values().cloned().collect(),
+        };
+        let bytes = serde_json::to_vec_pretty(&state)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let temp = path.with_extension(format!(
+            "tmp-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temp)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+        }
+        if let Err(error) = std::fs::rename(&temp, path.as_path()) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error);
+        }
+        if let Some(parent) = path.parent() {
+            if let Ok(directory) = std::fs::File::open(parent) {
+                let _ = directory.sync_all();
+            }
+        }
+        Ok(())
+    }
+
+    fn persist_or_log(&self, ownership: &RuntimeOwnership, operation: &'static str) {
+        if let Err(error) = self.persist_locked(ownership) {
+            tracing::error!(
+                error = %error,
+                operation,
+                "agent.restart.persistence.failed"
+            );
+        }
+    }
+
+    pub fn pending_recoveries(&self) -> Vec<PendingRestartRecovery> {
+        self.ownership
+            .lock()
+            .expect("restart ownership lock")
+            .pending_recoveries
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub fn set_runtime(&self, runtime: Arc<dyn RestartRuntime<ResumePlan = ()>>) {
+        *self
+            .registered_runtime
+            .write()
+            .expect("registered restart runtime lock") = Some(runtime);
+    }
+
+    pub async fn execute_registered<F>(&self, request: AgentRestart, emit: F) -> RestartOutcome
+    where
+        F: FnMut(&ServerMessage),
+    {
+        let runtime = self
+            .registered_runtime
+            .read()
+            .expect("registered restart runtime lock")
+            .clone();
+        let runtime = runtime.unwrap_or_else(|| Arc::new(UnavailableRestartRuntime));
+        self.execute_with_events(request, runtime.as_ref(), emit)
+            .await
+    }
+
+    fn locator_lock(&self, locator: &RuntimeLocator) -> Arc<tokio::sync::Mutex<()>> {
+        self.locator_locks
+            .lock()
+            .expect("restart locator locks")
+            .entry(locator.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    fn request_lock(&self, request_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.request_locks
+            .lock()
+            .expect("restart request locks")
+            .entry(request_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Register a runtime discovered by create/attach/inventory/reconciliation.
@@ -139,22 +381,62 @@ impl RestartCoordinator {
             .get(&(locator.kind, runtime_id.clone()))
             .cloned()
         {
-            ownership.by_locator.insert(locator, existing.clone());
+            ownership
+                .last_generation
+                .entry(locator.clone())
+                .and_modify(|generation| *generation = (*generation).max(existing.generation))
+                .or_insert(existing.generation);
+            Self::bind_locator_locked(&mut ownership, locator, runtime_id, existing.clone());
+            self.persist_or_log(&ownership, "bind_existing_runtime");
             return existing;
         }
         let generation = ownership
-            .by_locator
+            .last_generation
             .get(&locator)
-            .map_or(1, |current| current.generation.saturating_add(1));
+            .map_or(1, |generation| generation.saturating_add(1));
         let descriptor = RuntimeDescriptor {
             runtime_id: runtime_id.clone(),
             generation,
         };
-        ownership
-            .descriptor_by_live
-            .insert((locator.kind, runtime_id), descriptor.clone());
-        ownership.by_locator.insert(locator, descriptor.clone());
+        Self::bind_locator_locked(
+            &mut ownership,
+            locator.clone(),
+            runtime_id,
+            descriptor.clone(),
+        );
+        ownership.last_generation.insert(locator, generation);
+        self.persist_or_log(&ownership, "register_runtime");
         descriptor
+    }
+
+    fn bind_locator_locked(
+        ownership: &mut RuntimeOwnership,
+        locator: RuntimeLocator,
+        runtime_id: String,
+        descriptor: RuntimeDescriptor,
+    ) {
+        let live_key = (locator.kind, runtime_id.clone());
+        if let Some(previous_locator) = ownership
+            .locator_by_live
+            .insert(live_key.clone(), locator.clone())
+        {
+            if previous_locator != locator
+                && ownership
+                    .by_locator
+                    .get(&previous_locator)
+                    .is_some_and(|current| current.runtime_id == runtime_id)
+            {
+                ownership.by_locator.remove(&previous_locator);
+            }
+        }
+        if let Some(previous_runtime) = ownership.by_locator.insert(locator, descriptor.clone()) {
+            if previous_runtime.runtime_id != runtime_id {
+                ownership
+                    .locator_by_live
+                    .remove(&(live_key.0, previous_runtime.runtime_id));
+            }
+        }
+        ownership.descriptor_by_live.insert(live_key, descriptor);
     }
 
     /// Register a runtime that does not have a durable locator. This keeps the
@@ -167,14 +449,16 @@ impl RestartCoordinator {
     ) -> RuntimeDescriptor {
         let runtime_id = runtime_id.into();
         let mut ownership = self.ownership.lock().expect("restart ownership lock");
-        ownership
+        let descriptor = ownership
             .descriptor_by_live
             .entry((kind, runtime_id.clone()))
             .or_insert_with(|| RuntimeDescriptor {
                 runtime_id,
                 generation: 1,
             })
-            .clone()
+            .clone();
+        self.persist_or_log(&ownership, "register_unbound_runtime");
+        descriptor
     }
 
     /// Descriptor lookup used to stamp runtime-addressed lifecycle surfaces.
@@ -255,6 +539,14 @@ impl RestartCoordinator {
                     self.runtime_for_live(AgentRuntimeKind::Terminal, &frame.terminal_id)
                 });
             }
+            ServerMessage::TerminalSessionAssociated(frame) => {
+                let locator = RuntimeLocator::new(
+                    AgentRuntimeKind::Terminal,
+                    &frame.session_ref.provider,
+                    &frame.session_ref.session_id,
+                );
+                frame.runtime = Some(self.register_initial(locator, &frame.terminal_id));
+            }
             ServerMessage::FreshAgentCreated(frame) => {
                 let locator = frame
                     .session_ref
@@ -273,7 +565,20 @@ impl RestartCoordinator {
                             &frame.session_id,
                         )
                     });
-                frame.runtime = Some(self.register_initial(locator, &frame.session_id));
+                frame.runtime = Some(match frame.runtime.as_ref() {
+                    Some(runtime) => self.register_supplied(locator, runtime.clone()),
+                    None => self.register_initial(
+                        locator,
+                        format!("fresh-runtime-{}", uuid::Uuid::new_v4()),
+                    ),
+                });
+                if let Some(runtime) = frame.runtime.clone() {
+                    self.ownership
+                        .lock()
+                        .expect("restart ownership lock")
+                        .fresh_event_aliases
+                        .insert((frame.provider.clone(), frame.session_id.clone()), runtime);
+                }
             }
             ServerMessage::FreshAgentSessionMaterialized(frame) => {
                 let locator = frame
@@ -293,22 +598,41 @@ impl RestartCoordinator {
                             &frame.session_id,
                         )
                     });
-                frame.runtime = Some(self.register_initial(locator, &frame.session_id));
+                frame.runtime = Some(match frame.runtime.as_ref() {
+                    Some(runtime) => self.register_supplied(locator, runtime.clone()),
+                    None => self.register_initial(
+                        locator,
+                        format!("fresh-runtime-{}", uuid::Uuid::new_v4()),
+                    ),
+                });
+                if let Some(runtime) = frame.runtime.clone() {
+                    let mut ownership = self.ownership.lock().expect("restart ownership lock");
+                    ownership.fresh_event_aliases.insert(
+                        (frame.provider.clone(), frame.previous_session_id.clone()),
+                        runtime.clone(),
+                    );
+                    ownership
+                        .fresh_event_aliases
+                        .insert((frame.provider.clone(), frame.session_id.clone()), runtime);
+                }
             }
             ServerMessage::FreshAgentEvent(frame) => {
-                frame.runtime = frame.runtime.clone().or_else(|| {
-                    self.runtime_for_live(AgentRuntimeKind::FreshAgent, &frame.session_id)
+                if frame.runtime.is_none() {
+                    frame.runtime = self
+                        .ownership
+                        .lock()
+                        .expect("restart ownership lock")
+                        .fresh_event_aliases
+                        .get(&(frame.provider.clone(), frame.session_id.clone()))
+                        .cloned()
                         .or_else(|| {
-                            Some(self.register_initial(
-                                RuntimeLocator::new(
-                                    AgentRuntimeKind::FreshAgent,
-                                    &frame.provider,
-                                    &frame.session_id,
-                                ),
+                            self.runtime_for_locator(&RuntimeLocator::new(
+                                AgentRuntimeKind::FreshAgent,
+                                &frame.provider,
                                 &frame.session_id,
                             ))
-                        })
-                });
+                        });
+                }
             }
             ServerMessage::PaneReconcileResult(frame) => {
                 for verdict in &mut frame.verdicts {
@@ -342,7 +666,12 @@ impl RestartCoordinator {
         };
         if !matches!(
             envelope.get("type").and_then(serde_json::Value::as_str),
-            Some("freshAgent.created" | "freshAgent.event" | "freshAgent.session.materialized")
+            Some(
+                "terminal.session.associated"
+                    | "freshAgent.created"
+                    | "freshAgent.event"
+                    | "freshAgent.session.materialized"
+            )
         ) {
             return json.to_string();
         }
@@ -351,6 +680,41 @@ impl RestartCoordinator {
         };
         self.observe_server_message(&mut message);
         serde_json::to_string(&message).unwrap_or_else(|_| json.to_string())
+    }
+
+    pub fn register_supplied(
+        &self,
+        locator: RuntimeLocator,
+        descriptor: RuntimeDescriptor,
+    ) -> RuntimeDescriptor {
+        let mut ownership = self.ownership.lock().expect("restart ownership lock");
+        let last_generation = ownership
+            .last_generation
+            .get(&locator)
+            .copied()
+            .unwrap_or_default();
+        if descriptor.generation < last_generation {
+            return descriptor;
+        }
+        if descriptor.generation == last_generation
+            && ownership
+                .by_locator
+                .get(&locator)
+                .is_some_and(|current| current.runtime_id != descriptor.runtime_id)
+        {
+            return descriptor;
+        }
+        ownership
+            .last_generation
+            .insert(locator.clone(), descriptor.generation);
+        Self::bind_locator_locked(
+            &mut ownership,
+            locator,
+            descriptor.runtime_id.clone(),
+            descriptor.clone(),
+        );
+        self.persist_or_log(&ownership, "register_supplied_runtime");
+        descriptor
     }
 
     fn observe_terminal(
@@ -379,9 +743,8 @@ impl RestartCoordinator {
         })
     }
 
-    /// Run or replay a transaction. A process-wide async mutex closes the
-    /// same-request race: a concurrent resend waits, then observes the stored
-    /// terminal result instead of running provider teardown a second time.
+    /// Run or replay a transaction. Request-id and durable-locator locks close
+    /// duplicate/overlap races without serializing unrelated providers or runtimes.
     pub async fn execute<R: RestartRuntime>(
         &self,
         request: AgentRestart,
@@ -400,10 +763,14 @@ impl RestartCoordinator {
         mut emit: F,
     ) -> RestartOutcome
     where
-        R: RestartRuntime,
+        R: RestartRuntime + ?Sized,
         F: FnMut(&ServerMessage),
     {
-        let _execution = self.execution.lock().await;
+        let locator = RuntimeLocator::from_request(&request);
+        let request_lock = self.request_lock(&request.request_id);
+        let locator_lock = self.locator_lock(&locator);
+        let _request_guard = request_lock.lock_owned().await;
+        let _locator_guard = locator_lock.lock_owned().await;
 
         if let Some(outcome) = self.replay_or_conflict(&request) {
             for message in &outcome.messages {
@@ -412,7 +779,6 @@ impl RestartCoordinator {
             return outcome;
         }
 
-        let locator = RuntimeLocator::from_request(&request);
         let expected = RuntimeDescriptor {
             runtime_id: request.live_id.clone(),
             generation: request.expected_generation,
@@ -465,16 +831,69 @@ impl RestartCoordinator {
         );
         emit(&started);
 
+        {
+            let mut ownership = self.ownership.lock().expect("restart ownership lock");
+            ownership.pending_recoveries.insert(
+                request.request_id.clone(),
+                PendingRestartRecovery {
+                    request_id: request.request_id.clone(),
+                    request: request.clone(),
+                    old_runtime: expected.clone(),
+                    last_failure: None,
+                },
+            );
+            self.persist_or_log(&ownership, "record_shutdown_pending");
+        }
+
         if let Err(failure) = runtime.shutdown_for_restart(&request, &plan).await {
+            let mut ownership = self.ownership.lock().expect("restart ownership lock");
+            ownership.pending_recoveries.remove(&request.request_id);
+            self.persist_or_log(&ownership, "clear_failed_shutdown");
+            drop(ownership);
             let mut outcome = self.store_failure(request, expected, failure, false);
             emit(&outcome.messages[0]);
             outcome.messages.insert(0, started);
             return outcome;
         }
 
+        {
+            let mut ownership = self.ownership.lock().expect("restart ownership lock");
+            if ownership
+                .by_locator
+                .get(&locator)
+                .is_some_and(|current| current == &expected)
+            {
+                ownership.by_locator.remove(&locator);
+            }
+            self.persist_or_log(&ownership, "record_shutdown");
+        }
+
         let replacement_id = match runtime.create_replacement(&request, plan).await {
             Ok(runtime_id) => runtime_id,
             Err(failure) => {
+                if failure.retryable {
+                    let failed = AgentRestartFailed {
+                        request_id: request.request_id.clone(),
+                        provider: request.provider.clone(),
+                        session_id: request.session_id.clone(),
+                        kind: request.kind,
+                        runtime: expected.clone(),
+                        code: failure.code,
+                        message: failure.message.clone(),
+                        retryable: true,
+                    };
+                    let mut ownership = self.ownership.lock().expect("restart ownership lock");
+                    if let Some(recovery) =
+                        ownership.pending_recoveries.get_mut(&request.request_id)
+                    {
+                        recovery.last_failure = Some(failed);
+                    }
+                    self.persist_or_log(&ownership, "record_retryable_replacement_failure");
+                } else {
+                    let mut ownership = self.ownership.lock().expect("restart ownership lock");
+                    ownership.pending_recoveries.remove(&request.request_id);
+                    self.persist_or_log(&ownership, "clear_terminal_replacement_failure");
+                }
                 let mut outcome = self.store_failure(request, expected, failure, false);
                 emit(&outcome.messages[0]);
                 outcome.messages.insert(0, started);
@@ -484,21 +903,15 @@ impl RestartCoordinator {
 
         let replacement = {
             let mut ownership = self.ownership.lock().expect("restart ownership lock");
-            let Some(current) = ownership.by_locator.get(&locator).cloned() else {
-                drop(ownership);
-                let failure = RestartFailure::new(
-                    AgentRestartFailureCode::RuntimeNotFound,
-                    "runtime ownership disappeared during restart",
-                    true,
-                );
-                let mut outcome = self.store_failure(request, expected, failure, false);
-                emit(&outcome.messages[0]);
-                outcome.messages.insert(0, started);
-                return outcome;
-            };
-            let observed_replacement = current.runtime_id == replacement_id
-                && current.generation == expected.generation.saturating_add(1);
-            if current != expected && !observed_replacement {
+            let current = ownership.by_locator.get(&locator).cloned();
+            let observed_replacement = current.as_ref().is_some_and(|current| {
+                current.runtime_id == replacement_id
+                    && current.generation == expected.generation.saturating_add(1)
+            });
+            if current
+                .as_ref()
+                .is_some_and(|current| current != &expected && !observed_replacement)
+            {
                 drop(ownership);
                 let failure = RestartFailure::new(
                     AgentRestartFailureCode::StaleGeneration,
@@ -511,7 +924,7 @@ impl RestartCoordinator {
                 return outcome;
             }
             let descriptor = if observed_replacement {
-                current
+                current.expect("observed replacement has current descriptor")
             } else {
                 RuntimeDescriptor {
                     runtime_id: replacement_id.clone(),
@@ -521,7 +934,15 @@ impl RestartCoordinator {
             ownership
                 .descriptor_by_live
                 .insert((request.kind, replacement_id), descriptor.clone());
-            ownership.by_locator.insert(locator, descriptor.clone());
+            ownership
+                .last_generation
+                .insert(locator.clone(), descriptor.generation);
+            Self::bind_locator_locked(
+                &mut ownership,
+                locator,
+                descriptor.runtime_id.clone(),
+                descriptor.clone(),
+            );
             descriptor
         };
 
@@ -553,6 +974,13 @@ impl RestartCoordinator {
         let ownership = self.ownership.lock().expect("restart ownership lock");
         let stored = ownership.results.get(&request.request_id)?;
         if stored.fingerprint == *request {
+            tracing::info!(
+                request_id = %request.request_id,
+                provider = %request.provider,
+                session_id = %request.session_id,
+                kind = ?request.kind,
+                "agent.restart.replayed"
+            );
             return Some(RestartOutcome {
                 messages: vec![stored.terminal.clone()],
                 replayed: true,
@@ -565,6 +993,13 @@ impl RestartCoordinator {
                 runtime_id: request.live_id.clone(),
                 generation: request.expected_generation,
             });
+        tracing::warn!(
+            request_id = %request.request_id,
+            provider = %request.provider,
+            session_id = %request.session_id,
+            kind = ?request.kind,
+            "agent.restart.request_id_conflict"
+        );
         Some(RestartOutcome {
             messages: vec![ServerMessage::AgentRestartFailed(AgentRestartFailed {
                 request_id: request.request_id.clone(),
@@ -614,16 +1049,32 @@ impl RestartCoordinator {
     }
 
     fn store_terminal(&self, request: &AgentRestart, terminal: ServerMessage) {
-        self.ownership
-            .lock()
-            .expect("restart ownership lock")
-            .results
-            .insert(
-                request.request_id.clone(),
-                StoredResult {
-                    fingerprint: request.clone(),
-                    terminal,
-                },
-            );
+        let mut ownership = self.ownership.lock().expect("restart ownership lock");
+        let is_replaced = matches!(&terminal, ServerMessage::AgentRestartReplaced(_));
+        ownership.results.insert(
+            request.request_id.clone(),
+            StoredResult {
+                fingerprint: request.clone(),
+                terminal,
+            },
+        );
+        if is_replaced {
+            ownership.pending_recoveries.remove(&request.request_id);
+        }
+        self.persist_or_log(&ownership, "store_terminal_result");
+    }
+}
+
+impl freshell_freshagent::FreshRuntimeRegistry for RestartCoordinator {
+    fn register_runtime(
+        &self,
+        provider: &str,
+        durable_session_id: &str,
+        live_runtime_id: &str,
+    ) -> RuntimeDescriptor {
+        self.register_initial(
+            RuntimeLocator::new(AgentRuntimeKind::FreshAgent, provider, durable_session_id),
+            live_runtime_id,
+        )
     }
 }
