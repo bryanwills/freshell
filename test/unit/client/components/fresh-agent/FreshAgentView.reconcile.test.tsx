@@ -315,6 +315,41 @@ describe('FreshAgentView reconcile fold drive (Task 9)', () => {
     })])
   })
 
+  it('ignores a replacement for a legacy pane without a runtime fence', async () => {
+    renderFreshAgentPane({
+      sessionId: DURABLE,
+      status: 'running',
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+      resumeSessionId: DURABLE,
+    })
+    await flush()
+    wsMock.send.mockClear()
+
+    act(() => {
+      store.dispatch(applyAgentRestartReplaced({
+        type: 'agent.restart.replaced',
+        requestId: 'restart-legacy',
+        provider: 'claude',
+        sessionId: DURABLE,
+        kind: 'fresh-agent',
+        // sessionId must not substitute for an opaque old runtime id.
+        oldRuntimeId: DURABLE,
+        oldGeneration: 7,
+        runtimeId: 'runtime-new',
+        generation: 8,
+      }))
+    })
+    await flush()
+
+    expect(leafContent(store.getState())).toMatchObject({
+      sessionId: DURABLE,
+      runtimeId: undefined,
+      runtimeGeneration: undefined,
+    })
+    expect(sentOfType('freshAgent.create')).toHaveLength(0)
+    expect(sentOfType('freshAgent.attach')).toHaveLength(0)
+  })
+
   it('the mount create defers while reconcile-pending and falls back after the bound', async () => {
     seedPendingForPane(tabId, paneId)
     renderFreshAgentPane({ sessionId: undefined, status: 'creating', sessionRef: { provider: 'claude', sessionId: DURABLE } })

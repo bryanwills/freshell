@@ -240,14 +240,10 @@ const freshAgentSlice = createSlice({
       for (const [oldKey, session] of Object.entries(state.sessions)) {
         if (session.provider !== replacement.provider) continue
         if (replacement.generation <= replacement.oldGeneration) continue
-        const currentRuntimeId = session.runtimeId ?? session.sessionId
-        if (currentRuntimeId !== replacement.oldRuntimeId) continue
-        if (
-          session.runtimeGeneration !== undefined
-          && session.runtimeGeneration !== replacement.oldGeneration
-        ) {
-          continue
-        }
+        // Do not let an old broadcast repoint legacy session state. Durable
+        // sessionId is deliberately not a transport/runtime identifier.
+        if (session.runtimeId !== replacement.oldRuntimeId) continue
+        if (session.runtimeGeneration !== replacement.oldGeneration) continue
 
         session.runtimeGeneration = replacement.generation
         session.runtimeId = replacement.runtimeId

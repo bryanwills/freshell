@@ -22,14 +22,11 @@ function paneRuntimeProvider(content: RestartablePaneContent): string {
   return content.kind === 'terminal' ? content.mode : content.provider
 }
 
-function paneLiveRuntimeId(content: RestartablePaneContent): string | undefined {
-  return content.runtimeId
-    ?? (content.kind === 'terminal' ? content.terminalId : content.sessionId)
-}
-
 /**
  * A restart broadcast names durable identity plus the exact old runtime
- * generation. Only panes viewing that same runtime may follow the replacement.
+ * identity and generation. Only panes viewing that same fully-fenced runtime
+ * may follow the replacement. Legacy persisted panes lacking either fence
+ * fail closed: durable/session-facing IDs are never runtime identities.
  */
 export function paneMatchesAgentRuntimeReplacement(
   content: PaneContent,
@@ -45,13 +42,8 @@ export function paneMatchesAgentRuntimeReplacement(
     return false
   }
   if (replacement.generation <= replacement.oldGeneration) return false
-  if (paneLiveRuntimeId(content) !== replacement.oldRuntimeId) return false
-  if (
-    content.runtimeGeneration !== undefined
-    && content.runtimeGeneration !== replacement.oldGeneration
-  ) {
-    return false
-  }
+  if (content.runtimeId !== replacement.oldRuntimeId) return false
+  if (content.runtimeGeneration !== replacement.oldGeneration) return false
   return true
 }
 

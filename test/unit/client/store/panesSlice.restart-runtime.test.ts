@@ -113,6 +113,25 @@ describe('panesSlice agent restart replacement', () => {
     expect(wrongOldRuntime).toEqual(once)
   })
 
+  it('fails closed for a legacy pane without an exact runtime fence', () => {
+    const initial = stateWithViewers()
+    const legacy = leaves(initial.layouts.tab1)[0].content
+    if (legacy.kind !== 'terminal') throw new Error('expected terminal')
+    // terminalId is a durable/session-facing identifier in legacy persisted
+    // layouts. It must not be treated as the opaque runtime identity.
+    legacy.runtimeId = undefined
+    legacy.runtimeGeneration = undefined
+
+    const next = reducer(initial, applyAgentRestartReplaced(replacement))
+    const content = leaves(next.layouts.tab1)[0].content
+    expect(content).toMatchObject({
+      kind: 'terminal',
+      terminalId: 'terminal-old',
+      runtimeId: undefined,
+      runtimeGeneration: undefined,
+    })
+  })
+
   it('rebinds fresh-agent viewers while retaining durable identity and pane settings', () => {
     const initial = stateWithViewers()
     initial.layouts.tab1 = {

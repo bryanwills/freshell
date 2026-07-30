@@ -102,4 +102,27 @@ describe('freshAgentSlice agent restart replacement', () => {
     expect(state.sessions[key].streamingActive).toBe(true)
     expect(state.sessions[key].status).toBe('running')
   })
+
+  it('fails closed for an unfenced legacy session even when its durable session id matches', () => {
+    let state = structuredClone(activeState())
+    delete state.sessions[key].runtimeId
+    delete state.sessions[key].runtimeGeneration
+
+    state = reducer(state, applyAgentRestartReplaced({
+      type: 'agent.restart.replaced',
+      requestId: 'restart-legacy',
+      provider: 'codex',
+      sessionId: 's1',
+      kind: 'fresh-agent',
+      // This used to match through the sessionId fallback.
+      oldRuntimeId: 's1',
+      oldGeneration: 7,
+      runtimeId: 'fresh-new',
+      generation: 8,
+    }))
+
+    expect(state.sessions[key].sessionId).toBe('s1')
+    expect(state.sessions[key]).not.toHaveProperty('runtimeId')
+    expect(state.sessions[key]).not.toHaveProperty('runtimeGeneration')
+  })
 })
