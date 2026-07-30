@@ -91,6 +91,16 @@ pub trait CodexLaunchRuntime: Send + Sync {
 
     /// Tear the app-server down (`runtime.shutdown()`, `launch-planner.ts:302`).
     fn shutdown(&self) -> BoxFuture<'_, Result<(), String>>;
+
+    /// Snapshot the exact app-server process tree before a restart journal
+    /// crosses its destructive boundary. Injected runtimes that own no OS
+    /// process may leave this absent; the real spawn runtime always returns
+    /// its capture-before-kill barrier while live.
+    fn capture_restart_barrier(
+        &self,
+    ) -> BoxFuture<'_, Result<Option<OwnedProcessTreeBarrier>, String>> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 /// The planner's runtime factory (`CodexLaunchPlanner` ctor `runtimeOrFactory`,
@@ -149,6 +159,16 @@ impl CodexLaunchSidecar {
             .proxy
             .as_ref()
             .map(|proxy| proxy.require_candidate_persistence())
+    }
+
+    async fn capture_restart_barrier(&self) -> Result<Option<OwnedProcessTreeBarrier>, String> {
+        let inner = self.inner.lock().await;
+        if inner.shutdown_succeeded {
+            return Ok(Some(OwnedProcessTreeBarrier::already_quiescent()));
+        }
+        // Hold this exact sidecar's lifecycle lock across capture so shutdown
+        // cannot remove the child between the live-state check and snapshot.
+        self.runtime.capture_restart_barrier().await
     }
 
     async fn assert_adoptable(&self) -> Result<(), String> {
@@ -488,6 +508,32 @@ impl CodexTerminalLaunchManager {
         }
     }
 
+    /// Capture the adopted app-server's exact tree without moving ownership.
+    /// The terminal PTY has a separate process-group barrier; managed Codex
+    /// restart persists both before either owner is torn down.
+    pub async fn capture_terminal_restart_barrier(
+        &self,
+        terminal_id: &str,
+    ) -> Result<Option<OwnedProcessTreeBarrier>, String> {
+        let sidecar = self
+            .restart_retirements
+            .lock()
+            .unwrap()
+            .get(terminal_id)
+            .map(|entry| Arc::clone(&entry.sidecar))
+            .or_else(|| {
+                self.adopted
+                    .lock()
+                    .unwrap()
+                    .get(terminal_id)
+                    .map(|entry| Arc::clone(&entry.sidecar))
+            });
+        match sidecar {
+            Some(sidecar) => sidecar.capture_restart_barrier().await,
+            None => Ok(None),
+        }
+    }
+
     /// Server-exit teardown (main.rs graceful shutdown): mirrors legacy's close-time
     /// `codexLaunchPlanner.shutdown()` (`server/index.ts:981-1049` shutdown owners) —
     /// the planner stops accepting plans and tears down its unadopted sidecars — PLUS
@@ -730,6 +776,19 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
                 state.take();
             }
             Ok(())
+        })
+    }
+
+    fn capture_restart_barrier(
+        &self,
+    ) -> BoxFuture<'_, Result<Option<OwnedProcessTreeBarrier>, String>> {
+        Box::pin(async move {
+            Ok(self
+                .state
+                .lock()
+                .await
+                .as_ref()
+                .map(|spawned| spawned.tree.clone()))
         })
     }
 }

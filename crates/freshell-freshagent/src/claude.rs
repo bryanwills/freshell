@@ -566,7 +566,12 @@ impl FreshClaudeState {
                 code: code.to_string(),
                 message: message.to_string(),
                 request_id: request_id.to_string(),
-                retryable: None,
+                // Every caller is an operational create path (sidecar spawn,
+                // pipe write, provider create response, or a revoked
+                // in-flight lease after the owned tree was torn down). None
+                // proves the durable conversation unresumable, so the
+                // restart coordinator must retain the same request for retry.
+                retryable: Some(true),
             },
         ));
     }
@@ -825,11 +830,19 @@ impl FreshClaudeState {
                 child_reaped = retirement.child_reaped,
                 "freshagent.claude.restart_shutdown_not_quiescent"
             );
+            let message = format!(
+                "Claude predecessor {} is not yet fully quiescent \
+                     (tree_dead={}, consumer_quiesced={}, child_reaped={})",
+                retirement.runtime_id,
+                retirement.tree_dead,
+                retirement.consumer_quiesced,
+                retirement.child_reaped
+            );
             self.restart_retirements
                 .lock()
                 .await
                 .insert(expected_runtime_id.to_string(), retirement);
-            return crate::RestartShutdownOutcome::RetirementIncomplete;
+            return crate::RestartShutdownOutcome::RetirementIncomplete { message };
         }
 
         self.create_dedup
@@ -944,6 +957,35 @@ impl FreshClaudeState {
             return false;
         };
         self.sessions.lock().await.contains_key(&key)
+    }
+
+    /// Snapshot the exact sidecar/CLI process tree while the selected runtime
+    /// is still live. The serialized barrier lets a newly-booted coordinator
+    /// finish this retirement without depending on the in-memory session map.
+    pub async fn capture_restart_process_barrier(
+        &self,
+        durable_session_id: &str,
+        expected_runtime_id: &str,
+    ) -> Option<freshell_codex::transport::OwnedProcessTreeBarrier> {
+        if let Some(retirement) = self
+            .restart_retirements
+            .lock()
+            .await
+            .get(expected_runtime_id)
+        {
+            return (retirement.durable_session_id == durable_session_id)
+                .then(|| retirement.tree.clone());
+        }
+        let map_key = self.resolve_session_key(durable_session_id).await?;
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(&map_key)?;
+        (session.runtime.runtime_id == expected_runtime_id).then(|| {
+            freshell_codex::transport::OwnedProcessTreeBarrier::capture(
+                session.child.id().unwrap_or(0),
+                CLAUDE_SIDECAR_OWNERSHIP_ENV,
+                &session.ownership_id,
+            )
+        })
     }
 
     /// The exact Claude runtime flavour currently owning a durable session.
@@ -2426,6 +2468,36 @@ exit 0
         let err = await_top_level_error(&mut rx).await;
         assert!(err.contains("CLAUDE_ATTACH_RESUME_FAILED"));
         assert!(st.sessions.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn operational_create_failure_is_retryable_and_same_request_can_recover() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let (st, mut rx) = state_with_bus();
+        let request_id = "retryable-claude-create";
+
+        std::env::set_var("FRESHELL_CLAUDE_NODE", "/nonexistent-node-binary");
+        st.handle_create(dedup_create_msg(request_id)).await;
+        std::env::remove_var("FRESHELL_CLAUDE_NODE");
+
+        let failed: serde_json::Value =
+            serde_json::from_str(&rx.recv().await.expect("create failure frame")).unwrap();
+        assert_eq!(failed["type"], "freshAgent.create.failed");
+        assert_eq!(failed["requestId"], request_id);
+        assert_eq!(
+            failed["retryable"], true,
+            "spawn/write/create transport failures must keep the restart request recoverable"
+        );
+
+        let env = FakeClaudeSidecarEnv::install();
+        st.handle_create(dedup_create_msg(request_id)).await;
+        let created: serde_json::Value =
+            serde_json::from_str(&rx.recv().await.expect("retry create frame")).unwrap();
+        assert_eq!(created["type"], "freshAgent.created");
+        assert_eq!(created["requestId"], request_id);
+        assert_eq!(env.spawn_count(), 1);
+        drop(env);
+        st.shutdown().await;
     }
 
     #[tokio::test]

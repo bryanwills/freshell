@@ -188,6 +188,12 @@ struct CodexCreateRecord {
 struct CodexSession {
     runtime: freshell_protocol::RuntimeDescriptor,
     client: Arc<CodexAppServerClient>,
+    /// Capture-before-kill identity for boot-safe restart recovery. The
+    /// watcher owns the child handle, so these immutable spawn values are the
+    /// only way preflight can durably snapshot its exact process tree before
+    /// the server process itself disappears.
+    root_pid: u32,
+    ownership_id: String,
     /// Normalized model (`normalizeFreshcodexModel`), reused verbatim on `send`.
     model: String,
     /// Normalized menu effort (`normalizeFreshAgentEffort`); wire-mapped on `send`.
@@ -903,6 +909,8 @@ impl FreshCodexState {
         // and flips `exited` so the next send/attach lazily respawns (PR-4).
         let (kill_tx, kill_rx) = oneshot::channel();
         let exited = Arc::new(AtomicBool::new(false));
+        let root_pid = child.id().unwrap_or(0);
+        let restart_ownership_id = ownership_id.clone();
         let watcher = spawn_exit_watcher(
             child,
             ownership_id,
@@ -919,6 +927,8 @@ impl FreshCodexState {
             CodexSession {
                 runtime: runtime.clone(),
                 client,
+                root_pid,
+                ownership_id: restart_ownership_id,
                 model: model.clone(),
                 effort: effort.clone(),
                 cwd: cwd.clone(),
@@ -1464,11 +1474,20 @@ impl FreshCodexState {
                 tree_quiesced = retirement.tree_quiesced,
                 "freshagent.codex.restart_shutdown_not_quiescent"
             );
+            let message = format!(
+                "Codex predecessor {} is not yet fully quiescent \
+                 (capture_confirmed={}, consumer_quiesced={}, transport_closed={}, tree_quiesced={})",
+                retirement.runtime_id,
+                retirement.capture_confirmed,
+                retirement.consumer_quiesced,
+                retirement.transport_closed,
+                retirement.tree_quiesced
+            );
             self.restart_retirements
                 .lock()
                 .await
                 .insert(expected_runtime_id.to_string(), retirement);
-            return crate::RestartShutdownOutcome::RetirementIncomplete;
+            return crate::RestartShutdownOutcome::RetirementIncomplete { message };
         }
         self.leases.clear_binding(PROVIDER, &retirement.session_id);
         self.create_dedup
@@ -1488,6 +1507,29 @@ impl FreshCodexState {
         guard
             .get(session_id)
             .is_some_and(|s| !s.exited.load(Ordering::SeqCst))
+    }
+
+    /// Snapshot the sidecar and every currently-readable descendant before
+    /// restart closes its transport or transfers the child to quarantine.
+    /// The immutable spawn identity follows transparent respawns, so this is
+    /// fenced to the exact runtime currently in the sessions map.
+    pub async fn capture_restart_process_barrier(
+        &self,
+        session_id: &str,
+        expected_runtime_id: &str,
+    ) -> Option<freshell_codex::transport::OwnedProcessTreeBarrier> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(session_id)?;
+        if session.runtime.runtime_id != expected_runtime_id
+            || session.exited.load(Ordering::SeqCst)
+        {
+            return None;
+        }
+        Some(freshell_codex::transport::OwnedProcessTreeBarrier::capture(
+            session.root_pid,
+            CODEX_SIDECAR_OWNERSHIP_ENV,
+            &session.ownership_id,
+        ))
     }
 
     /// Handle a `freshAgent.attach` for codex (reload-rehydrate). Decision table:
@@ -1942,6 +1984,8 @@ impl FreshCodexState {
             runtime.clone(),
         );
         let (kill_tx, kill_rx) = oneshot::channel();
+        let root_pid = child.id().unwrap_or(0);
+        let restart_ownership_id = ownership_id.clone();
         let watcher = spawn_exit_watcher(
             child,
             ownership_id,
@@ -1966,6 +2010,8 @@ impl FreshCodexState {
                 CodexSession {
                     runtime,
                     client,
+                    root_pid,
+                    ownership_id: restart_ownership_id,
                     model: model.clone(),
                     effort: effort.clone(),
                     cwd: cwd.clone(),
@@ -2089,6 +2135,8 @@ impl FreshCodexState {
             runtime.clone(),
         );
         let (kill_tx, kill_rx) = oneshot::channel();
+        let root_pid = child.id().unwrap_or(0);
+        let restart_ownership_id = ownership_id.clone();
         let watcher = spawn_exit_watcher(
             child,
             ownership_id,
@@ -2108,6 +2156,8 @@ impl FreshCodexState {
                 CodexSession {
                     runtime: runtime.clone(),
                     client,
+                    root_pid,
+                    ownership_id: restart_ownership_id,
                     model: model.clone(),
                     effort: effort.clone(),
                     cwd: cwd.clone(),
@@ -2704,6 +2754,8 @@ impl FreshCodexState {
             runtime.clone(),
         );
         let (kill_tx, kill_rx) = oneshot::channel();
+        let root_pid = child.id().unwrap_or(0);
+        let restart_ownership_id = ownership_id.clone();
         let watcher = spawn_exit_watcher(
             child,
             ownership_id,
@@ -2721,6 +2773,8 @@ impl FreshCodexState {
                 CodexSession {
                     runtime,
                     client: client.clone(),
+                    root_pid,
+                    ownership_id: restart_ownership_id,
                     // P1.13 (Task 5, R3): the ledger record's settings snapshot -- blank
                     // only when no record was recoverable (never-recorded historical
                     // sessions resume on defaults, exactly as before this fix).
@@ -2817,9 +2871,11 @@ impl FreshCodexState {
             runtime_id: format!("fresh-runtime-test-{thread_id}"),
             generation: 1,
         };
+        let root_pid = child.id().unwrap_or(0);
+        let ownership_id = format!("codex-sidecar-test-snapshot-router-{thread_id}");
         let watcher = spawn_exit_watcher(
             child,
-            format!("codex-sidecar-test-snapshot-router-{thread_id}"),
+            ownership_id.clone(),
             thread_id.to_string(),
             self.broadcast_tx.clone(),
             kill_rx,
@@ -2832,6 +2888,8 @@ impl FreshCodexState {
             CodexSession {
                 runtime,
                 client,
+                root_pid,
+                ownership_id,
                 model: "gpt-5.3-codex-spark".to_string(),
                 effort: None,
                 cwd: None,
@@ -4395,6 +4453,7 @@ pub(crate) mod tests {
             runtime_id: format!("fresh-runtime-test-{thread_id}"),
             generation: 1,
         };
+        let root_pid = child.id().unwrap_or(0);
         let watcher = spawn_exit_watcher(
             child,
             ownership_id.to_string(),
@@ -4410,6 +4469,8 @@ pub(crate) mod tests {
             CodexSession {
                 runtime,
                 client,
+                root_pid,
+                ownership_id: ownership_id.to_string(),
                 model: "gpt-5.3-codex-spark".to_string(),
                 effort: None,
                 cwd: None,
@@ -4461,6 +4522,7 @@ pub(crate) mod tests {
         );
         let (kill_tx, kill_rx) = oneshot::channel();
         let exited = Arc::new(AtomicBool::new(false));
+        let root_pid = child.id().unwrap_or(0);
         let watcher = spawn_exit_watcher(
             child,
             ownership_id.to_string(),
@@ -4476,6 +4538,8 @@ pub(crate) mod tests {
             CodexSession {
                 runtime,
                 client,
+                root_pid,
+                ownership_id: ownership_id.to_string(),
                 model: "gpt-5.3-codex-spark".to_string(),
                 effort: None,
                 cwd: None,
@@ -4900,14 +4964,14 @@ while true; do read -r -t 1 _ || true; done
         }
         blocker_started.notified().await;
 
-        assert_eq!(
+        assert!(matches!(
             st.shutdown_for_restart_detailed(
                 "thread-retirement-incomplete",
                 "fresh-runtime-test-thread-retirement-incomplete",
             )
             .await,
-            crate::RestartShutdownOutcome::RetirementIncomplete
-        );
+            crate::RestartShutdownOutcome::RetirementIncomplete { .. }
+        ));
         assert!(!st.has_live_session("thread-retirement-incomplete").await);
         assert!(matches!(
             st.leases.claim(

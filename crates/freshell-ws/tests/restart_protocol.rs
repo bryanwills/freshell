@@ -13,7 +13,8 @@ use freshell_protocol::{
 };
 use freshell_ws::restart::{
     ProductionFreshResumePlan, ProductionFreshRuntime, RestartCoordinator, RestartFailure,
-    RestartResumeContext, RestartRuntime, RuntimeLocator,
+    RestartOutcome, RestartResumeContext, RestartRetirementAction, RestartRetirementFence,
+    RestartRuntime, RuntimeLocator,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -952,6 +953,308 @@ impl RestartRuntime for NonRetryableReplacementFails {
             false,
         ))
     }
+}
+
+fn make_restart_state_unwritable(path: &std::path::Path) {
+    std::fs::remove_file(path).expect("remove restart state file");
+    std::fs::create_dir(path).expect("replace restart state with directory");
+}
+
+#[derive(Clone, Copy)]
+enum FaultingReplacement {
+    RetryableFailure,
+    TerminalFailure,
+    Success,
+}
+
+struct FaultDuringReplacement {
+    persistence_path: std::path::PathBuf,
+    replacement: FaultingReplacement,
+}
+
+#[async_trait::async_trait]
+impl RestartRuntime for FaultDuringReplacement {
+    type ResumePlan = ();
+
+    async fn preflight(&self, _request: &AgentRestart) -> Result<(), RestartFailure> {
+        Ok(())
+    }
+
+    async fn shutdown_for_restart(
+        &self,
+        _request: &AgentRestart,
+        _plan: &(),
+    ) -> Result<(), RestartFailure> {
+        Ok(())
+    }
+
+    async fn create_replacement(
+        &self,
+        _request: &AgentRestart,
+        _plan: (),
+    ) -> Result<String, RestartFailure> {
+        make_restart_state_unwritable(&self.persistence_path);
+        match self.replacement {
+            FaultingReplacement::RetryableFailure => Err(RestartFailure::new(
+                AgentRestartFailureCode::ReplacementFailed,
+                "temporary replacement failure",
+                true,
+            )),
+            FaultingReplacement::TerminalFailure => Err(RestartFailure::new(
+                AgentRestartFailureCode::ReplacementFailed,
+                "terminal replacement failure",
+                false,
+            )),
+            FaultingReplacement::Success => Ok("term-created-before-commit".to_string()),
+        }
+    }
+}
+
+struct FaultAfterRetirement {
+    persistence_path: std::path::PathBuf,
+}
+
+#[async_trait::async_trait]
+impl RestartRuntime for FaultAfterRetirement {
+    type ResumePlan = ();
+
+    async fn preflight(&self, _request: &AgentRestart) -> Result<(), RestartFailure> {
+        Ok(())
+    }
+
+    async fn shutdown_for_restart(
+        &self,
+        _request: &AgentRestart,
+        _plan: &(),
+    ) -> Result<(), RestartFailure> {
+        make_restart_state_unwritable(&self.persistence_path);
+        Ok(())
+    }
+
+    async fn create_replacement(
+        &self,
+        _request: &AgentRestart,
+        _plan: (),
+    ) -> Result<String, RestartFailure> {
+        panic!("replacement cannot start before retirement completion is durable")
+    }
+}
+
+fn assert_post_retirement_persistence_failure_is_recoverable(outcome: &RestartOutcome) {
+    assert!(matches!(
+        outcome.messages.last(),
+        Some(ServerMessage::AgentRestartFailed(message))
+            if message.retryable
+                && message.recovery_pending
+                && message.code == AgentRestartFailureCode::PreflightFailed
+    ));
+}
+
+#[tokio::test]
+async fn every_initial_post_retirement_persistence_fault_reports_recovery_pending() {
+    for replacement in [
+        FaultingReplacement::RetryableFailure,
+        FaultingReplacement::TerminalFailure,
+        FaultingReplacement::Success,
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("restart-state.json");
+        let coordinator = RestartCoordinator::new_persistent(path.clone()).unwrap();
+        coordinator.register_initial(locator(), "term-1");
+        let outcome = coordinator
+            .execute(
+                restart("post-retirement-fault", "term-1", 1),
+                &FaultDuringReplacement {
+                    persistence_path: path,
+                    replacement,
+                },
+            )
+            .await;
+        assert_post_retirement_persistence_failure_is_recoverable(&outcome);
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("restart-state.json");
+    let coordinator = RestartCoordinator::new_persistent(path.clone()).unwrap();
+    coordinator.register_initial(locator(), "term-1");
+    let outcome = coordinator
+        .execute(
+            restart("retirement-complete-fault", "term-1", 1),
+            &FaultAfterRetirement {
+                persistence_path: path,
+            },
+        )
+        .await;
+    assert_post_retirement_persistence_failure_is_recoverable(&outcome);
+}
+
+struct FaultDuringRecovery {
+    persistence_path: std::path::PathBuf,
+    replacement: FaultingReplacement,
+}
+
+#[async_trait::async_trait]
+impl RestartRuntime for FaultDuringRecovery {
+    type ResumePlan = ();
+
+    async fn preflight(&self, _request: &AgentRestart) -> Result<(), RestartFailure> {
+        panic!("post-retirement recovery must not preflight the vanished runtime")
+    }
+
+    async fn shutdown_for_restart(
+        &self,
+        _request: &AgentRestart,
+        _plan: &(),
+    ) -> Result<(), RestartFailure> {
+        panic!("completed retirement must not run twice")
+    }
+
+    async fn create_replacement(
+        &self,
+        _request: &AgentRestart,
+        _plan: (),
+    ) -> Result<String, RestartFailure> {
+        panic!("recovery must use recover_replacement")
+    }
+
+    async fn recover_replacement(
+        &self,
+        _request: &AgentRestart,
+        _context: Option<&RestartResumeContext>,
+    ) -> Result<String, RestartFailure> {
+        make_restart_state_unwritable(&self.persistence_path);
+        match self.replacement {
+            FaultingReplacement::RetryableFailure => Err(RestartFailure::new(
+                AgentRestartFailureCode::ReplacementFailed,
+                "temporary recovery failure",
+                true,
+            )),
+            FaultingReplacement::TerminalFailure => Err(RestartFailure::new(
+                AgentRestartFailureCode::ReplacementFailed,
+                "terminal recovery failure",
+                false,
+            )),
+            FaultingReplacement::Success => Ok("term-recovered-before-commit".to_string()),
+        }
+    }
+}
+
+struct FaultAfterRecoveredRetirement {
+    persistence_path: std::path::PathBuf,
+}
+
+#[async_trait::async_trait]
+impl RestartRuntime for FaultAfterRecoveredRetirement {
+    type ResumePlan = ();
+
+    async fn preflight(&self, _request: &AgentRestart) -> Result<(), RestartFailure> {
+        Ok(())
+    }
+
+    async fn shutdown_for_restart(
+        &self,
+        _request: &AgentRestart,
+        _plan: &(),
+    ) -> Result<(), RestartFailure> {
+        panic!("boot recovery must use recover_retirement")
+    }
+
+    async fn create_replacement(
+        &self,
+        _request: &AgentRestart,
+        _plan: (),
+    ) -> Result<String, RestartFailure> {
+        panic!("replacement cannot precede durable recovered retirement")
+    }
+
+    async fn recover_retirement(
+        &self,
+        _request: &AgentRestart,
+        _context: Option<&RestartResumeContext>,
+    ) -> Result<(), RestartFailure> {
+        make_restart_state_unwritable(&self.persistence_path);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn every_recovery_and_adoption_persistence_fault_reports_recovery_pending() {
+    for replacement in [
+        FaultingReplacement::RetryableFailure,
+        FaultingReplacement::TerminalFailure,
+        FaultingReplacement::Success,
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("restart-state.json");
+        let request = restart("recovery-persistence-fault", "term-1", 1);
+        let coordinator = RestartCoordinator::new_persistent(path.clone()).unwrap();
+        coordinator.register_initial(locator(), "term-1");
+        coordinator
+            .execute(request.clone(), &ReplacementFails)
+            .await;
+        drop(coordinator);
+
+        let reopened = RestartCoordinator::new_persistent(path.clone()).unwrap();
+        let outcome = reopened
+            .execute(
+                request,
+                &FaultDuringRecovery {
+                    persistence_path: path,
+                    replacement,
+                },
+            )
+            .await;
+        assert_post_retirement_persistence_failure_is_recoverable(&outcome);
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("restart-state.json");
+    let request = restart("retirement-recovery-persistence-fault", "term-1", 1);
+    let coordinator = RestartCoordinator::new_persistent(path.clone()).unwrap();
+    coordinator.register_initial(locator(), "term-1");
+    let incomplete = RetirementRetries {
+        shutdowns: AtomicUsize::new(0),
+    };
+    coordinator.execute(request.clone(), &incomplete).await;
+    drop(coordinator);
+    let reopened = RestartCoordinator::new_persistent(path.clone()).unwrap();
+    let outcome = reopened
+        .execute(
+            request,
+            &FaultAfterRecoveredRetirement {
+                persistence_path: path,
+            },
+        )
+        .await;
+    assert_post_retirement_persistence_failure_is_recoverable(&outcome);
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("restart-state.json");
+    let request = restart("adoption-persistence-fault", "term-1", 1);
+    let coordinator = RestartCoordinator::new_persistent(path.clone()).unwrap();
+    coordinator.register_initial(locator(), "term-1");
+    coordinator
+        .execute(request.clone(), &ReplacementFails)
+        .await;
+    drop(coordinator);
+    let reopened = RestartCoordinator::new_persistent(path.clone()).unwrap();
+    reopened.register_supplied(
+        locator(),
+        RuntimeDescriptor {
+            runtime_id: "term-observed-replacement".to_string(),
+            generation: 2,
+        },
+    );
+    make_restart_state_unwritable(&path);
+    let outcome = reopened
+        .execute(
+            request,
+            &RecoveryMustNotSpawn {
+                attempts: AtomicUsize::new(0),
+            },
+        )
+        .await;
+    assert_post_retirement_persistence_failure_is_recoverable(&outcome);
 }
 
 struct RetirementRetries {
@@ -2513,6 +2816,401 @@ impl ProductionFreshRuntime for FaithfulFreshRuntime {
             .send(serde_json::to_string(&created).unwrap())
             .unwrap();
     }
+}
+
+struct BootFenceFreshRuntime {
+    coordinator: RestartCoordinator,
+    broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
+    live: AtomicBool,
+    session_type: freshell_protocol::SessionType,
+    barrier: Option<freshell_codex::transport::OwnedProcessTreeBarrier>,
+    predecessor: Arc<Mutex<std::process::Child>>,
+    leave_retirement_pending: bool,
+    creates: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ProductionFreshRuntime for BootFenceFreshRuntime {
+    async fn has_live_session(
+        &self,
+        _provider: freshell_protocol::AgentProvider,
+        _session_id: &str,
+    ) -> bool {
+        self.live.load(Ordering::SeqCst)
+    }
+
+    async fn shutdown_for_restart(
+        &self,
+        _provider: freshell_protocol::AgentProvider,
+        _session_id: &str,
+        _expected_runtime_id: &str,
+    ) -> bool {
+        !self.leave_retirement_pending
+    }
+
+    async fn shutdown_for_restart_detailed(
+        &self,
+        _provider: freshell_protocol::AgentProvider,
+        _session_id: &str,
+        _expected_runtime_id: &str,
+    ) -> freshell_freshagent::RestartShutdownOutcome {
+        if self.leave_retirement_pending {
+            freshell_freshagent::RestartShutdownOutcome::RetirementIncomplete {
+                message: "simulate server exit after the durable retirement journal".to_string(),
+            }
+        } else {
+            freshell_freshagent::RestartShutdownOutcome::Stopped
+        }
+    }
+
+    async fn capture_resume_plan(
+        &self,
+        _provider: freshell_protocol::AgentProvider,
+        _session_id: &str,
+    ) -> Option<ProductionFreshResumePlan> {
+        Some(ProductionFreshResumePlan {
+            session_type: self.session_type,
+            cwd: Some("/workspace/boot-fence".to_string()),
+            model: None,
+            effort: None,
+            permission_mode: None,
+            sandbox: None,
+        })
+    }
+
+    async fn capture_restart_actions(
+        &self,
+        _provider: freshell_protocol::AgentProvider,
+        _session_id: &str,
+        _expected_runtime_id: &str,
+    ) -> Result<Vec<RestartRetirementAction>, String> {
+        self.barrier
+            .clone()
+            .map(|barrier| vec![RestartRetirementAction::ProcessTree { barrier }])
+            .ok_or_else(|| "test predecessor barrier unavailable".to_string())
+    }
+
+    async fn handle_create(
+        &self,
+        provider: freshell_protocol::AgentProvider,
+        create: freshell_protocol::FreshAgentCreate,
+    ) {
+        assert!(
+            self.predecessor
+                .lock()
+                .unwrap()
+                .try_wait()
+                .expect("inspect predecessor")
+                .is_some(),
+            "boot recovery must confirm the predecessor dead before replacement create"
+        );
+        self.creates.fetch_add(1, Ordering::SeqCst);
+        self.live.store(true, Ordering::SeqCst);
+        let durable_id = create
+            .resume_session_id
+            .as_deref()
+            .expect("restart uses durable resume");
+        let provider_name = provider_name(provider);
+        let runtime = self.coordinator.register_initial(
+            RuntimeLocator::new(AgentRuntimeKind::FreshAgent, provider_name, durable_id),
+            format!("fresh-{provider_name}-boot-replacement"),
+        );
+        let created = ServerMessage::FreshAgentCreated(FreshAgentCreated {
+            provider: provider_name.to_string(),
+            request_id: create.request_id,
+            runtime_provider: provider_name.to_string(),
+            session_id: durable_id.to_string(),
+            session_type: match create.session_type {
+                freshell_protocol::SessionType::Freshclaude => "freshclaude",
+                freshell_protocol::SessionType::Kilroy => "kilroy",
+                freshell_protocol::SessionType::Freshcodex => "freshcodex",
+                freshell_protocol::SessionType::Freshopencode => "freshopencode",
+            }
+            .to_string(),
+            session_ref: create.session_ref,
+            runtime: Some(runtime),
+        });
+        self.broadcast_tx
+            .send(serde_json::to_string(&created).unwrap())
+            .unwrap();
+    }
+}
+
+fn spawn_boot_fence_predecessor(
+    ownership_id: &str,
+) -> (
+    Arc<Mutex<std::process::Child>>,
+    freshell_codex::transport::OwnedProcessTreeBarrier,
+) {
+    const OWNERSHIP_ENV: &str = "FRESHELL_TEST_RESTART_BOOT_OWNER";
+    let child = std::process::Command::new("sh")
+        .args(["-c", "while :; do sleep 1; done"])
+        .env(OWNERSHIP_ENV, ownership_id)
+        .spawn()
+        .expect("spawn predecessor writer");
+    let barrier = freshell_codex::transport::OwnedProcessTreeBarrier::capture(
+        child.id(),
+        OWNERSHIP_ENV,
+        ownership_id,
+    );
+    (Arc::new(Mutex::new(child)), barrier)
+}
+
+struct PendingTerminalBootFence {
+    fence: RestartRetirementFence,
+    cwd: String,
+}
+
+#[async_trait::async_trait]
+impl RestartRuntime for PendingTerminalBootFence {
+    type ResumePlan = ();
+
+    async fn preflight(&self, _request: &AgentRestart) -> Result<(), RestartFailure> {
+        Ok(())
+    }
+
+    async fn shutdown_for_restart(
+        &self,
+        _request: &AgentRestart,
+        _plan: &(),
+    ) -> Result<(), RestartFailure> {
+        Err(RestartFailure::new(
+            AgentRestartFailureCode::ShutdownFailed,
+            "simulate server exit before local terminal retirement",
+            true,
+        ))
+    }
+
+    async fn create_replacement(
+        &self,
+        _request: &AgentRestart,
+        _plan: (),
+    ) -> Result<String, RestartFailure> {
+        unreachable!("retirement remains pending")
+    }
+
+    fn persisted_resume_context(
+        &self,
+        _request: &AgentRestart,
+        _plan: &(),
+    ) -> Option<RestartResumeContext> {
+        Some(RestartResumeContext {
+            terminal_cwd: Some(self.cwd.clone()),
+            terminal_shell: Some(freshell_protocol::Shell::System),
+            ..RestartResumeContext::default()
+        })
+    }
+
+    fn persisted_retirement_fence(
+        &self,
+        _request: &AgentRestart,
+        _plan: &(),
+    ) -> Option<RestartRetirementFence> {
+        Some(self.fence.clone())
+    }
+}
+
+#[tokio::test]
+async fn production_boot_recovery_finishes_persisted_claude_and_codex_retirements() {
+    for (provider, session_type) in [
+        ("claude", freshell_protocol::SessionType::Freshclaude),
+        ("codex", freshell_protocol::SessionType::Freshcodex),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("restart-state.json");
+        let (predecessor, barrier) =
+            spawn_boot_fence_predecessor(&format!("{provider}-{}", uuid::Uuid::new_v4()));
+        let (_url, registry, mut state) = common::spawn_server_with_specs_and_state(vec![]).await;
+        state.boot_id = Arc::new(format!("boot-origin-{provider}"));
+        state.session_existence = Arc::new(PresentSessions);
+        state.restart = RestartCoordinator::new_persistent(path.clone()).unwrap();
+        let durable_id = format!("durable-{provider}-boot-fence");
+        let old_runtime_id = format!("fresh-{provider}-boot-old");
+        let old = state.restart.register_initial(
+            RuntimeLocator::new(AgentRuntimeKind::FreshAgent, provider, &durable_id),
+            &old_runtime_id,
+        );
+        let first_runtime = Arc::new(BootFenceFreshRuntime {
+            coordinator: state.restart.clone(),
+            broadcast_tx: Arc::clone(&state.broadcast_tx),
+            live: AtomicBool::new(true),
+            session_type,
+            barrier: Some(barrier),
+            predecessor: Arc::clone(&predecessor),
+            leave_retirement_pending: true,
+            creates: AtomicUsize::new(0),
+        });
+        let production = freshell_ws::restart::ProductionRestartRuntime::with_fresh_runtime(
+            state.clone(),
+            first_runtime,
+        );
+        let request = AgentRestart {
+            request_id: format!("boot-fence-{provider}"),
+            provider: provider.to_string(),
+            session_id: durable_id,
+            kind: AgentRuntimeKind::FreshAgent,
+            live_id: old_runtime_id,
+            expected_generation: old.generation,
+        };
+
+        let first = state.restart.execute(request.clone(), &production).await;
+        assert!(matches!(
+            first.messages.last(),
+            Some(ServerMessage::AgentRestartFailed(failed))
+                if failed.retryable && failed.recovery_pending
+        ));
+        assert!(state.restart.pending_recoveries()[0]
+            .retirement_fence
+            .is_some());
+        drop(production);
+        drop(state);
+
+        let reopened = RestartCoordinator::new_persistent(path).unwrap();
+        let (_url, recovery_registry, mut recovery_state) =
+            common::spawn_server_with_specs_and_state(vec![]).await;
+        recovery_state.boot_id = Arc::new(format!("boot-recovery-{provider}"));
+        recovery_state.session_existence = Arc::new(PresentSessions);
+        recovery_state.restart = reopened.clone();
+        let recovery_runtime = Arc::new(BootFenceFreshRuntime {
+            coordinator: reopened.clone(),
+            broadcast_tx: Arc::clone(&recovery_state.broadcast_tx),
+            live: AtomicBool::new(false),
+            session_type,
+            barrier: None,
+            predecessor: Arc::clone(&predecessor),
+            leave_retirement_pending: false,
+            creates: AtomicUsize::new(0),
+        });
+        let production = freshell_ws::restart::ProductionRestartRuntime::with_fresh_runtime(
+            recovery_state,
+            recovery_runtime.clone(),
+        );
+
+        let recovered = reopened.execute(request, &production).await;
+        assert!(matches!(
+            recovered.messages.last(),
+            Some(ServerMessage::AgentRestartReplaced(_))
+        ));
+        assert_eq!(recovery_runtime.creates.load(Ordering::SeqCst), 1);
+        assert!(reopened.pending_recoveries().is_empty());
+        registry.kill_all();
+        recovery_registry.kill_all();
+        if predecessor.lock().unwrap().try_wait().unwrap().is_none() {
+            let _ = predecessor.lock().unwrap().kill();
+            let _ = predecessor.lock().unwrap().wait();
+        }
+    }
+}
+
+#[tokio::test]
+async fn production_boot_recovery_finishes_persisted_terminal_retirement_before_restore() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("restart-state.json");
+    let (predecessor, barrier) =
+        spawn_boot_fence_predecessor(&format!("terminal-{}", uuid::Uuid::new_v4()));
+    let request = AgentRestart {
+        request_id: "boot-fence-terminal".to_string(),
+        provider: "amplifier".to_string(),
+        session_id: "durable-terminal-boot-fence".to_string(),
+        kind: AgentRuntimeKind::Terminal,
+        live_id: "terminal-boot-old".to_string(),
+        expected_generation: 1,
+    };
+    let coordinator = RestartCoordinator::new_persistent(path.clone()).unwrap();
+    coordinator.register_initial(
+        RuntimeLocator::new(
+            AgentRuntimeKind::Terminal,
+            "amplifier",
+            "durable-terminal-boot-fence",
+        ),
+        &request.live_id,
+    );
+    let first = coordinator
+        .execute(
+            request.clone(),
+            &PendingTerminalBootFence {
+                fence: RestartRetirementFence {
+                    origin_boot_id: "boot-terminal-origin".to_string(),
+                    actions: vec![RestartRetirementAction::ProcessTree { barrier }],
+                },
+                cwd: temp.path().to_string_lossy().into_owned(),
+            },
+        )
+        .await;
+    assert!(matches!(
+        first.messages.last(),
+        Some(ServerMessage::AgentRestartFailed(failed))
+            if failed.retryable && failed.recovery_pending
+    ));
+    drop(coordinator);
+
+    let reopened = RestartCoordinator::new_persistent(path).unwrap();
+    let (_url, registry, mut state) =
+        common::spawn_server_with_specs_and_state(vec![common::sleeper_cli_spec("amplifier")])
+            .await;
+    state.boot_id = Arc::new("boot-terminal-recovery".to_string());
+    state.session_existence = Arc::new(PresentSessions);
+    state.restart = reopened.clone();
+    let production = freshell_ws::restart::ProductionRestartRuntime::new(state);
+
+    let recovered = reopened.execute(request, &production).await;
+    assert!(matches!(
+        recovered.messages.last(),
+        Some(ServerMessage::AgentRestartReplaced(_))
+    ));
+    assert!(
+        predecessor
+            .lock()
+            .unwrap()
+            .try_wait()
+            .expect("inspect predecessor")
+            .is_some(),
+        "terminal replacement must wait for the persisted predecessor tree"
+    );
+    assert!(reopened.pending_recoveries().is_empty());
+    registry.kill_all();
+}
+
+#[tokio::test]
+async fn production_boot_recovery_without_a_persisted_fence_fails_safe() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("restart-state.json");
+    let request = restart("missing-boot-fence", "term-1", 1);
+    let coordinator = RestartCoordinator::new_persistent(path.clone()).unwrap();
+    coordinator.register_initial(locator(), "term-1");
+    coordinator
+        .execute(
+            request.clone(),
+            &RetirementRetries {
+                shutdowns: AtomicUsize::new(0),
+            },
+        )
+        .await;
+    drop(coordinator);
+
+    let reopened = RestartCoordinator::new_persistent(path).unwrap();
+    let (_url, registry, mut state) =
+        common::spawn_server_with_specs_and_state(vec![common::sleeper_cli_spec("claude")]).await;
+    state.boot_id = Arc::new("boot-without-fence".to_string());
+    state.session_existence = Arc::new(PresentSessions);
+    state.restart = reopened.clone();
+    let production = freshell_ws::restart::ProductionRestartRuntime::new(state);
+
+    let outcome = reopened.execute(request, &production).await;
+    assert!(matches!(
+        outcome.messages.last(),
+        Some(ServerMessage::AgentRestartFailed(failed))
+            if failed.code == AgentRestartFailureCode::ShutdownFailed
+                && failed.retryable
+                && failed.recovery_pending
+                && failed.message.contains("retirement fence is unavailable")
+    ));
+    assert_eq!(reopened.pending_recoveries().len(), 1);
+    assert!(
+        registry.inventory().is_empty(),
+        "no replacement writer may start"
+    );
+    registry.kill_all();
 }
 
 #[tokio::test]

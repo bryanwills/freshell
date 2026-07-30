@@ -2,6 +2,10 @@ import { configureStore } from '@reduxjs/toolkit'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import panesReducer from '@/store/panesSlice'
 import freshAgentReducer from '@/store/freshAgentSlice'
+import tabsReducer, { updateTab } from '@/store/tabsSlice'
+import terminalLifecycleReducer, {
+  recordTerminalExit,
+} from '@/store/terminalLifecycleSlice'
 import { WsClient } from '@/lib/ws-client'
 
 class MockWebSocket {
@@ -45,6 +49,8 @@ function makeStore() {
     reducer: {
       panes: panesReducer,
       freshAgent: freshAgentReducer,
+      tabs: tabsReducer,
+      terminalLifecycle: terminalLifecycleReducer,
     },
     preloadedState: {
       panes: {
@@ -64,8 +70,23 @@ function makeStore() {
               sessionRef: { provider: 'claude', sessionId: 's1' },
             },
           },
+          tab2: {
+            type: 'leaf' as const,
+            id: 'pane-2',
+            content: {
+              kind: 'terminal' as const,
+              createRequestId: 'create-2',
+              status: 'running' as const,
+              mode: 'claude' as const,
+              shell: 'system' as const,
+              terminalId: 'terminal-old',
+              runtimeId: 'terminal-old',
+              runtimeGeneration: 7,
+              sessionRef: { provider: 'claude', sessionId: 's1' },
+            },
+          },
         },
-        activePane: { tab1: 'pane-1' },
+        activePane: { tab1: 'pane-1', tab2: 'pane-2' },
         paneTitles: {},
         paneTitleSetByUser: {},
         renameRequestTabId: null,
@@ -79,6 +100,34 @@ function makeStore() {
         pendingCreates: {},
         pendingCreateFailures: {},
         availableModels: [],
+      },
+      tabs: {
+        tabs: [
+          {
+            id: 'tab1',
+            createRequestId: 'tab1',
+            title: 'Viewer one',
+            status: 'running' as const,
+            mode: 'claude' as const,
+            shell: 'system' as const,
+            createdAt: 1,
+          },
+          {
+            id: 'tab2',
+            createRequestId: 'tab2',
+            title: 'Viewer two',
+            status: 'running' as const,
+            mode: 'claude' as const,
+            shell: 'system' as const,
+            createdAt: 2,
+          },
+        ],
+        activeTabId: 'tab1',
+        renameRequestTabId: null,
+        tombstones: [],
+      },
+      terminalLifecycle: {
+        byPaneId: {},
       },
     },
   })
@@ -163,6 +212,48 @@ describe('WsClient restart transaction folding', () => {
     if (content.type !== 'leaf' || content.content.kind !== 'terminal') throw new Error('expected terminal')
     expect(content.content.terminalId).toBe('terminal-new')
     expect(sent(socket).filter((frame) => frame.type === 'terminal.create')).toHaveLength(0)
+  })
+
+  it('restores every replacement viewer tab and clears only their old exit state', async () => {
+    const store = makeStore()
+    store.dispatch(updateTab({ id: 'tab1', updates: { status: 'exited' } }))
+    store.dispatch(updateTab({ id: 'tab2', updates: { status: 'exited' } }))
+    store.dispatch(recordTerminalExit({
+      paneId: 'pane-1',
+      terminalId: 'terminal-old',
+      exitCode: 0,
+      at: 1,
+    }))
+    store.dispatch(recordTerminalExit({
+      paneId: 'pane-2',
+      terminalId: 'terminal-old',
+      exitCode: 0,
+      at: 1,
+    }))
+    store.dispatch(recordTerminalExit({
+      paneId: 'unrelated-pane',
+      terminalId: 'terminal-unrelated',
+      exitCode: 1,
+      at: 1,
+    }))
+
+    const client = new WsClient('ws://example/ws')
+    client.bindAgentRestartStore(store)
+    const promise = client.connect()
+    const socket = MockWebSocket.instances[0]
+    socket.onopen?.()
+    socket.message({ type: 'ready', capabilities: { agentRestartV1: true } })
+    await promise
+
+    socket.message(replaced)
+
+    expect(store.getState().tabs.tabs.map((tab) => [tab.id, tab.status])).toEqual([
+      ['tab1', 'running'],
+      ['tab2', 'running'],
+    ])
+    expect(store.getState().terminalLifecycle.byPaneId['pane-1']).toBeUndefined()
+    expect(store.getState().terminalLifecycle.byPaneId['pane-2']).toBeUndefined()
+    expect(store.getState().terminalLifecycle.byPaneId['unrelated-pane']?.exit?.exitCode).toBe(1)
   })
 
   it('resends an in-flight restart after ready and folds the stored terminal result once', async () => {

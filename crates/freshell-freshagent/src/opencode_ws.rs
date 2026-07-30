@@ -122,6 +122,11 @@ pub struct FreshOpencodeState {
     /// `(provider, session_id)`. Wired by `main.rs`; defaults to always-false.
     terminal_liveness: crate::TerminalLivenessProbe,
     runtime_identity: FreshRuntimeIdentity,
+    /// Exact sessions removed from the public alias map while restart finishes
+    /// their remote abort and local task joins. A failed abort remains keyed by
+    /// the selected runtime so the same request retries the retirement instead
+    /// of being misclassified as stale.
+    restart_retirements: Arc<TokioMutex<HashMap<String, OpencodeRestartRetirement>>>,
 }
 
 /// The cached result of a completed opencode `freshAgent.create`, keyed by `requestId` in
@@ -166,6 +171,11 @@ struct OpencodeSession {
     /// `freshAgent.session.snapshot` / `freshAgent.session.changed` / `freshAgent.error`
     /// for the lifetime of the session. `None` until materialized; aborted on kill.
     serve_bridge: Option<tokio::task::JoinHandle<()>>,
+}
+
+struct OpencodeRestartRetirement {
+    requested_session_id: String,
+    session: Arc<TokioMutex<OpencodeSession>>,
 }
 
 /// Why [`FreshOpencodeState::resume_durable_session`] could not produce a live session for
@@ -219,6 +229,7 @@ impl FreshOpencodeState {
             leases: Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
             terminal_liveness: Arc::new(|_, _| false),
             runtime_identity: FreshRuntimeIdentity::default(),
+            restart_retirements: Arc::new(TokioMutex::new(HashMap::new())),
         }
     }
 
@@ -787,6 +798,56 @@ impl FreshOpencodeState {
         self.sessions.lock().await.contains_key(session_id)
     }
 
+    /// Capture the exact remote-session abort needed if restart crosses a
+    /// server-process boot. An unmaterialized placeholder owns no remote
+    /// writer and therefore returns `Ok(None)`.
+    pub async fn capture_restart_remote_abort(
+        &self,
+        session_id: &str,
+        expected_runtime_id: &str,
+    ) -> Result<Option<(String, Option<String>)>, String> {
+        let session_arc = self
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| "selected OpenCode session is no longer live".to_string())?;
+        let session = session_arc.lock().await;
+        if session.runtime.runtime_id != expected_runtime_id {
+            return Err("selected OpenCode runtime changed before fence capture".to_string());
+        }
+        Ok(session
+            .real_session_id
+            .clone()
+            .map(|real_id| (real_id, session.cwd.clone())))
+    }
+
+    /// Complete a persisted OpenCode retirement after the sessions/quarantine
+    /// maps from the originating process are gone. The shared serve process is
+    /// never killed: only the exact durable remote session is aborted.
+    pub async fn recover_restart_remote_abort(
+        &self,
+        session_id: &str,
+        cwd: Option<&str>,
+    ) -> crate::RestartShutdownOutcome {
+        let manager = self.fresh_agent.ensure_manager().await;
+        let route = cwd.map(str::to_string);
+        match manager.abort(session_id, &route).await {
+            Ok(()) => crate::RestartShutdownOutcome::Stopped,
+            Err(error) => {
+                let message =
+                    format!("OpenCode predecessor remote abort failed for {session_id}: {error}");
+                tracing::warn!(
+                    error = %error,
+                    session_id,
+                    "freshagent.opencode.restart_boot_abort_failed"
+                );
+                crate::RestartShutdownOutcome::RetirementIncomplete { message }
+            }
+        }
+    }
+
     // ── freshAgent.kill (WS) ────────────────────────────────────────────────
 
     /// Handle a `freshAgent.kill` for opencode: remove the session's bookkeeping (both
@@ -854,15 +915,61 @@ impl FreshOpencodeState {
     /// aliases are then removed while the sessions map is locked, and only when
     /// they still point at that runtime.
     pub async fn shutdown_for_restart(&self, session_id: &str, expected_runtime_id: &str) -> bool {
-        let mut sessions = self.sessions.lock().await;
-        let Some(session_arc) = sessions.get(session_id).cloned() else {
-            return false;
-        };
-        let mut session = session_arc.lock().await;
-        if session.runtime.runtime_id != expected_runtime_id {
-            return false;
-        }
+        self.shutdown_for_restart_detailed(session_id, expected_runtime_id)
+            .await
+            == crate::RestartShutdownOutcome::Stopped
+    }
 
+    pub async fn shutdown_for_restart_detailed(
+        &self,
+        session_id: &str,
+        expected_runtime_id: &str,
+    ) -> crate::RestartShutdownOutcome {
+        let session_arc = {
+            // The retirement map is acquired first everywhere in this method.
+            // Remove every public alias in the same critical section that
+            // installs quarantine, then release BOTH global maps before any
+            // manager startup or network request.
+            let mut retirements = self.restart_retirements.lock().await;
+            if let Some(retirement) = retirements.get(expected_runtime_id) {
+                let session = retirement.session.lock().await;
+                let matches_session = retirement.requested_session_id == session_id
+                    || session.placeholder_id == session_id
+                    || session.real_session_id.as_deref() == Some(session_id);
+                drop(session);
+                if !matches_session {
+                    return crate::RestartShutdownOutcome::Stale;
+                }
+                Arc::clone(&retirement.session)
+            } else {
+                if retirements
+                    .values()
+                    .any(|retirement| retirement.requested_session_id == session_id)
+                {
+                    return crate::RestartShutdownOutcome::Stale;
+                }
+                let mut sessions = self.sessions.lock().await;
+                let Some(session_arc) = sessions.get(session_id).cloned() else {
+                    return crate::RestartShutdownOutcome::Stale;
+                };
+                let session = session_arc.lock().await;
+                if session.runtime.runtime_id != expected_runtime_id {
+                    return crate::RestartShutdownOutcome::Stale;
+                }
+                drop(session);
+                sessions.retain(|_, candidate| !Arc::ptr_eq(candidate, &session_arc));
+                retirements.insert(
+                    expected_runtime_id.to_string(),
+                    OpencodeRestartRetirement {
+                        requested_session_id: session_id.to_string(),
+                        session: Arc::clone(&session_arc),
+                    },
+                );
+                session_arc
+            }
+        };
+
+        let mut session = session_arc.lock().await;
         if let Some(real_id) = session.real_session_id.clone() {
             // Set the completion fence before the remote abort. The abort can
             // synchronously produce an idle edge that lets `run_turn` return;
@@ -871,18 +978,19 @@ impl FreshOpencodeState {
             session.turn_aborted.store(true, Ordering::SeqCst);
             let manager = self.fresh_agent.ensure_manager().await;
             if let Err(error) = manager.abort(&real_id, &session.cwd).await {
-                session.turn_aborted.store(false, Ordering::SeqCst);
+                let message =
+                    format!("OpenCode predecessor remote abort failed for {real_id}: {error}");
                 tracing::warn!(
                     error = %error,
                     session_id = %real_id,
                     runtime_id = %expected_runtime_id,
                     "freshagent.opencode.restart_abort_failed"
                 );
-                return false;
+                drop(session);
+                return crate::RestartShutdownOutcome::RetirementIncomplete { message };
             }
         }
 
-        sessions.retain(|_, candidate| !Arc::ptr_eq(candidate, &session_arc));
         if let Some(task) = session.turn_task.take() {
             task.abort();
             let _ = task.await;
@@ -897,11 +1005,14 @@ impl FreshOpencodeState {
         self.leases.clear_binding(PROVIDER, session_id);
         let placeholder = session.placeholder_id.clone();
         drop(session);
-        drop(sessions);
         self.create_dedup
             .clear_for_session(|record| record.placeholder_id == placeholder)
             .await;
-        true
+        self.restart_retirements
+            .lock()
+            .await
+            .remove(expected_runtime_id);
+        crate::RestartShutdownOutcome::Stopped
     }
 
     // ── freshAgent.interrupt (WS) ────────────────────────────────────────
@@ -1578,6 +1689,63 @@ mod tests {
                 prompt_started: AtomicBool::new(false),
                 remote_busy: AtomicBool::new(false),
             }
+        }
+    }
+
+    struct RetryableRestartAbortHttp {
+        next_session: AtomicUsize,
+        aborts: AtomicUsize,
+    }
+    impl ServeHttp for RetryableRestartAbortHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+        > {
+            let is_create = matches!(req.method, freshell_opencode::serve::HttpMethod::Post)
+                && (req.url.ends_with("/session") || req.url.contains("/session?"));
+            if is_create {
+                let n = self.next_session.fetch_add(1, Ordering::SeqCst) + 1;
+                let body = serde_json::to_vec(&json!({ "id": format!("ses_retry_{n}") })).unwrap();
+                return Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) });
+            }
+            if req.url.contains("/abort") && self.aborts.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Box::pin(async { Err("temporary remote abort failure".to_string()) });
+            }
+            Box::pin(async { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) })
+        }
+    }
+
+    struct BlockingRestartAbortHttp {
+        next_session: AtomicUsize,
+        abort_started: Arc<tokio::sync::Notify>,
+        abort_release: Arc<tokio::sync::Notify>,
+    }
+    impl ServeHttp for BlockingRestartAbortHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+        > {
+            let is_create = matches!(req.method, freshell_opencode::serve::HttpMethod::Post)
+                && (req.url.ends_with("/session") || req.url.contains("/session?"));
+            if is_create {
+                let n = self.next_session.fetch_add(1, Ordering::SeqCst) + 1;
+                let body = serde_json::to_vec(&json!({ "id": format!("ses_block_{n}") })).unwrap();
+                return Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) });
+            }
+            if req.url.contains("/abort") {
+                let started = Arc::clone(&self.abort_started);
+                let release = Arc::clone(&self.abort_release);
+                return Box::pin(async move {
+                    started.notify_one();
+                    release.notified().await;
+                    Ok(ServeHttpResponse::new(200, b"{}".to_vec()))
+                });
+            }
+            Box::pin(async { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) })
         }
     }
     impl ServeHttp for RestartActiveTurnHttp {
@@ -2553,6 +2721,127 @@ mod tests {
                 "the quiesced predecessor must not re-emit under its replacement: {frame}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn restart_abort_failure_is_detailed_retryable_and_same_runtime_retry_finishes() {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let http = Arc::new(RetryableRestartAbortHttp {
+            next_session: AtomicUsize::new(0),
+            aborts: AtomicUsize::new(0),
+        });
+        let manager = OpencodeServeManager::new(
+            ServeDeps {
+                spawner: Arc::new(TrackedSpawner {
+                    killed: Arc::new(AtomicBool::new(false)),
+                }),
+                http: http.clone(),
+                ports: Arc::new(FakeAllocator),
+                events: Arc::new(NoopEventSource),
+            },
+            ServeConfig::default(),
+        );
+        manager.ensure_started().await.unwrap();
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-restart-retry")).await;
+        let placeholder = "freshopencode-req-restart-retry";
+        st.handle_send(send_msg(placeholder, "working")).await;
+        let (durable_id, runtime_id) = {
+            let sessions = st.sessions.lock().await;
+            let session = sessions.get(placeholder).unwrap().lock().await;
+            (
+                session.real_session_id.clone().unwrap(),
+                session.runtime.runtime_id.clone(),
+            )
+        };
+
+        let first = st
+            .shutdown_for_restart_detailed(&durable_id, &runtime_id)
+            .await;
+        assert!(matches!(
+            first,
+            crate::RestartShutdownOutcome::RetirementIncomplete { ref message }
+                if message.contains("temporary remote abort failure")
+        ));
+        assert!(
+            !st.has_live_session(&durable_id).await,
+            "a quarantined predecessor must not remain available for new work"
+        );
+
+        assert_eq!(
+            st.shutdown_for_restart_detailed(&durable_id, &runtime_id)
+                .await,
+            crate::RestartShutdownOutcome::Stopped
+        );
+        assert_eq!(http.aborts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn restart_remote_abort_does_not_hold_the_global_sessions_lock() {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let abort_started = Arc::new(tokio::sync::Notify::new());
+        let abort_release = Arc::new(tokio::sync::Notify::new());
+        let manager = OpencodeServeManager::new(
+            ServeDeps {
+                spawner: Arc::new(TrackedSpawner {
+                    killed: Arc::new(AtomicBool::new(false)),
+                }),
+                http: Arc::new(BlockingRestartAbortHttp {
+                    next_session: AtomicUsize::new(0),
+                    abort_started: Arc::clone(&abort_started),
+                    abort_release: Arc::clone(&abort_release),
+                }),
+                ports: Arc::new(FakeAllocator),
+                events: Arc::new(NoopEventSource),
+            },
+            ServeConfig::default(),
+        );
+        manager.ensure_started().await.unwrap();
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-restart-blocked")).await;
+        st.handle_send(send_msg("freshopencode-req-restart-blocked", "working"))
+            .await;
+        st.handle_create(create_msg("req-restart-unrelated")).await;
+        let (durable_id, runtime_id) = {
+            let sessions = st.sessions.lock().await;
+            let session = sessions
+                .get("freshopencode-req-restart-blocked")
+                .unwrap()
+                .lock()
+                .await;
+            (
+                session.real_session_id.clone().unwrap(),
+                session.runtime.runtime_id.clone(),
+            )
+        };
+
+        let retiring = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.shutdown_for_restart_detailed(&durable_id, &runtime_id)
+                    .await
+            })
+        };
+        abort_started.notified().await;
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            st.has_live_session("freshopencode-req-restart-unrelated"),
+        )
+        .await
+        .expect("unrelated session access must not wait for remote abort")
+        .then_some(())
+        .expect("unrelated session remains live");
+        abort_release.notify_one();
+        assert_eq!(
+            retiring.await.unwrap(),
+            crate::RestartShutdownOutcome::Stopped
+        );
     }
 
     #[tokio::test]

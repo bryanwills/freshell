@@ -71,11 +71,11 @@ pub use spawn_gate::{SpawnGate, SpawnGateError};
 /// runtime was found and fenced, but one of its ownership barriers has not yet
 /// completed. Coordinators must persist that phase and retry the same
 /// retirement before creating a replacement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RestartShutdownOutcome {
     Stopped,
     Stale,
-    RetirementIncomplete,
+    RetirementIncomplete { message: String },
 }
 
 /// Task 13b: the injected cross-kind liveness probe -- `(provider, session_id) -> bool`,

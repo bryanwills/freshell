@@ -37,6 +37,7 @@ real-transport = ["dep:tokio-tungstenite", "dep:futures-util", "dep:libc", "toki
 # Dynamic JSON parsing that mirrors the TS `Record<string, unknown>` params/result model
 # (JSON.parse parity, corruption-tolerant). preserve_order matches the wire object model.
 serde_json = { workspace = true }
+serde = { workspace = true }
 # Async runtime for the request/response correlation (oneshot pending map), the background
 # notification consumer (mpsc), the bounded request timeout (`time`), and the single-flight
 # initialize guard (`sync`). No live IO in the CORE — the transport is injected.

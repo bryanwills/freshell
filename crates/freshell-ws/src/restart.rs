@@ -67,6 +67,12 @@ pub struct PendingRestartRecovery {
     pub retirement_pending: bool,
     #[serde(default)]
     pub resume_context: Option<RestartResumeContext>,
+    /// Capture-before-kill proof retained across a real server process boot.
+    /// When `retirement_pending` survives into a different boot, production
+    /// recovery must complete every action here before it may create a new
+    /// writer for the durable session.
+    #[serde(default)]
+    pub retirement_fence: Option<RestartRetirementFence>,
     pub last_failure: Option<AgentRestartFailed>,
 }
 
@@ -99,6 +105,33 @@ pub struct RestartResumeContext {
     pub fresh_permission_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fresh_sandbox: Option<freshell_protocol::Sandbox>,
+}
+
+/// Durable ownership actions captured while the predecessor is still live.
+///
+/// A process-tree action contains exact `(pid,starttime)` incarnations, never
+/// a naked PID. OpenCode uses a shared serve process and therefore fences the
+/// selected remote session with an explicit abort instead of killing the
+/// process that also owns unrelated sessions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestartRetirementFence {
+    pub origin_boot_id: String,
+    #[serde(default)]
+    pub actions: Vec<RestartRetirementAction>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum RestartRetirementAction {
+    ProcessTree {
+        barrier: freshell_codex::transport::OwnedProcessTreeBarrier,
+    },
+    OpenCodeRemoteAbort {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,6 +230,19 @@ pub trait RestartRuntime: Send + Sync {
         None
     }
 
+    /// Capture the ownership barrier that makes `retirement_pending` safe to
+    /// recover after this server process is gone. Implementations that own no
+    /// external writer may leave this absent; the production adapter requires
+    /// one for every live production runtime before crossing the destructive
+    /// boundary.
+    fn persisted_retirement_fence(
+        &self,
+        _request: &AgentRestart,
+        _plan: &Self::ResumePlan,
+    ) -> Option<RestartRetirementFence> {
+        None
+    }
+
     /// Resume a replacement whose selected predecessor was already shut down
     /// before a retryable failure or server restart. Implementations may
     /// override this when recovery needs a path distinct from ordinary
@@ -221,6 +267,19 @@ pub trait RestartRuntime: Send + Sync {
     ) -> Result<(), RestartFailure> {
         let plan = self.preflight(request).await?;
         self.shutdown_for_restart(request, &plan).await
+    }
+
+    /// Recover a durable retirement with its capture-before-kill fence. The
+    /// default preserves the existing same-process adapter contract; the
+    /// production adapter additionally distinguishes same-boot quarantine
+    /// recovery from cross-boot process/remote ownership recovery.
+    async fn recover_persisted_retirement(
+        &self,
+        request: &AgentRestart,
+        context: Option<&RestartResumeContext>,
+        _fence: Option<&RestartRetirementFence>,
+    ) -> Result<(), RestartFailure> {
+        self.recover_retirement(request, context).await
     }
 }
 
@@ -1399,7 +1458,8 @@ impl RestartCoordinator {
                     pending = canonical.clone();
                 }
             }) {
-                let outcome = self.persistence_failure(&request, pending.old_runtime, error);
+                let outcome =
+                    self.persistence_failure_with_phase(&request, pending.old_runtime, error, true);
                 emit(&outcome.messages[0]);
                 return outcome;
             }
@@ -1456,6 +1516,7 @@ impl RestartCoordinator {
             }
         };
         let resume_context = runtime.persisted_resume_context(&request, &plan);
+        let retirement_fence = runtime.persisted_retirement_fence(&request, &plan);
 
         let started = ServerMessage::AgentRestartStarted(AgentRestartStarted {
             request_id: request.request_id.clone(),
@@ -1474,6 +1535,7 @@ impl RestartCoordinator {
                     old_runtime: expected.clone(),
                     retirement_pending: true,
                     resume_context,
+                    retirement_fence,
                     last_failure: None,
                 },
             );
@@ -1532,12 +1594,7 @@ impl RestartCoordinator {
                     messages: vec![terminal],
                     replayed: false,
                 },
-                Err(error) => self.persistence_failure_with_phase(
-                    &request,
-                    expected,
-                    error,
-                    failure.retryable,
-                ),
+                Err(error) => self.persistence_failure_with_phase(&request, expected, error, true),
             };
             emit(&outcome.messages[0]);
             outcome.messages.insert(0, started);
@@ -1602,7 +1659,9 @@ impl RestartCoordinator {
                             messages: vec![ServerMessage::AgentRestartFailed(failed)],
                             replayed: false,
                         },
-                        Err(error) => self.persistence_failure(&request, expected, error),
+                        Err(error) => {
+                            self.persistence_failure_with_phase(&request, expected, error, true)
+                        }
                     };
                     emit(&outcome.messages[0]);
                     outcome.messages.insert(0, started);
@@ -1632,7 +1691,9 @@ impl RestartCoordinator {
                             messages: vec![terminal],
                             replayed: false,
                         },
-                        Err(error) => self.persistence_failure(&request, expected, error),
+                        Err(error) => {
+                            self.persistence_failure_with_phase(&request, expected, error, true)
+                        }
                     };
                     emit(&outcome.messages[0]);
                     outcome.messages.insert(0, started);
@@ -1671,7 +1732,7 @@ impl RestartCoordinator {
                     messages: vec![ServerMessage::AgentRestartFailed(failed)],
                     replayed: false,
                 },
-                Err(error) => self.persistence_failure(&request, expected, error),
+                Err(error) => self.persistence_failure_with_phase(&request, expected, error, true),
             };
             emit(&outcome.messages[0]);
             outcome.messages.insert(0, started);
@@ -1682,7 +1743,8 @@ impl RestartCoordinator {
             match self.commit_replacement(&request, &expected, replacement_id) {
                 Ok(committed) => committed,
                 Err(error) => {
-                    let mut outcome = self.persistence_failure(&request, expected, error);
+                    let mut outcome =
+                        self.persistence_failure_with_phase(&request, expected, error, true);
                     emit(&outcome.messages[0]);
                     outcome.messages.insert(0, started);
                     return outcome;
@@ -1724,13 +1786,14 @@ impl RestartCoordinator {
         if let Err(error) = self.try_update_ownership("join_completed_replacement", |ownership| {
             self.insert_result_locked(ownership, request, joined.clone());
         }) {
-            return Some(self.persistence_failure(
+            return Some(self.persistence_failure_with_phase(
                 request,
                 RuntimeDescriptor {
                     runtime_id: request.live_id.clone(),
                     generation: request.expected_generation,
                 },
                 error,
+                true,
             ));
         }
         tracing::info!(
@@ -1768,7 +1831,11 @@ impl RestartCoordinator {
         emit(&started);
         if pending.retirement_pending {
             if let Err(failure) = runtime
-                .recover_retirement(&request, pending.resume_context.as_ref())
+                .recover_persisted_retirement(
+                    &request,
+                    pending.resume_context.as_ref(),
+                    pending.retirement_fence.as_ref(),
+                )
                 .await
             {
                 tracing::warn!(
@@ -1822,12 +1889,7 @@ impl RestartCoordinator {
                 let terminal = match persisted {
                     Ok(()) => ServerMessage::AgentRestartFailed(failed),
                     Err(error) => self
-                        .persistence_failure_with_phase(
-                            &request,
-                            pending.old_runtime,
-                            error,
-                            failure.retryable,
-                        )
+                        .persistence_failure_with_phase(&request, pending.old_runtime, error, true)
                         .messages
                         .remove(0),
                 };
@@ -1932,7 +1994,7 @@ impl RestartCoordinator {
                 let terminal = match persisted {
                     Ok(()) => ServerMessage::AgentRestartFailed(failed),
                     Err(error) => self
-                        .persistence_failure(&request, pending.old_runtime, error)
+                        .persistence_failure_with_phase(&request, pending.old_runtime, error, true)
                         .messages
                         .remove(0),
                 };
@@ -1972,7 +2034,7 @@ impl RestartCoordinator {
             let terminal = match persisted {
                 Ok(()) => ServerMessage::AgentRestartFailed(failed),
                 Err(error) => self
-                    .persistence_failure(&request, pending.old_runtime, error)
+                    .persistence_failure_with_phase(&request, pending.old_runtime, error, true)
                     .messages
                     .remove(0),
             };
@@ -1987,7 +2049,7 @@ impl RestartCoordinator {
             Ok((_replacement, terminal)) => terminal,
             Err(error) => {
                 let terminal = self
-                    .persistence_failure(&request, pending.old_runtime, error)
+                    .persistence_failure_with_phase(&request, pending.old_runtime, error, true)
                     .messages
                     .remove(0);
                 emit(&terminal);
@@ -2037,7 +2099,7 @@ impl RestartCoordinator {
                 Ok((_replacement, terminal)) => terminal,
                 Err(error) => {
                     let terminal = self
-                        .persistence_failure(&request, pending.old_runtime, error)
+                        .persistence_failure_with_phase(&request, pending.old_runtime, error, true)
                         .messages
                         .remove(0);
                     emit(&terminal);
@@ -2287,6 +2349,7 @@ impl RestartCoordinator {
 #[derive(Clone)]
 struct ProductionResumePlan {
     context: RestartResumeContext,
+    retirement_fence: RestartRetirementFence,
 }
 
 /// Exact fresh-agent creation inputs captured while the selected runtime is
@@ -2344,6 +2407,31 @@ pub trait ProductionFreshRuntime: Send + Sync {
         provider: freshell_protocol::AgentProvider,
         session_id: &str,
     ) -> Option<ProductionFreshResumePlan>;
+
+    /// Capture provider-specific retirement work while the exact runtime is
+    /// still live. Test seams without an external writer default to an empty
+    /// action set; the real WS state overrides every supported provider.
+    async fn capture_restart_actions(
+        &self,
+        _provider: freshell_protocol::AgentProvider,
+        _session_id: &str,
+        _expected_runtime_id: &str,
+    ) -> Result<Vec<RestartRetirementAction>, String> {
+        Ok(Vec::new())
+    }
+
+    /// Cross-boot OpenCode recovery cannot consult the originating process's
+    /// sessions map. Abort the exact persisted remote id through the shared
+    /// serve manager instead.
+    async fn recover_opencode_remote_abort(
+        &self,
+        _session_id: &str,
+        _cwd: Option<&str>,
+    ) -> freshell_freshagent::RestartShutdownOutcome {
+        freshell_freshagent::RestartShutdownOutcome::RetirementIncomplete {
+            message: "OpenCode boot-recovery abort is unavailable".to_string(),
+        }
+    }
 
     async fn handle_create(
         &self,
@@ -2417,16 +2505,10 @@ impl ProductionFreshRuntime for WsStateFreshRuntime {
                     .await
             }
             freshell_protocol::AgentProvider::Opencode => {
-                if self
-                    .state
+                self.state
                     .fresh_opencode
-                    .shutdown_for_restart(session_id, expected_runtime_id)
+                    .shutdown_for_restart_detailed(session_id, expected_runtime_id)
                     .await
-                {
-                    freshell_freshagent::RestartShutdownOutcome::Stopped
-                } else {
-                    freshell_freshagent::RestartShutdownOutcome::Stale
-                }
             }
             freshell_protocol::AgentProvider::Amplifier => {
                 freshell_freshagent::RestartShutdownOutcome::Stale
@@ -2487,6 +2569,61 @@ impl ProductionFreshRuntime for WsStateFreshRuntime {
             permission_mode: binding.as_ref().and_then(|row| row.permission_mode.clone()),
             sandbox,
         })
+    }
+
+    async fn capture_restart_actions(
+        &self,
+        provider: freshell_protocol::AgentProvider,
+        session_id: &str,
+        expected_runtime_id: &str,
+    ) -> Result<Vec<RestartRetirementAction>, String> {
+        match provider {
+            freshell_protocol::AgentProvider::Claude => self
+                .state
+                .fresh_claude
+                .capture_restart_process_barrier(session_id, expected_runtime_id)
+                .await
+                .map(|barrier| vec![RestartRetirementAction::ProcessTree { barrier }])
+                .ok_or_else(|| {
+                    "selected Claude runtime disappeared before retirement fence capture"
+                        .to_string()
+                }),
+            freshell_protocol::AgentProvider::Codex => self
+                .state
+                .fresh_codex
+                .capture_restart_process_barrier(session_id, expected_runtime_id)
+                .await
+                .map(|barrier| vec![RestartRetirementAction::ProcessTree { barrier }])
+                .ok_or_else(|| {
+                    "selected Codex runtime disappeared before retirement fence capture".to_string()
+                }),
+            freshell_protocol::AgentProvider::Opencode => {
+                let remote = self
+                    .state
+                    .fresh_opencode
+                    .capture_restart_remote_abort(session_id, expected_runtime_id)
+                    .await?;
+                Ok(remote
+                    .map(|(session_id, cwd)| {
+                        vec![RestartRetirementAction::OpenCodeRemoteAbort { session_id, cwd }]
+                    })
+                    .unwrap_or_default())
+            }
+            freshell_protocol::AgentProvider::Amplifier => {
+                Err("Amplifier has no fresh-agent restart runtime".to_string())
+            }
+        }
+    }
+
+    async fn recover_opencode_remote_abort(
+        &self,
+        session_id: &str,
+        cwd: Option<&str>,
+    ) -> freshell_freshagent::RestartShutdownOutcome {
+        self.state
+            .fresh_opencode
+            .recover_restart_remote_abort(session_id, cwd)
+            .await
     }
 
     async fn handle_create(
@@ -2710,23 +2847,22 @@ impl ProductionRestartRuntime {
     async fn create_from_builtin_path(
         &self,
         request: &AgentRestart,
-        plan: ProductionResumePlan,
+        context: RestartResumeContext,
     ) -> Result<String, RestartFailure> {
         let (provider, _) = Self::provider(request)?;
         match request.kind {
             AgentRuntimeKind::Terminal => crate::terminal::create_terminal_replacement(
                 &self.state,
                 request,
-                plan.context.terminal_cwd.clone(),
+                context.terminal_cwd.clone(),
                 freshell_terminal::TerminalRestartLaunch {
-                    shell: plan
-                        .context
+                    shell: context
                         .terminal_shell
                         .unwrap_or(freshell_protocol::Shell::System),
-                    permission_mode: plan.context.terminal_permission_mode.clone(),
-                    model: plan.context.terminal_model.clone(),
-                    sandbox: plan.context.terminal_sandbox.clone(),
-                    codex_managed: plan.context.terminal_codex_managed,
+                    permission_mode: context.terminal_permission_mode.clone(),
+                    model: context.terminal_model.clone(),
+                    sandbox: context.terminal_sandbox.clone(),
+                    codex_managed: context.terminal_codex_managed,
                 },
             )
             .await
@@ -2734,7 +2870,7 @@ impl ProductionRestartRuntime {
                 RestartFailure::new(AgentRestartFailureCode::ReplacementFailed, message, true)
             }),
             AgentRuntimeKind::FreshAgent => {
-                self.create_fresh_replacement(request, provider, &plan.context)
+                self.create_fresh_replacement(request, provider, &context)
                     .await
             }
         }
@@ -2748,7 +2884,7 @@ impl RestartRuntime for ProductionRestartRuntime {
     async fn preflight(&self, request: &AgentRestart) -> Result<(), RestartFailure> {
         let (provider, _) = Self::provider(request)?;
         self.validate_durable(request)?;
-        let context = match request.kind {
+        let (context, actions) = match request.kind {
             AgentRuntimeKind::Terminal => {
                 let probe = self.state.registry.probe(&request.live_id).ok_or_else(|| {
                     RestartFailure::new(
@@ -2757,6 +2893,17 @@ impl RestartRuntime for ProductionRestartRuntime {
                         false,
                     )
                 })?;
+                let root_pid = self
+                    .state
+                    .registry
+                    .pid_of(&request.live_id)
+                    .ok_or_else(|| {
+                        RestartFailure::new(
+                            AgentRestartFailureCode::RuntimeNotFound,
+                            "selected terminal no longer owns a live process",
+                            false,
+                        )
+                    })?;
                 if probe.mode != request.provider {
                     return Err(RestartFailure::new(
                         AgentRestartFailureCode::StaleGeneration,
@@ -2783,15 +2930,49 @@ impl RestartRuntime for ProductionRestartRuntime {
                         false,
                     )
                 })?;
-                RestartResumeContext {
-                    terminal_cwd: probe.cwd,
-                    terminal_shell: Some(launch.shell),
-                    terminal_permission_mode: launch.permission_mode,
-                    terminal_model: launch.model,
-                    terminal_sandbox: launch.sandbox,
-                    terminal_codex_managed: launch.codex_managed,
-                    ..RestartResumeContext::default()
+                let mut actions = vec![RestartRetirementAction::ProcessTree {
+                    barrier:
+                        freshell_codex::transport::OwnedProcessTreeBarrier::capture_process_group(
+                            root_pid,
+                        ),
+                }];
+                if launch.codex_managed == Some(true) {
+                    let managed_barrier =
+                        freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+                            .capture_terminal_restart_barrier(&request.live_id)
+                            .await
+                            .map_err(|message| {
+                                RestartFailure::new(
+                                    AgentRestartFailureCode::PreflightFailed,
+                                    format!(
+                                        "managed Codex retirement fence capture failed: {message}"
+                                    ),
+                                    true,
+                                )
+                            })?
+                            .ok_or_else(|| {
+                                RestartFailure::new(
+                                    AgentRestartFailureCode::PreflightFailed,
+                                    "managed Codex app-server ownership is unavailable",
+                                    true,
+                                )
+                            })?;
+                    actions.push(RestartRetirementAction::ProcessTree {
+                        barrier: managed_barrier,
+                    });
                 }
+                (
+                    RestartResumeContext {
+                        terminal_cwd: probe.cwd,
+                        terminal_shell: Some(launch.shell),
+                        terminal_permission_mode: launch.permission_mode,
+                        terminal_model: launch.model,
+                        terminal_sandbox: launch.sandbox,
+                        terminal_codex_managed: launch.codex_managed,
+                        ..RestartResumeContext::default()
+                    },
+                    actions,
+                )
             }
             AgentRuntimeKind::FreshAgent => {
                 if !self.fresh_is_live(provider, &request.session_id).await {
@@ -2812,16 +2993,30 @@ impl RestartRuntime for ProductionRestartRuntime {
                             false,
                         )
                     })?;
-                RestartResumeContext {
-                    fresh_session_type: Some(plan.session_type),
-                    fresh_cwd: plan.cwd,
-                    fresh_model: plan.model,
-                    fresh_effort: plan.effort,
-                    fresh_permission_mode: plan.permission_mode,
-                    fresh_sandbox: plan.sandbox,
-                    ..RestartResumeContext::default()
-                }
+                let actions = self
+                    .fresh_runtime
+                    .capture_restart_actions(provider, &request.session_id, &request.live_id)
+                    .await
+                    .map_err(|message| {
+                        RestartFailure::new(AgentRestartFailureCode::PreflightFailed, message, true)
+                    })?;
+                (
+                    RestartResumeContext {
+                        fresh_session_type: Some(plan.session_type),
+                        fresh_cwd: plan.cwd,
+                        fresh_model: plan.model,
+                        fresh_effort: plan.effort,
+                        fresh_permission_mode: plan.permission_mode,
+                        fresh_sandbox: plan.sandbox,
+                        ..RestartResumeContext::default()
+                    },
+                    actions,
+                )
             }
+        };
+        let retirement_fence = RestartRetirementFence {
+            origin_boot_id: self.state.boot_id.as_ref().clone(),
+            actions,
         };
         let mut plans = self.plans.lock().expect("production restart plans");
         if plans.len() >= DEFAULT_RESTART_LOCK_LIMIT {
@@ -2829,7 +3024,13 @@ impl RestartRuntime for ProductionRestartRuntime {
                 plans.remove(&oldest);
             }
         }
-        plans.insert(request.request_id.clone(), ProductionResumePlan { context });
+        plans.insert(
+            request.request_id.clone(),
+            ProductionResumePlan {
+                context,
+                retirement_fence,
+            },
+        );
         Ok(())
     }
 
@@ -2875,10 +3076,12 @@ impl RestartRuntime for ProductionRestartRuntime {
                             false,
                         ));
                     }
-                    freshell_freshagent::RestartShutdownOutcome::RetirementIncomplete => {
+                    freshell_freshagent::RestartShutdownOutcome::RetirementIncomplete {
+                        message,
+                    } => {
                         return Err(RestartFailure::new(
                             AgentRestartFailureCode::ShutdownFailed,
-                            "selected fresh-agent runtime retirement is not yet quiescent",
+                            message,
                             true,
                         ));
                     }
@@ -2905,7 +3108,7 @@ impl RestartRuntime for ProductionRestartRuntime {
                     true,
                 )
             })?;
-        self.create_from_builtin_path(request, plan).await
+        self.create_from_builtin_path(request, plan.context).await
     }
 
     fn persisted_resume_context(
@@ -2920,6 +3123,18 @@ impl RestartRuntime for ProductionRestartRuntime {
             .map(|plan| plan.context.clone())
     }
 
+    fn persisted_retirement_fence(
+        &self,
+        request: &AgentRestart,
+        _plan: &(),
+    ) -> Option<RestartRetirementFence> {
+        self.plans
+            .lock()
+            .expect("production restart plans")
+            .get(&request.request_id)
+            .map(|plan| plan.retirement_fence.clone())
+    }
+
     async fn recover_replacement(
         &self,
         request: &AgentRestart,
@@ -2929,15 +3144,13 @@ impl RestartRuntime for ProductionRestartRuntime {
         self.validate_durable(request)?;
         self.create_from_builtin_path(
             request,
-            ProductionResumePlan {
-                context: context.cloned().ok_or_else(|| {
-                    RestartFailure::new(
-                        AgentRestartFailureCode::ReplacementFailed,
-                        "persisted restart resume plan is unavailable",
-                        false,
-                    )
-                })?,
-            },
+            context.cloned().ok_or_else(|| {
+                RestartFailure::new(
+                    AgentRestartFailureCode::ReplacementFailed,
+                    "persisted restart resume plan is unavailable",
+                    false,
+                )
+            })?,
         )
         .await
     }
@@ -2950,6 +3163,98 @@ impl RestartRuntime for ProductionRestartRuntime {
         // Production teardown owns a quarantined, runtime-fenced retirement;
         // it does not need to re-run live preflight after destructive removal.
         self.shutdown_for_restart(request, &()).await
+    }
+
+    async fn recover_persisted_retirement(
+        &self,
+        request: &AgentRestart,
+        context: Option<&RestartResumeContext>,
+        fence: Option<&RestartRetirementFence>,
+    ) -> Result<(), RestartFailure> {
+        let fence = fence.ok_or_else(|| {
+            RestartFailure::new(
+                AgentRestartFailureCode::ShutdownFailed,
+                "persisted predecessor retirement fence is unavailable; refusing to create a competing writer",
+                true,
+            )
+        })?;
+        if fence.origin_boot_id == self.state.boot_id.as_ref().as_str() {
+            return self.recover_retirement(request, context).await;
+        }
+
+        let process_action_count = fence
+            .actions
+            .iter()
+            .filter(|action| matches!(action, RestartRetirementAction::ProcessTree { .. }))
+            .count();
+        let required_process_actions = match request.kind {
+            AgentRuntimeKind::Terminal => {
+                if context.and_then(|context| context.terminal_codex_managed) == Some(true) {
+                    2
+                } else {
+                    1
+                }
+            }
+            AgentRuntimeKind::FreshAgent if request.provider == "claude" => 1,
+            AgentRuntimeKind::FreshAgent if request.provider == "codex" => 1,
+            AgentRuntimeKind::FreshAgent if request.provider == "opencode" => 0,
+            AgentRuntimeKind::FreshAgent => 1,
+        };
+        if process_action_count < required_process_actions {
+            return Err(RestartFailure::new(
+                AgentRestartFailureCode::ShutdownFailed,
+                format!(
+                    "persisted predecessor retirement fence is incomplete \
+                     (expected at least {required_process_actions} local process barriers, \
+                     found {process_action_count}); refusing replacement"
+                ),
+                true,
+            ));
+        }
+
+        for action in &fence.actions {
+            match action {
+                RestartRetirementAction::ProcessTree { barrier } => {
+                    let mut barrier = barrier.clone();
+                    if !barrier.terminate_and_confirm().await {
+                        return Err(RestartFailure::new(
+                            AgentRestartFailureCode::ShutdownFailed,
+                            "persisted predecessor process tree is not yet confirmed quiescent",
+                            true,
+                        ));
+                    }
+                }
+                RestartRetirementAction::OpenCodeRemoteAbort { session_id, cwd } => {
+                    match self
+                        .fresh_runtime
+                        .recover_opencode_remote_abort(session_id, cwd.as_deref())
+                        .await
+                    {
+                        freshell_freshagent::RestartShutdownOutcome::Stopped => {}
+                        freshell_freshagent::RestartShutdownOutcome::Stale => {
+                            return Err(RestartFailure::new(
+                                AgentRestartFailureCode::ShutdownFailed,
+                                format!(
+                                    "persisted OpenCode predecessor {session_id} could not be \
+                                     confirmed aborted"
+                                ),
+                                true,
+                            ));
+                        }
+                        freshell_freshagent::RestartShutdownOutcome::RetirementIncomplete {
+                            message,
+                        } => {
+                            return Err(RestartFailure::new(
+                                AgentRestartFailureCode::ShutdownFailed,
+                                message,
+                                true,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 

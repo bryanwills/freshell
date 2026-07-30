@@ -18,7 +18,10 @@ import { createLogger } from '@/lib/client-logger'
 import { applyAgentRestartReplaced as applyPaneAgentRestartReplaced } from '@/store/panesSlice'
 import { applyAgentRestartReplaced as applyFreshAgentRestartReplaced } from '@/store/freshAgentSlice'
 import type { FreshAgentState } from '@/store/freshAgentTypes'
-import type { PanesState } from '@/store/paneTypes'
+import type { PanesState, PaneNode } from '@/store/paneTypes'
+import { paneMatchesAgentRuntimeReplacement } from '@/lib/pane-utils'
+import { updateTab } from '@/store/tabsSlice'
+import { clearTerminalLifecycle } from '@/store/terminalLifecycleSlice'
 
 const log = createLogger('WsClient')
 
@@ -97,6 +100,32 @@ type AgentRestartStore = {
     panes: PanesState
     freshAgent: FreshAgentState
   }
+}
+
+function collectTerminalRestartViewers(
+  panes: PanesState,
+  replacement: Extract<ServerMessage, { type: 'agent.restart.replaced' }>,
+): { tabIds: Set<string>; paneIds: Set<string> } {
+  const tabIds = new Set<string>()
+  const paneIds = new Set<string>()
+  const visit = (tabId: string, node: PaneNode) => {
+    if (node.type === 'split') {
+      visit(tabId, node.children[0])
+      visit(tabId, node.children[1])
+      return
+    }
+    if (
+      node.content.kind === 'terminal'
+      && paneMatchesAgentRuntimeReplacement(node.content, replacement)
+    ) {
+      tabIds.add(tabId)
+      paneIds.add(node.id)
+    }
+  }
+  for (const [tabId, root] of Object.entries(panes.layouts)) {
+    visit(tabId, root)
+  }
+  return { tabIds, paneIds }
 }
 
 const CONNECTION_TIMEOUT_MS = 10_000
@@ -376,6 +405,9 @@ export class WsClient {
       }
 
       if (msg.type === 'agent.restart.replaced') {
+        const terminalViewers = this.agentRestartStore
+          ? collectTerminalRestartViewers(this.agentRestartStore.getState().panes, msg)
+          : undefined
         this.retiredRuntimeGenerations.set(
           msg.oldRuntimeId,
           Math.max(this.retiredRuntimeGenerations.get(msg.oldRuntimeId) ?? -1, msg.oldGeneration),
@@ -384,6 +416,17 @@ export class WsClient {
         // handlers, so React effects can only observe the committed descriptor.
         this.agentRestartStore?.dispatch(applyPaneAgentRestartReplaced(msg))
         this.agentRestartStore?.dispatch(applyFreshAgentRestartReplaced(msg))
+        if (terminalViewers && this.agentRestartStore) {
+          for (const tabId of terminalViewers.tabIds) {
+            this.agentRestartStore.dispatch(updateTab({
+              id: tabId,
+              updates: { status: 'running' },
+            }))
+          }
+          for (const paneId of terminalViewers.paneIds) {
+            this.agentRestartStore.dispatch(clearTerminalLifecycle({ paneId }))
+          }
+        }
       }
     }
 
