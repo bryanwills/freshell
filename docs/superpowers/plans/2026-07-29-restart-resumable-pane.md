@@ -424,3 +424,31 @@ Expected: diff check is silent; commit only if verification changed one of those
   alone; the full restart target remained 44/44 throughout.
 - No Node backend changes, external provider processes, or live-port
   operations were used.
+
+#### Final review iteration 5 — 2026-07-30
+
+- Claude/Kilroy restart teardown now keeps the sidecar stdin alive until the
+  ownership-tagged process tree has been captured, killed, and confirmed dead.
+  The stdout consumer is then cancelled and joined, stdin is closed, and the
+  direct child is reaped before the durable lease is released.
+- The new Kilroy-flavoured regression fixture models a sidecar that exits on
+  stdin EOF while leaving a tagged, SIGTERM-resistant CLI descendant alive.
+  Before the fix it observed EOF before capture and failed; after the fix,
+  shutdown confirms the descendant is dead before returning success and
+  reopening the lease.
+- Red/green and focused regression evidence:
+  - Red:
+    `cargo test -p freshell-freshagent restart_shutdown_keeps_stdin_open_until_owned_cli_is_captured -- --nocapture`
+    — failed because the sidecar observed stdin EOF before ownership capture.
+  - Green:
+    `cargo test -p freshell-freshagent restart_shutdown_ -- --nocapture`
+    — 6 passed, including both Claude/Kilroy ownership-barrier regressions.
+- Full impacted verification:
+  - `cargo test -p freshell-freshagent --lib` — 329 passed.
+  - `cargo fmt --all -- --check` — passed.
+  - `cargo clippy -p freshell-freshagent --all-targets -- -A clippy::too_many_arguments -D warnings`
+    — passed.
+- The five-iteration final-review cap is exhausted; no sixth final review was
+  run.
+- No Node backend changes, external provider processes, or live-port
+  operations were used.

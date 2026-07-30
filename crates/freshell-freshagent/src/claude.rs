@@ -694,13 +694,13 @@ impl FreshClaudeState {
             mut consumer,
             ..
         } = session;
-        drop(stdin);
 
-        // Capture the ownership-tagged process tree while the sidecar is still
-        // our child, then use the shared bounded SIGTERM -> SIGKILL escalation.
-        // This must happen before closing the stdout reader: a noisy sidecar
-        // can otherwise exit on EPIPE and reparent its CLI before Linux/YAMA
-        // lets us capture the inherited ownership tag.
+        // Keep both sidecar pipes open while capturing and killing the
+        // ownership-tagged process tree. Closing stdin first is itself a
+        // shutdown signal for the Node sidecar; it can exit and reparent its
+        // CLI before Linux/YAMA lets us read the descendant's inherited tag.
+        // Keeping the stdout consumer alive likewise prevents a noisy sidecar
+        // from exiting on EPIPE before capture.
         let tree_dead = match child.id() {
             Some(pid) => {
                 crate::session_lease::kill_and_confirm_tree_dead(
@@ -721,6 +721,10 @@ impl FreshClaudeState {
             .await
             .is_ok();
 
+        // The tagged-tree barrier has completed and the consumer can no longer
+        // observe predecessor output. It is now safe to close stdin before
+        // reaping the direct child.
+        drop(stdin);
         if !tree_dead {
             let _ = child.start_kill();
         }
@@ -1973,6 +1977,119 @@ wait
                 .claim(PROVIDER, "active-restart", "replacement", 2),
             crate::session_lease::FreshSessionClaim::Acquired,
             "the durable lease reopens only after full quiescence"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restart_shutdown_keeps_stdin_open_until_owned_cli_is_captured() {
+        let st = state();
+        let temp = tempfile::tempdir().unwrap();
+        let descendant_pid = temp.path().join("descendant.pid");
+        let eof_marker = temp.path().join("sidecar-saw-eof");
+        let ownership_id = format!("test-eof-reparent-{}", uuid::Uuid::new_v4());
+        let script = r#"
+(
+  trap '' TERM
+  echo "$BASHPID" > "$FRESHELL_TEST_DESCENDANT_PID"
+  while true; do sleep 0.05; done
+) &
+while IFS= read -r _; do :; done
+echo eof > "$FRESHELL_TEST_EOF_MARKER"
+exit 0
+"#;
+        let mut child = tokio::process::Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .env(CLAUDE_SIDECAR_OWNERSHIP_ENV, &ownership_id)
+            .env("FRESHELL_TEST_DESCENDANT_PID", &descendant_pid)
+            .env("FRESHELL_TEST_EOF_MARKER", &eof_marker)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn EOF-sensitive fake sidecar");
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let runtime = freshell_protocol::RuntimeDescriptor {
+            runtime_id: "fresh-runtime-eof-reparent".to_string(),
+            generation: 1,
+        };
+        let consumer = st.spawn_consumer(
+            BufReader::new(stdout).lines(),
+            "eof-reparent".to_string(),
+            "kilroy".to_string(),
+            "eof-reparent".to_string(),
+            None,
+            Arc::new(std::sync::Mutex::new("eof-reparent".to_string())),
+            runtime.clone(),
+        );
+        st.sessions.lock().await.insert(
+            "eof-reparent".to_string(),
+            ClaudeSession {
+                runtime,
+                session_type: SessionType::Kilroy,
+                stdin,
+                child,
+                ownership_id,
+                consumer,
+                sidecar_session_id: "eof-reparent".to_string(),
+                cli_session_id: Some("eof-reparent".to_string()),
+                broadcast_id: Arc::new(std::sync::Mutex::new("eof-reparent".to_string())),
+            },
+        );
+        st.cli_index
+            .lock()
+            .await
+            .insert("eof-reparent".to_string(), "eof-reparent".to_string());
+        assert_eq!(
+            st.leases.claim(PROVIDER, "eof-reparent", "original", 1),
+            crate::session_lease::FreshSessionClaim::Acquired
+        );
+        assert!(st
+            .leases
+            .complete(PROVIDER, "eof-reparent", "original", "eof-reparent"));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !descendant_pid.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "EOF-sensitive fake CLI did not start"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let pid: i32 = std::fs::read_to_string(&descendant_pid)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        let stopped = st
+            .shutdown_for_restart("eof-reparent", "fresh-runtime-eof-reparent")
+            .await;
+        let descendant_alive = unsafe { libc::kill(pid, 0) == 0 };
+        if descendant_alive {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+
+        assert!(
+            !eof_marker.exists(),
+            "restart must not close stdin and let the sidecar reparent its CLI before capture"
+        );
+        assert!(
+            stopped,
+            "restart shutdown must confirm the EOF-sensitive owned tree is dead"
+        );
+        assert!(
+            !descendant_alive,
+            "shutdown success must not leave the reparent-prone tagged descendant alive"
+        );
+        assert_eq!(
+            st.leases.claim(PROVIDER, "eof-reparent", "replacement", 2),
+            crate::session_lease::FreshSessionClaim::Acquired,
+            "the durable lease reopens only after the descendant death barrier"
         );
     }
 
