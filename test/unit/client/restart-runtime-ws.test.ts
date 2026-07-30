@@ -126,6 +126,7 @@ const retryableFailed = {
   code: 'REPLACEMENT_FAILED' as const,
   message: 'replacement is temporarily unavailable',
   retryable: true,
+  recoveryPending: true,
 }
 
 describe('WsClient restart transaction folding', () => {
@@ -258,6 +259,40 @@ describe('WsClient restart transaction folding', () => {
     second.message(replaced)
   })
 
+  it('keeps durable recovery when reconnect receives failure before started replay', async () => {
+    const client = new WsClient('ws://example/ws')
+    const firstConnect = client.connect()
+    const first = MockWebSocket.instances[0]
+    first.onopen?.()
+    first.message({ type: 'ready', capabilities: { agentRestartV1: true } })
+    await firstConnect
+
+    client.requestAgentRestart(request)
+    const originalWireRequest = first.sent.find((frame) => JSON.parse(frame).type === 'agent.restart')
+    expect(originalWireRequest).toBeDefined()
+
+    // The server accepted and retired the predecessor, but this socket drops
+    // before the client observes its started edge.
+    first.drop()
+    const reconnect = client.connect()
+    const second = MockWebSocket.instances[1]
+    second.onopen?.()
+    second.message({ type: 'ready', capabilities: { agentRestartV1: true } })
+    await reconnect
+    expect(client.isAgentRestartRecoveryPending(request.requestId)).toBe(false)
+
+    // A failure from the durable transaction can overtake the replayed
+    // started edge on the new socket. The frame itself is authoritative.
+    second.message(retryableFailed)
+    expect(client.isAgentRestartRecoveryPending(request.requestId)).toBe(true)
+    await vi.advanceTimersByTimeAsync(500)
+
+    expect(second.sent.filter((frame) => JSON.parse(frame).type === 'agent.restart')).toEqual([
+      originalWireRequest,
+      originalWireRequest,
+    ])
+  })
+
   it('finalizes a retryable warming-index preflight failure that arrived before started', async () => {
     const client = new WsClient('ws://example/ws')
     const firstConnect = client.connect()
@@ -271,6 +306,7 @@ describe('WsClient restart transaction folding', () => {
       ...retryableFailed,
       code: 'PREFLIGHT_FAILED' as const,
       message: 'session index is still warming; retry restart shortly',
+      recoveryPending: false,
     })
     await vi.advanceTimersByTimeAsync(10_000)
     expect(sent(first).filter((frame) => frame.type === 'agent.restart')).toEqual([request])

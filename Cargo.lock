@@ -1285,6 +1285,7 @@ dependencies = [
  "futures-util",
  "libc",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-tungstenite 0.24.0",
  "uuid",

@@ -54,7 +54,17 @@ struct StoredResult {
 pub struct PendingRestartRecovery {
     pub request_id: String,
     pub request: AgentRestart,
+    /// Distinct client request ids correlated to the same retired runtime.
+    /// The owner remains authoritative for storage/recovery, while every
+    /// follower receives and can replay a request-specific terminal result.
+    #[serde(default)]
+    pub followers: Vec<AgentRestart>,
     pub old_runtime: RuntimeDescriptor,
+    /// True until provider teardown has crossed every process/consumer/lease
+    /// barrier. A retry or boot recovery must finish this phase before it may
+    /// create a replacement.
+    #[serde(default)]
+    pub retirement_pending: bool,
     #[serde(default)]
     pub resume_context: Option<RestartResumeContext>,
     pub last_failure: Option<AgentRestartFailed>,
@@ -198,6 +208,19 @@ pub trait RestartRuntime: Send + Sync {
     ) -> Result<String, RestartFailure> {
         let plan = self.preflight(request).await?;
         self.create_replacement(request, plan).await
+    }
+
+    /// Continue a teardown that was durably recorded before provider
+    /// quiescence completed. The default is suitable for adapters whose live
+    /// runtime remains preflightable; production adapters may resume an
+    /// internal quarantined retirement directly.
+    async fn recover_retirement(
+        &self,
+        request: &AgentRestart,
+        _context: Option<&RestartResumeContext>,
+    ) -> Result<(), RestartFailure> {
+        let plan = self.preflight(request).await?;
+        self.shutdown_for_restart(request, &plan).await
     }
 }
 
@@ -374,7 +397,15 @@ impl RestartCoordinator {
         // Migration from the first durable format: retryable replacement
         // failures were incorrectly stored as terminal results. A pending
         // recovery is authoritative and must remain executable after reopen.
-        persisted_results.retain(|entry| !pending_recoveries.contains_key(&entry.request_id));
+        persisted_results.retain(|entry| {
+            !pending_recoveries.values().any(|pending| {
+                pending.request_id == entry.request_id
+                    || pending
+                        .followers
+                        .iter()
+                        .any(|follower| follower.request_id == entry.request_id)
+            })
+        });
         let result_order = persisted_results
             .iter()
             .map(|entry| entry.request_id.clone())
@@ -1311,6 +1342,72 @@ impl RestartCoordinator {
             return outcome;
         }
 
+        // A request id previously correlated as a follower has the same replay
+        // and conflict semantics as the transaction owner's request id.
+        let follower_pending = {
+            let ownership = self.ownership.lock().expect("restart ownership lock");
+            ownership.pending_recoveries.values().find_map(|pending| {
+                pending
+                    .followers
+                    .iter()
+                    .find(|follower| follower.request_id == request.request_id)
+                    .map(|follower| (pending.clone(), follower.clone()))
+            })
+        };
+        if let Some((pending, fingerprint)) = follower_pending {
+            if fingerprint != request {
+                let outcome = self.request_conflict(&request);
+                emit(&outcome.messages[0]);
+                return outcome;
+            }
+            if let Some(replacement) = self.runtime_for_locator(&locator).filter(|current| {
+                current.runtime_id != pending.old_runtime.runtime_id
+                    && current.generation > pending.old_runtime.generation
+            }) {
+                return self
+                    .adopt_pending_replacement_with_events(request, pending, replacement, emit)
+                    .await;
+            }
+            return self
+                .recover_pending_with_events(request, pending, runtime, emit)
+                .await;
+        }
+
+        // Once the owner has retired the runtime, the canonical live locator
+        // is intentionally absent. Correlate a distinct requester by its exact
+        // old descriptor before ordinary RUNTIME_NOT_FOUND validation, persist
+        // that correlation, and let either client drive recovery.
+        let correlated_pending = {
+            let ownership = self.ownership.lock().expect("restart ownership lock");
+            ownership
+                .pending_recoveries
+                .values()
+                .find(|pending| Self::same_restart_target(&pending.request, &request))
+                .cloned()
+        };
+        if let Some(mut pending) = correlated_pending {
+            let owner_request_id = pending.request_id.clone();
+            if let Err(error) = self.try_update_ownership("join_pending_recovery", |ownership| {
+                if let Some(canonical) = ownership.pending_recoveries.get_mut(&owner_request_id) {
+                    if !canonical
+                        .followers
+                        .iter()
+                        .any(|follower| follower.request_id == request.request_id)
+                    {
+                        canonical.followers.push(request.clone());
+                    }
+                    pending = canonical.clone();
+                }
+            }) {
+                let outcome = self.persistence_failure(&request, pending.old_runtime, error);
+                emit(&outcome.messages[0]);
+                return outcome;
+            }
+            return self
+                .recover_pending_with_events(request, pending, runtime, emit)
+                .await;
+        }
+
         // A distinct requester can race the transaction owner with the exact
         // same locator + old runtime generation. The locator lock intentionally
         // makes the follower wait for that one teardown/replacement. Once it
@@ -1373,7 +1470,9 @@ impl RestartCoordinator {
                 PendingRestartRecovery {
                     request_id: request.request_id.clone(),
                     request: request.clone(),
+                    followers: Vec::new(),
                     old_runtime: expected.clone(),
+                    retirement_pending: true,
                     resume_context,
                     last_failure: None,
                 },
@@ -1405,18 +1504,53 @@ impl RestartCoordinator {
                 error = %failure.message,
                 "agent.restart.shutdown.failed"
             );
-            let terminal = self.failure_message(&request, expected.clone(), &failure);
-            let persisted = self.try_update_ownership("store_failed_shutdown", |ownership| {
-                ownership.pending_recoveries.remove(&request.request_id);
-                self.insert_result_locked(ownership, &request, terminal.clone());
-            });
+            let terminal = ServerMessage::AgentRestartFailed(self.failure_frame(
+                &request,
+                expected.clone(),
+                &failure,
+                failure.retryable,
+            ));
+            let persisted = if failure.retryable {
+                self.try_update_ownership("record_retryable_shutdown_failure", |ownership| {
+                    if let Some(recovery) =
+                        ownership.pending_recoveries.get_mut(&request.request_id)
+                    {
+                        let ServerMessage::AgentRestartFailed(failed) = &terminal else {
+                            unreachable!("shutdown failure frame")
+                        };
+                        recovery.last_failure = Some(failed.clone());
+                    }
+                })
+            } else {
+                self.try_update_ownership("store_failed_shutdown", |ownership| {
+                    ownership.pending_recoveries.remove(&request.request_id);
+                    self.insert_result_locked(ownership, &request, terminal.clone());
+                })
+            };
             let mut outcome = match persisted {
                 Ok(()) => RestartOutcome {
                     messages: vec![terminal],
                     replayed: false,
                 },
-                Err(error) => self.persistence_failure(&request, expected, error),
+                Err(error) => self.persistence_failure_with_phase(
+                    &request,
+                    expected,
+                    error,
+                    failure.retryable,
+                ),
             };
+            emit(&outcome.messages[0]);
+            outcome.messages.insert(0, started);
+            return outcome;
+        }
+
+        if let Err(error) = self.try_update_ownership("record_retirement_complete", |ownership| {
+            if let Some(recovery) = ownership.pending_recoveries.get_mut(&request.request_id) {
+                recovery.retirement_pending = false;
+                recovery.last_failure = None;
+            }
+        }) {
+            let mut outcome = self.persistence_failure_with_phase(&request, expected, error, true);
             emit(&outcome.messages[0]);
             outcome.messages.insert(0, started);
             return outcome;
@@ -1452,7 +1586,7 @@ impl RestartCoordinator {
                         error = %failure.message,
                         "agent.restart.replacement.retryable_failure"
                     );
-                    let failed = self.failure_frame(&request, expected.clone(), &failure);
+                    let failed = self.failure_frame(&request, expected.clone(), &failure, true);
                     let persisted = self.try_update_ownership(
                         "record_retryable_replacement_failure",
                         |ownership| {
@@ -1523,7 +1657,7 @@ impl RestartCoordinator {
                 error = %failure.message,
                 "agent.restart.replacement.retryable_failure"
             );
-            let failed = self.failure_frame(&request, expected.clone(), &failure);
+            let failed = self.failure_frame(&request, expected.clone(), &failure, true);
             let persisted =
                 self.try_update_ownership("reject_reused_replacement_runtime", |ownership| {
                     if let Some(recovery) =
@@ -1561,16 +1695,19 @@ impl RestartCoordinator {
         }
     }
 
+    fn same_restart_target(left: &AgentRestart, right: &AgentRestart) -> bool {
+        left.provider == right.provider
+            && left.session_id == right.session_id
+            && left.kind == right.kind
+            && left.live_id == right.live_id
+            && left.expected_generation == right.expected_generation
+    }
+
     fn join_completed_replacement(&self, request: &AgentRestart) -> Option<RestartOutcome> {
         let joined = {
             let ownership = self.ownership.lock().expect("restart ownership lock");
             ownership.results.values().find_map(|stored| {
-                let same_old_runtime = stored.fingerprint.provider == request.provider
-                    && stored.fingerprint.session_id == request.session_id
-                    && stored.fingerprint.kind == request.kind
-                    && stored.fingerprint.live_id == request.live_id
-                    && stored.fingerprint.expected_generation == request.expected_generation;
-                if !same_old_runtime {
+                if !Self::same_restart_target(&stored.fingerprint, request) {
                     return None;
                 }
                 match &stored.terminal {
@@ -1629,6 +1766,114 @@ impl RestartCoordinator {
             runtime: pending.old_runtime.clone(),
         });
         emit(&started);
+        if pending.retirement_pending {
+            if let Err(failure) = runtime
+                .recover_retirement(&request, pending.resume_context.as_ref())
+                .await
+            {
+                tracing::warn!(
+                    request_id = %request.request_id,
+                    provider = %request.provider,
+                    session_id = %request.session_id,
+                    old_runtime_id = %pending.old_runtime.runtime_id,
+                    old_generation = pending.old_runtime.generation,
+                    code = ?failure.code,
+                    retryable = failure.retryable,
+                    error = %failure.message,
+                    "agent.restart.retirement_recovery.failed"
+                );
+                let failed = self.failure_frame(
+                    &request,
+                    pending.old_runtime.clone(),
+                    &failure,
+                    failure.retryable,
+                );
+                let owner_request_id = pending.request_id.clone();
+                let persisted = if failure.retryable {
+                    self.try_update_ownership("record_retryable_retirement_failure", |ownership| {
+                        if let Some(recovery) =
+                            ownership.pending_recoveries.get_mut(&owner_request_id)
+                        {
+                            recovery.last_failure = Some(failed.clone());
+                        }
+                    })
+                } else {
+                    self.try_update_ownership("store_terminal_retirement_failure", |ownership| {
+                        let correlated = ownership
+                            .pending_recoveries
+                            .remove(&owner_request_id)
+                            .map(|recovery| {
+                                std::iter::once(recovery.request)
+                                    .chain(recovery.followers)
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_else(|| vec![request.clone()]);
+                        for correlated_request in correlated {
+                            let mut correlated_failed = failed.clone();
+                            correlated_failed.request_id = correlated_request.request_id.clone();
+                            self.insert_result_locked(
+                                ownership,
+                                &correlated_request,
+                                ServerMessage::AgentRestartFailed(correlated_failed),
+                            );
+                        }
+                    })
+                };
+                let terminal = match persisted {
+                    Ok(()) => ServerMessage::AgentRestartFailed(failed),
+                    Err(error) => self
+                        .persistence_failure_with_phase(
+                            &request,
+                            pending.old_runtime,
+                            error,
+                            failure.retryable,
+                        )
+                        .messages
+                        .remove(0),
+                };
+                emit(&terminal);
+                return RestartOutcome {
+                    messages: vec![started, terminal],
+                    replayed: false,
+                };
+            }
+
+            let owner_request_id = pending.request_id.clone();
+            if let Err(error) =
+                self.try_update_ownership("record_recovered_retirement_complete", |ownership| {
+                    if let Some(recovery) = ownership.pending_recoveries.get_mut(&owner_request_id)
+                    {
+                        recovery.retirement_pending = false;
+                        recovery.last_failure = None;
+                    }
+                })
+            {
+                let terminal = self
+                    .persistence_failure_with_phase(&request, pending.old_runtime, error, true)
+                    .messages
+                    .remove(0);
+                emit(&terminal);
+                return RestartOutcome {
+                    messages: vec![started, terminal],
+                    replayed: false,
+                };
+            }
+        }
+        {
+            let locator = RuntimeLocator::from_request(&request);
+            let mut ownership = self.ownership.lock().expect("restart ownership lock");
+            if ownership
+                .by_locator
+                .get(&locator)
+                .is_some_and(|current| current == &pending.old_runtime)
+            {
+                ownership.by_locator.remove(&locator);
+                ownership
+                    .retired_live
+                    .insert((request.kind, pending.old_runtime.runtime_id.clone()));
+                ownership.locator_order.retain(|entry| entry != &locator);
+            }
+        }
         let replacement_id = match runtime
             .recover_replacement(&request, pending.resume_context.as_ref())
             .await
@@ -1646,23 +1891,42 @@ impl RestartCoordinator {
                     error = %failure.message,
                     "agent.restart.recovery.failed"
                 );
-                let failed = self.failure_frame(&request, pending.old_runtime.clone(), &failure);
+                let failed = self.failure_frame(
+                    &request,
+                    pending.old_runtime.clone(),
+                    &failure,
+                    failure.retryable,
+                );
                 let persisted = if failure.retryable {
+                    let owner_request_id = pending.request_id.clone();
                     self.try_update_ownership("record_retryable_recovery_failure", |ownership| {
                         if let Some(recovery) =
-                            ownership.pending_recoveries.get_mut(&request.request_id)
+                            ownership.pending_recoveries.get_mut(&owner_request_id)
                         {
                             recovery.last_failure = Some(failed.clone());
                         }
                     })
                 } else {
+                    let owner_request_id = pending.request_id.clone();
                     self.try_update_ownership("store_terminal_recovery_failure", |ownership| {
-                        ownership.pending_recoveries.remove(&request.request_id);
-                        self.insert_result_locked(
-                            ownership,
-                            &request,
-                            ServerMessage::AgentRestartFailed(failed.clone()),
-                        );
+                        let correlated = ownership
+                            .pending_recoveries
+                            .remove(&owner_request_id)
+                            .map(|recovery| {
+                                std::iter::once(recovery.request)
+                                    .chain(recovery.followers)
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_else(|| vec![request.clone()]);
+                        for correlated_request in correlated {
+                            let mut correlated_failed = failed.clone();
+                            correlated_failed.request_id = correlated_request.request_id.clone();
+                            self.insert_result_locked(
+                                ownership,
+                                &correlated_request,
+                                ServerMessage::AgentRestartFailed(correlated_failed),
+                            );
+                        }
                     })
                 };
                 let terminal = match persisted {
@@ -1696,11 +1960,11 @@ impl RestartCoordinator {
                 error = %failure.message,
                 "agent.restart.recovery.failed"
             );
-            let failed = self.failure_frame(&request, pending.old_runtime.clone(), &failure);
+            let failed = self.failure_frame(&request, pending.old_runtime.clone(), &failure, true);
+            let owner_request_id = pending.request_id.clone();
             let persisted =
                 self.try_update_ownership("reject_reused_recovery_runtime", |ownership| {
-                    if let Some(recovery) =
-                        ownership.pending_recoveries.get_mut(&request.request_id)
+                    if let Some(recovery) = ownership.pending_recoveries.get_mut(&owner_request_id)
                     {
                         recovery.last_failure = Some(failed.clone());
                     }
@@ -1827,6 +2091,22 @@ impl RestartCoordinator {
             runtime: replacement.clone(),
         });
         self.try_update_ownership("commit_replacement", |ownership| {
+            let pending_keys = ownership
+                .pending_recoveries
+                .iter()
+                .filter(|(_, pending)| Self::same_restart_target(&pending.request, request))
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            let mut correlated_requests = vec![request.clone()];
+            for key in pending_keys {
+                if let Some(pending) = ownership.pending_recoveries.remove(&key) {
+                    correlated_requests.push(pending.request);
+                    correlated_requests.extend(pending.followers);
+                }
+            }
+            correlated_requests.sort_by(|left, right| left.request_id.cmp(&right.request_id));
+            correlated_requests.dedup_by(|left, right| left.request_id == right.request_id);
+
             let replacement_key = (request.kind, replacement.runtime_id.clone());
             ownership
                 .descriptor_by_live
@@ -1839,8 +2119,18 @@ impl RestartCoordinator {
                 replacement.runtime_id.clone(),
                 replacement.clone(),
             );
-            ownership.pending_recoveries.remove(&request.request_id);
-            self.insert_result_locked(ownership, request, terminal.clone());
+            for correlated_request in correlated_requests {
+                let mut correlated_terminal = match &terminal {
+                    ServerMessage::AgentRestartReplaced(message) => message.clone(),
+                    _ => unreachable!("restart replacement commit stores a replaced frame"),
+                };
+                correlated_terminal.request_id = correlated_request.request_id.clone();
+                self.insert_result_locked(
+                    ownership,
+                    &correlated_request,
+                    ServerMessage::AgentRestartReplaced(correlated_terminal),
+                );
+            }
             Self::prune_ownership_locked(ownership, self.ownership_limit);
         })?;
         tracing::info!(
@@ -1859,6 +2149,7 @@ impl RestartCoordinator {
         request: &AgentRestart,
         descriptor: RuntimeDescriptor,
         failure: &RestartFailure,
+        recovery_pending: bool,
     ) -> AgentRestartFailed {
         AgentRestartFailed {
             request_id: request.request_id.clone(),
@@ -1869,6 +2160,7 @@ impl RestartCoordinator {
             code: failure.code,
             message: failure.message.clone(),
             retryable: failure.retryable,
+            recovery_pending,
         }
     }
 
@@ -1878,7 +2170,7 @@ impl RestartCoordinator {
         descriptor: RuntimeDescriptor,
         failure: &RestartFailure,
     ) -> ServerMessage {
-        ServerMessage::AgentRestartFailed(self.failure_frame(request, descriptor, failure))
+        ServerMessage::AgentRestartFailed(self.failure_frame(request, descriptor, failure, false))
     }
 
     fn persistence_failure(
@@ -1886,6 +2178,16 @@ impl RestartCoordinator {
         request: &AgentRestart,
         descriptor: RuntimeDescriptor,
         error: std::io::Error,
+    ) -> RestartOutcome {
+        self.persistence_failure_with_phase(request, descriptor, error, false)
+    }
+
+    fn persistence_failure_with_phase(
+        &self,
+        request: &AgentRestart,
+        descriptor: RuntimeDescriptor,
+        error: std::io::Error,
+        recovery_pending: bool,
     ) -> RestartOutcome {
         RestartOutcome {
             messages: vec![ServerMessage::AgentRestartFailed(AgentRestartFailed {
@@ -1897,6 +2199,7 @@ impl RestartCoordinator {
                 code: AgentRestartFailureCode::PreflightFailed,
                 message: format!("restart transaction could not be durably recorded: {error}"),
                 retryable: true,
+                recovery_pending,
             })],
             replayed: false,
         }
@@ -1927,6 +2230,7 @@ impl RestartCoordinator {
                 message: "requestId was already used with a different restart fingerprint"
                     .to_string(),
                 retryable: false,
+                recovery_pending: false,
             })],
             replayed: true,
         }
@@ -2019,6 +2323,22 @@ pub trait ProductionFreshRuntime: Send + Sync {
         expected_runtime_id: &str,
     ) -> bool;
 
+    async fn shutdown_for_restart_detailed(
+        &self,
+        provider: freshell_protocol::AgentProvider,
+        session_id: &str,
+        expected_runtime_id: &str,
+    ) -> freshell_freshagent::RestartShutdownOutcome {
+        if self
+            .shutdown_for_restart(provider, session_id, expected_runtime_id)
+            .await
+        {
+            freshell_freshagent::RestartShutdownOutcome::Stopped
+        } else {
+            freshell_freshagent::RestartShutdownOutcome::Stale
+        }
+    }
+
     async fn capture_resume_plan(
         &self,
         provider: freshell_protocol::AgentProvider,
@@ -2072,26 +2392,45 @@ impl ProductionFreshRuntime for WsStateFreshRuntime {
         session_id: &str,
         expected_runtime_id: &str,
     ) -> bool {
+        self.shutdown_for_restart_detailed(provider, session_id, expected_runtime_id)
+            .await
+            == freshell_freshagent::RestartShutdownOutcome::Stopped
+    }
+
+    async fn shutdown_for_restart_detailed(
+        &self,
+        provider: freshell_protocol::AgentProvider,
+        session_id: &str,
+        expected_runtime_id: &str,
+    ) -> freshell_freshagent::RestartShutdownOutcome {
         match provider {
             freshell_protocol::AgentProvider::Claude => {
                 self.state
                     .fresh_claude
-                    .shutdown_for_restart(session_id, expected_runtime_id)
+                    .shutdown_for_restart_detailed(session_id, expected_runtime_id)
                     .await
             }
             freshell_protocol::AgentProvider::Codex => {
                 self.state
                     .fresh_codex
-                    .shutdown_for_restart(session_id, expected_runtime_id)
+                    .shutdown_for_restart_detailed(session_id, expected_runtime_id)
                     .await
             }
             freshell_protocol::AgentProvider::Opencode => {
-                self.state
+                if self
+                    .state
                     .fresh_opencode
                     .shutdown_for_restart(session_id, expected_runtime_id)
                     .await
+                {
+                    freshell_freshagent::RestartShutdownOutcome::Stopped
+                } else {
+                    freshell_freshagent::RestartShutdownOutcome::Stale
+                }
             }
-            freshell_protocol::AgentProvider::Amplifier => false,
+            freshell_protocol::AgentProvider::Amplifier => {
+                freshell_freshagent::RestartShutdownOutcome::Stale
+            }
         }
     }
 
@@ -2502,25 +2841,47 @@ impl RestartRuntime for ProductionRestartRuntime {
         let (provider, _) = Self::provider(request)?;
         match request.kind {
             AgentRuntimeKind::Terminal => {
-                if !crate::terminal::shutdown_terminal_for_restart(&self.state, &request.live_id) {
-                    return Err(RestartFailure::new(
-                        AgentRestartFailureCode::ShutdownFailed,
-                        "selected terminal disappeared before shutdown",
-                        false,
-                    ));
+                match crate::terminal::shutdown_terminal_for_restart(&self.state, &request.live_id)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Err(RestartFailure::new(
+                            AgentRestartFailureCode::StaleGeneration,
+                            "selected terminal disappeared before shutdown",
+                            false,
+                        ));
+                    }
+                    Err(message) => {
+                        return Err(RestartFailure::new(
+                            AgentRestartFailureCode::ShutdownFailed,
+                            message,
+                            true,
+                        ));
+                    }
                 }
             }
             AgentRuntimeKind::FreshAgent => {
-                let stopped = self
+                let outcome = self
                     .fresh_runtime
-                    .shutdown_for_restart(provider, &request.session_id, &request.live_id)
+                    .shutdown_for_restart_detailed(provider, &request.session_id, &request.live_id)
                     .await;
-                if !stopped {
-                    return Err(RestartFailure::new(
-                        AgentRestartFailureCode::StaleGeneration,
-                        "selected fresh-agent runtime changed before shutdown",
-                        false,
-                    ));
+                match outcome {
+                    freshell_freshagent::RestartShutdownOutcome::Stopped => {}
+                    freshell_freshagent::RestartShutdownOutcome::Stale => {
+                        return Err(RestartFailure::new(
+                            AgentRestartFailureCode::StaleGeneration,
+                            "selected fresh-agent runtime changed before shutdown",
+                            false,
+                        ));
+                    }
+                    freshell_freshagent::RestartShutdownOutcome::RetirementIncomplete => {
+                        return Err(RestartFailure::new(
+                            AgentRestartFailureCode::ShutdownFailed,
+                            "selected fresh-agent runtime retirement is not yet quiescent",
+                            true,
+                        ));
+                    }
                 }
             }
         }
@@ -2579,6 +2940,16 @@ impl RestartRuntime for ProductionRestartRuntime {
             },
         )
         .await
+    }
+
+    async fn recover_retirement(
+        &self,
+        request: &AgentRestart,
+        _context: Option<&RestartResumeContext>,
+    ) -> Result<(), RestartFailure> {
+        // Production teardown owns a quarantined, runtime-fenced retirement;
+        // it does not need to re-run live preflight after destructive removal.
+        self.shutdown_for_restart(request, &()).await
     }
 }
 

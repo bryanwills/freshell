@@ -358,11 +358,12 @@ fn restart_server_messages_roundtrip_with_correlated_generations() {
         other => panic!("expected AgentRestartReplaced, got {other:?}"),
     }
 
-    let failed = r#"{"type":"agent.restart.failed","requestId":"restart-1","provider":"claude","sessionId":"durable-1","kind":"terminal","runtimeId":"term-1","generation":7,"code":"UNRESUMABLE","message":"durable session is unavailable","retryable":false}"#;
+    let failed = r#"{"type":"agent.restart.failed","requestId":"restart-1","provider":"claude","sessionId":"durable-1","kind":"terminal","runtimeId":"term-1","generation":7,"code":"UNRESUMABLE","message":"durable session is unavailable","retryable":false,"recoveryPending":true}"#;
     match server_roundtrip(failed, "agent.restart.failed") {
         ServerMessage::AgentRestartFailed(message) => {
             assert_eq!(message.code, AgentRestartFailureCode::Unresumable);
             assert!(!message.retryable);
+            assert!(message.recovery_pending);
         }
         other => panic!("expected AgentRestartFailed, got {other:?}"),
     }

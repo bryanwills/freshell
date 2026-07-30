@@ -38,6 +38,9 @@
         "provider": {
           "type": "string"
         },
+        "recoveryPending": {
+          "type": "boolean"
+        },
         "requestId": {
           "type": "string"
         },
@@ -3403,6 +3406,22 @@
             "server_restart_incompatible_retention"
           ],
           "type": "string"
+        },
+        "runtime": {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "type": "number"
+            },
+            "runtimeId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "generation",
+            "runtimeId"
+          ],
+          "type": "object"
         },
         "streamId": {
           "type": "string"

@@ -65,6 +65,19 @@ pub use runtime_identity::{
 pub use snapshot::SnapshotState;
 pub use spawn_gate::{SpawnGate, SpawnGateError};
 
+/// Provider-runtime result for an exact restart retirement attempt.
+///
+/// `RetirementIncomplete` is deliberately distinct from `Stale`: the selected
+/// runtime was found and fenced, but one of its ownership barriers has not yet
+/// completed. Coordinators must persist that phase and retry the same
+/// retirement before creating a replacement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartShutdownOutcome {
+    Stopped,
+    Stale,
+    RetirementIncomplete,
+}
+
 /// Task 13b: the injected cross-kind liveness probe -- `(provider, session_id) -> bool`,
 /// true when a live terminal PTY currently owns that session. Constructed by
 /// `freshell-server`'s `main.rs` over the SAME probes the terminal D7 create-rung guard

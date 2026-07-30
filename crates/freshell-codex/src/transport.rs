@@ -83,15 +83,126 @@ impl WsTransport for TungsteniteTransport {
     }
 }
 
-/// `killOwnedProcesses` analog for codex (`runtime.ts:452-586`): SIGTERM any process whose
-/// `/proc/<pid>/environ` carries our `FRESHELL_CODEX_SIDECAR_ID=<ownership_id>` tag — the
-/// detached app-server sidecar we own. Linux `/proc`-based, best-effort and platform-guarded;
-/// we only signal processes carrying OUR unique tag, so no unrelated process is touched.
+/// A capture-before-kill ownership barrier for one process tree.
+///
+/// Linux/YAMA can make a descendant's `/proc/<pid>/environ` unreadable as soon
+/// as its direct parent exits and it reparents outside Freshell's ancestry.
+/// Therefore callers capture ownership-tagged `(pid, starttime)` pairs before
+/// closing transports or signaling the direct child, retain that exact set
+/// across retries, and confirm death through world-readable `/proc/<pid>/stat`.
+/// The start-time fence prevents a recycled PID from being mistaken for the
+/// predecessor.
+pub struct OwnedProcessTreeBarrier {
+    #[cfg(target_os = "linux")]
+    ownership_env: String,
+    #[cfg(target_os = "linux")]
+    ownership_id: String,
+    #[cfg(target_os = "linux")]
+    members: Vec<(i32, u64)>,
+    #[cfg(not(target_os = "linux"))]
+    _root_pid: u32,
+}
+
+impl OwnedProcessTreeBarrier {
+    /// Capture every currently-readable tagged process plus the known direct
+    /// child. This performs no signaling and is safe to call while sidecar
+    /// transports are still live.
+    #[cfg(target_os = "linux")]
+    pub fn capture(root_pid: u32, ownership_env: &str, ownership_id: &str) -> Self {
+        let mut members: Vec<(i32, u64)> = scan_owned_pids(ownership_env, ownership_id)
+            .into_iter()
+            .filter_map(|pid| proc_starttime(pid).map(|start| (pid, start)))
+            .collect();
+        if !members.iter().any(|(pid, _)| *pid == root_pid as i32) {
+            if let Some(start) = proc_starttime(root_pid as i32) {
+                members.push((root_pid as i32, start));
+            }
+        }
+        Self {
+            ownership_env: ownership_env.to_string(),
+            ownership_id: ownership_id.to_string(),
+            members,
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn capture(root_pid: u32, _ownership_env: &str, _ownership_id: &str) -> Self {
+        Self {
+            _root_pid: root_pid,
+        }
+    }
+
+    /// Signal and confirm the entire captured tree is dead.
+    ///
+    /// New tagged descendants are folded in before every signal round while
+    /// `/proc/<pid>/environ` remains readable. Twenty graceful SIGTERM rounds
+    /// are followed by four SIGKILL rounds. A member counts as dead only when
+    /// its captured `(pid,starttime)` incarnation is gone or is a zombie.
+    /// Failed attempts retain the captured members, so a later retry never
+    /// depends on re-reading an environment that YAMA may now hide.
+    #[cfg(target_os = "linux")]
+    pub async fn terminate_and_confirm(&mut self) -> bool {
+        for round in 0..24u8 {
+            self.refresh_members();
+            if self.members.is_empty() {
+                return true;
+            }
+            let signal = if round < 20 {
+                libc::SIGTERM
+            } else {
+                libc::SIGKILL
+            };
+            for (pid, _) in &self.members {
+                unsafe {
+                    libc::kill(*pid, signal);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        self.refresh_members();
+        self.members.is_empty()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub async fn terminate_and_confirm(&mut self) -> bool {
+        // Without a portable descendant enumeration + start-time fence there
+        // is no proof that the durable writer tree is gone. Hold ownership
+        // closed rather than reporting a false success.
+        false
+    }
+
+    #[cfg(target_os = "linux")]
+    fn refresh_members(&mut self) {
+        self.members
+            .retain(|(pid, start)| proc_starttime(*pid) == Some(*start));
+        for pid in scan_owned_pids(&self.ownership_env, &self.ownership_id) {
+            if !self.members.iter().any(|(known, _)| *known == pid) {
+                if let Some(start) = proc_starttime(pid) {
+                    self.members.push((pid, start));
+                }
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
-pub fn reap_owned_codex_sidecars(ownership_id: &str) {
-    let needle = crate::durability::ownership_needle(ownership_id);
+fn proc_starttime(pid: i32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = stat.rsplit(')').next()?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    match fields.first() {
+        Some(&"Z") | Some(&"X") | None => return None,
+        Some(_) => {}
+    }
+    fields.get(19)?.parse().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn scan_owned_pids(ownership_env: &str, ownership_id: &str) -> Vec<i32> {
+    let needle = format!("{ownership_env}={ownership_id}");
+    let mut found = Vec::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
-        return;
+        return found;
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -102,14 +213,26 @@ pub fn reap_owned_codex_sidecars(ownership_id: &str) {
         let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ")) else {
             continue;
         };
-        let carries_tag = environ
-            .split(|&b| b == 0)
-            .any(|var| var == needle.as_bytes());
-        if carries_tag {
-            // SIGTERM (15). Safe: only processes carrying OUR tag are signaled.
-            unsafe {
-                libc::kill(pid, libc::SIGTERM);
-            }
+        if environ
+            .split(|byte| *byte == 0)
+            .any(|variable| variable == needle.as_bytes())
+        {
+            found.push(pid);
+        }
+    }
+    found
+}
+
+/// `killOwnedProcesses` analog for codex (`runtime.ts:452-586`): SIGTERM any process whose
+/// `/proc/<pid>/environ` carries our `FRESHELL_CODEX_SIDECAR_ID=<ownership_id>` tag — the
+/// detached app-server sidecar we own. Linux `/proc`-based, best-effort and platform-guarded;
+/// we only signal processes carrying OUR unique tag, so no unrelated process is touched.
+#[cfg(target_os = "linux")]
+pub fn reap_owned_codex_sidecars(ownership_id: &str) {
+    for pid in scan_owned_pids(crate::durability::CODEX_SIDECAR_OWNERSHIP_ENV, ownership_id) {
+        // SIGTERM (15). Safe: only processes carrying OUR tag are signaled.
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
         }
     }
 }

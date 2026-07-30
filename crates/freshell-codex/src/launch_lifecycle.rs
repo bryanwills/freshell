@@ -49,7 +49,7 @@ use crate::launch_plan::{
     CODEX_INITIAL_LAUNCH_RETRY_DELAY_MS,
 };
 use crate::remote_proxy::{CodexRemoteProxy, CodexRemoteProxyOptions, RemoteProxyEvent};
-use crate::transport::reap_owned_codex_sidecars;
+use crate::transport::{reap_owned_codex_sidecars, OwnedProcessTreeBarrier};
 
 /// `assertAcceptingPlans` (`launch-planner.ts:199`), byte-identical.
 pub const CODEX_LAUNCH_PLANNER_SHUTDOWN_MESSAGE: &str =
@@ -382,6 +382,11 @@ struct AdoptedTerminalLaunch {
 pub struct CodexTerminalLaunchManager {
     planner: CodexLaunchPlanner,
     adopted: Mutex<HashMap<String, AdoptedTerminalLaunch>>,
+    /// Restart owns a stronger lifecycle than the ordinary PTY exit hook.
+    /// Entries move here before any await so a racing exit notification cannot
+    /// queue-and-forget teardown, and a failed barrier stays retryable by the
+    /// same terminal/runtime key.
+    restart_retirements: Mutex<HashMap<String, AdoptedTerminalLaunch>>,
     teardown_tx: OnceLock<mpsc::UnboundedSender<AdoptedTerminalLaunch>>,
 }
 
@@ -390,6 +395,7 @@ impl CodexTerminalLaunchManager {
         Self {
             planner: CodexLaunchPlanner::new(runtime_factory),
             adopted: Mutex::new(HashMap::new()),
+            restart_retirements: Mutex::new(HashMap::new()),
             teardown_tx: OnceLock::new(),
         }
     }
@@ -456,6 +462,32 @@ impl CodexTerminalLaunchManager {
         }
     }
 
+    /// Restart-only teardown for a managed Codex terminal. Unlike the normal
+    /// sync exit hook, this path is awaitable: the caller does not create the
+    /// replacement until the old proxy has closed and the sidecar runtime has
+    /// confirmed its captured process tree dead.
+    pub async fn shutdown_terminal_for_restart(&self, terminal_id: &str) -> Result<bool, String> {
+        let entry = self
+            .restart_retirements
+            .lock()
+            .unwrap()
+            .remove(terminal_id)
+            .or_else(|| self.adopted.lock().unwrap().remove(terminal_id));
+        let Some(entry) = entry else {
+            return Ok(false);
+        };
+        match entry.sidecar.shutdown().await {
+            Ok(()) => Ok(true),
+            Err(error) => {
+                self.restart_retirements
+                    .lock()
+                    .unwrap()
+                    .insert(terminal_id.to_string(), entry);
+                Err(error)
+            }
+        }
+    }
+
     /// Server-exit teardown (main.rs graceful shutdown): mirrors legacy's close-time
     /// `codexLaunchPlanner.shutdown()` (`server/index.ts:981-1049` shutdown owners) —
     /// the planner stops accepting plans and tears down its unadopted sidecars — PLUS
@@ -468,7 +500,11 @@ impl CodexTerminalLaunchManager {
             let mut map = self.adopted.lock().unwrap();
             map.drain().map(|(_, entry)| entry).collect()
         };
-        for entry in adopted {
+        let retiring: Vec<AdoptedTerminalLaunch> = {
+            let mut map = self.restart_retirements.lock().unwrap();
+            map.drain().map(|(_, entry)| entry).collect()
+        };
+        for entry in adopted.into_iter().chain(retiring) {
             let _ = entry.sidecar.shutdown().await;
         }
     }
@@ -492,6 +528,7 @@ struct SpawnedSidecar {
     ws_url: String,
     ownership_id: String,
     child: tokio::process::Child,
+    tree: OwnedProcessTreeBarrier,
 }
 
 /// The real [`CodexLaunchRuntime`]: spawns `codex -c features.apps=false app-server
@@ -621,6 +658,11 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
             let mut child = cmd
                 .spawn()
                 .map_err(|error| format!("codex app-server spawn failed ({command}): {error}"))?;
+            let tree = OwnedProcessTreeBarrier::capture(
+                child.id().unwrap_or(0),
+                crate::durability::CODEX_SIDECAR_OWNERSHIP_ENV,
+                &ownership_id,
+            );
             drain_child_io(&mut child);
 
             // Wait for the listener: probe-dial until accepted or the budget expires.
@@ -652,6 +694,7 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
                 ws_url: ws_url.clone(),
                 ownership_id,
                 child,
+                tree,
             });
             Ok(CodexRuntimeReady { ws_url })
         })
@@ -671,10 +714,20 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
     fn shutdown(&self) -> BoxFuture<'_, Result<(), String>> {
         Box::pin(async move {
             let mut state = self.state.lock().await;
-            if let Some(mut spawned) = state.take() {
-                let _ = spawned.child.start_kill();
-                let _ = tokio::time::timeout(Duration::from_secs(5), spawned.child.wait()).await;
-                reap_owned_codex_sidecars(&spawned.ownership_id);
+            if let Some(spawned) = state.as_mut() {
+                let tree_dead = spawned.tree.terminate_and_confirm().await;
+                let child_reaped = matches!(
+                    tokio::time::timeout(Duration::from_secs(5), spawned.child.wait()).await,
+                    Ok(Ok(_))
+                );
+                if !(tree_dead && child_reaped) {
+                    return Err(format!(
+                        "codex app-server ownership barrier incomplete \
+                         (ownership_id={}, tree_dead={tree_dead}, child_reaped={child_reaped})",
+                        spawned.ownership_id
+                    ));
+                }
+                state.take();
             }
             Ok(())
         })

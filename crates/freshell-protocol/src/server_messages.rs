@@ -345,6 +345,12 @@ pub struct AgentRestartFailed {
     pub code: AgentRestartFailureCode,
     pub message: String,
     pub retryable: bool,
+    /// True only when the server durably retained a post-retirement
+    /// transaction that the same request (or a correlated follower) can
+    /// continue. Clients must not infer this phase from a separately delivered
+    /// `agent.restart.started` edge because reconnect can reorder delivery.
+    #[serde(default)]
+    pub recovery_pending: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

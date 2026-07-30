@@ -122,6 +122,11 @@ pub struct FreshClaudeState {
     /// `(provider, session_id)`. Wired by `main.rs`; defaults to always-false.
     terminal_liveness: crate::TerminalLivenessProbe,
     runtime_identity: FreshRuntimeIdentity,
+    /// Exact-runtime retirements that have crossed the destructive fence but
+    /// have not yet completed every ownership barrier. They are no longer
+    /// advertised as live, while their durable indexes/lease stay held until a
+    /// same-request retry finishes quiescence.
+    restart_retirements: Arc<TokioMutex<HashMap<String, ClaudeRestartRetirement>>>,
 }
 
 /// The cached result of a completed claude/kilroy `freshAgent.create`, keyed by
@@ -168,6 +173,20 @@ struct ClaudeSession {
     broadcast_id: Arc<std::sync::Mutex<String>>,
 }
 
+struct ClaudeRestartRetirement {
+    durable_session_id: String,
+    runtime_id: String,
+    map_key: String,
+    stdin: Option<ChildStdin>,
+    child: Child,
+    ownership_id: String,
+    consumer: Option<tokio::task::JoinHandle<()>>,
+    tree: freshell_codex::transport::OwnedProcessTreeBarrier,
+    tree_dead: bool,
+    consumer_quiesced: bool,
+    child_reaped: bool,
+}
+
 impl FreshClaudeState {
     /// Build the state around the shared broadcast bus.
     pub fn new(broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>) -> Self {
@@ -181,6 +200,7 @@ impl FreshClaudeState {
             leases: Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
             terminal_liveness: Arc::new(|_, _| false),
             runtime_identity: FreshRuntimeIdentity::default(),
+            restart_retirements: Arc::new(TokioMutex::new(HashMap::new())),
         }
     }
 
@@ -670,6 +690,36 @@ impl FreshClaudeState {
         durable_session_id: &str,
         expected_runtime_id: &str,
     ) -> bool {
+        self.shutdown_for_restart_detailed(durable_session_id, expected_runtime_id)
+            .await
+            == crate::RestartShutdownOutcome::Stopped
+    }
+
+    pub async fn shutdown_for_restart_detailed(
+        &self,
+        durable_session_id: &str,
+        expected_runtime_id: &str,
+    ) -> crate::RestartShutdownOutcome {
+        let quarantined = {
+            let retirements = self.restart_retirements.lock().await;
+            match retirements.get(expected_runtime_id) {
+                Some(retirement) if retirement.durable_session_id == durable_session_id => true,
+                Some(_) => return crate::RestartShutdownOutcome::Stale,
+                None => {
+                    if retirements
+                        .values()
+                        .any(|retirement| retirement.durable_session_id == durable_session_id)
+                    {
+                        return crate::RestartShutdownOutcome::Stale;
+                    }
+                    false
+                }
+            }
+        };
+        if quarantined {
+            return self.continue_restart_retirement(expected_runtime_id).await;
+        }
+
         let map_key = self
             .resolve_session_key(durable_session_id)
             .await
@@ -684,94 +734,122 @@ impl FreshClaudeState {
             }
         };
         let Some(session) = removed else {
-            return false;
+            return crate::RestartShutdownOutcome::Stale;
         };
 
         let ClaudeSession {
+            runtime,
             stdin,
-            mut child,
+            child,
             ownership_id,
-            mut consumer,
+            consumer,
             ..
         } = session;
+        let tree = freshell_codex::transport::OwnedProcessTreeBarrier::capture(
+            child.id().unwrap_or(0),
+            CLAUDE_SIDECAR_OWNERSHIP_ENV,
+            &ownership_id,
+        );
+        self.restart_retirements.lock().await.insert(
+            expected_runtime_id.to_string(),
+            ClaudeRestartRetirement {
+                durable_session_id: durable_session_id.to_string(),
+                runtime_id: runtime.runtime_id,
+                map_key,
+                stdin: Some(stdin),
+                child,
+                ownership_id,
+                consumer: Some(consumer),
+                tree,
+                tree_dead: false,
+                consumer_quiesced: false,
+                child_reaped: false,
+            },
+        );
+        self.continue_restart_retirement(expected_runtime_id).await
+    }
 
-        // Keep both sidecar pipes open while capturing and killing the
-        // ownership-tagged process tree. Closing stdin first is itself a
-        // shutdown signal for the Node sidecar; it can exit and reparent its
-        // CLI before Linux/YAMA lets us read the descendant's inherited tag.
-        // Keeping the stdout consumer alive likewise prevents a noisy sidecar
-        // from exiting on EPIPE before capture.
-        let tree_dead = match child.id() {
-            Some(pid) => {
-                crate::session_lease::kill_and_confirm_tree_dead(
-                    pid,
-                    CLAUDE_SIDECAR_OWNERSHIP_ENV,
-                    &ownership_id,
-                )
-                .await
-            }
-            None => child.try_wait().ok().flatten().is_some(),
+    async fn continue_restart_retirement(
+        &self,
+        expected_runtime_id: &str,
+    ) -> crate::RestartShutdownOutcome {
+        let Some(mut retirement) = self
+            .restart_retirements
+            .lock()
+            .await
+            .remove(expected_runtime_id)
+        else {
+            return crate::RestartShutdownOutcome::Stale;
         };
 
-        // Cancellation is not a quiescence barrier until the JoinHandle has
-        // completed. In particular, the consumer may be inside an awaited
-        // durable identity write when restart begins.
-        consumer.abort();
-        let consumer_quiesced = tokio::time::timeout(RESTART_CONSUMER_JOIN_BUDGET, &mut consumer)
-            .await
-            .is_ok();
+        if !retirement.tree_dead {
+            retirement.tree_dead = retirement.tree.terminate_and_confirm().await;
+        }
 
-        // The tagged-tree barrier has completed and the consumer can no longer
-        // observe predecessor output. It is now safe to close stdin before
-        // reaping the direct child.
-        drop(stdin);
-        if !tree_dead {
-            let _ = child.start_kill();
+        // Keep stdin and the output consumer alive until the capture-before-kill
+        // barrier finishes. Closing either first can make the sidecar exit and
+        // reparent an SDK child before YAMA lets us identify it.
+        if retirement.tree_dead {
+            retirement.stdin.take();
+            if !retirement.consumer_quiesced {
+                if let Some(mut consumer) = retirement.consumer.take() {
+                    consumer.abort();
+                    if tokio::time::timeout(RESTART_CONSUMER_JOIN_BUDGET, &mut consumer)
+                        .await
+                        .is_ok()
+                    {
+                        retirement.consumer_quiesced = true;
+                    } else {
+                        retirement.consumer = Some(consumer);
+                    }
+                } else {
+                    retirement.consumer_quiesced = true;
+                }
+            }
+            if !retirement.child_reaped {
+                retirement.child_reaped = matches!(
+                    tokio::time::timeout(RESTART_CHILD_REAP_BUDGET, retirement.child.wait()).await,
+                    Ok(Ok(_))
+                );
+            }
         }
-        let mut child_reaped = matches!(
-            tokio::time::timeout(RESTART_CHILD_REAP_BUDGET, child.wait()).await,
-            Ok(Ok(_))
-        );
-        if !child_reaped {
-            let _ = child.start_kill();
-            child_reaped = matches!(
-                tokio::time::timeout(RESTART_CHILD_REAP_BUDGET, child.wait()).await,
-                Ok(Ok(_))
-            );
-        }
-        // Only after every captured process is confirmed dead and the direct
-        // child is reaped may the durable lease be reopened.
-        if !(consumer_quiesced && tree_dead && child_reaped) {
+
+        if !(retirement.tree_dead && retirement.consumer_quiesced && retirement.child_reaped) {
             tracing::error!(
                 provider = PROVIDER,
-                session_id = durable_session_id,
-                runtime_id = expected_runtime_id,
-                ownership_id,
-                consumer_quiesced,
-                tree_dead,
-                child_reaped,
+                session_id = %retirement.durable_session_id,
+                runtime_id = %retirement.runtime_id,
+                ownership_id = %retirement.ownership_id,
+                consumer_quiesced = retirement.consumer_quiesced,
+                tree_dead = retirement.tree_dead,
+                child_reaped = retirement.child_reaped,
                 "freshagent.claude.restart_shutdown_not_quiescent"
             );
-            return false;
+            self.restart_retirements
+                .lock()
+                .await
+                .insert(expected_runtime_id.to_string(), retirement);
+            return crate::RestartShutdownOutcome::RetirementIncomplete;
         }
 
         self.create_dedup
-            .clear_for_session(|record| record.session_id == map_key)
+            .clear_for_session(|record| record.session_id == retirement.map_key)
             .await;
         let mut removed_durables = Vec::new();
         self.cli_index.lock().await.retain(|durable, mapped| {
-            if mapped == &map_key {
+            if mapped == &retirement.map_key {
                 removed_durables.push(durable.clone());
                 false
             } else {
                 true
             }
         });
-        self.leases.clear_binding(PROVIDER, durable_session_id);
+        self.leases
+            .clear_binding(PROVIDER, &retirement.durable_session_id);
         for durable in removed_durables {
             self.leases.clear_binding(PROVIDER, &durable);
         }
-        true
+        crate::RestartShutdownOutcome::Stopped
     }
 
     // ── freshAgent.interrupt (WS) ────────────────────────────────────────────
@@ -1282,6 +1360,7 @@ impl FreshClaudeState {
     /// (the `"freshclaude"` vs `"kilroy"` flavour; provider is always [`PROVIDER`]).
     /// `broadcast_id` (Task 10b): the shared envelope-stamp handle read PER EVENT --
     /// starts as the map key; an attach-by-durable rebind flips it to the durable id.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_consumer(
         &self,
         mut reader: tokio::io::Lines<BufReader<ChildStdout>>,
@@ -1851,6 +1930,83 @@ pub(crate) mod tests {
             st.leases.claim(PROVIDER, durable, "replacement", 3),
             crate::session_lease::FreshSessionClaim::Acquired,
             "successful explicit restart teardown must reopen the durable lease"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn incomplete_restart_retirement_is_quarantined_and_retryable_instead_of_becoming_stale()
+    {
+        let st = state();
+        let durable = "retirement-incomplete";
+        insert_fake_claude_session(&st, durable).await;
+        st.cli_index
+            .lock()
+            .await
+            .insert(durable.to_string(), durable.to_string());
+        assert_eq!(
+            st.leases.claim(PROVIDER, durable, "original", 1),
+            crate::session_lease::FreshSessionClaim::Acquired
+        );
+        assert!(st.leases.complete(PROVIDER, durable, "original", durable));
+
+        // A blocking consumer cannot be cancelled after it starts. This forces the
+        // first quiescence join through its bounded timeout after the process tree
+        // itself has already been killed: exactly the destructive partial-retirement
+        // shape that used to remove `sessions` while leaving cli_index + lease bound.
+        let blocker_started = Arc::new(tokio::sync::Notify::new());
+        let blocker_release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        {
+            let mut sessions = st.sessions.lock().await;
+            let session = sessions.get_mut(durable).expect("inserted fixture");
+            let started = blocker_started.clone();
+            let release = blocker_release.clone();
+            session.consumer = tokio::task::spawn_blocking(move || {
+                started.notify_one();
+                let (released, wake) = &*release;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = wake.wait(released).unwrap();
+                }
+            });
+        }
+        blocker_started.notified().await;
+
+        assert!(
+            !st.shutdown_for_restart(durable, "fresh-runtime-test-retirement-incomplete")
+                .await,
+            "the first attempt must report incomplete retirement"
+        );
+        assert!(
+            !st.has_live_session(durable).await,
+            "a dead predecessor must never remain advertised as live"
+        );
+        assert!(matches!(
+            st.leases
+                .claim(PROVIDER, durable, "replacement-too-early", 2),
+            crate::session_lease::FreshSessionClaim::BoundLive { .. }
+        ));
+
+        // Once the outstanding consumer actually finishes, retrying the SAME
+        // runtime retirement must finish the quarantined cleanup rather than
+        // misclassifying it as a stale generation.
+        {
+            let (released, wake) = &*blocker_release;
+            *released.lock().unwrap() = true;
+            wake.notify_one();
+        }
+        assert!(
+            st.shutdown_for_restart(durable, "fresh-runtime-test-retirement-incomplete")
+                .await,
+            "retry must complete the quarantined predecessor retirement"
+        );
+        assert!(
+            !st.cli_index.lock().await.contains_key(durable),
+            "completed retirement must evict the dead durable route"
+        );
+        assert_eq!(
+            st.leases.claim(PROVIDER, durable, "replacement", 3),
+            crate::session_lease::FreshSessionClaim::Acquired,
+            "the lease reopens only after retry confirms full quiescence"
         );
     }
 

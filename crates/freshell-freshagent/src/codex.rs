@@ -96,6 +96,8 @@ const DEAD_THREAD_CACHE_TTL: Duration = Duration::from_secs(30);
 /// bookkeeping" without anything actually enforcing a bound). Enforced on insert in
 /// [`FreshCodexState::mark_thread_dead`].
 const DEAD_THREADS_CAP: usize = 256;
+const RESTART_CONSUMER_JOIN_BUDGET: Duration = Duration::from_secs(1);
+const RESTART_WATCHER_JOIN_BUDGET: Duration = Duration::from_secs(3);
 
 /// Shared, cheaply-cloneable freshcodex WS state (mergeable into the server app + WsState).
 #[derive(Clone)]
@@ -163,6 +165,11 @@ pub struct FreshCodexState {
     /// `(provider, session_id)`. Wired by `main.rs`; defaults to always-false.
     terminal_liveness: crate::TerminalLivenessProbe,
     runtime_identity: FreshRuntimeIdentity,
+    /// Exact runtimes removed from the live map whose restart teardown has
+    /// not yet crossed every quiescence barrier. Durable leases remain bound
+    /// and same-request retries continue these handles instead of seeing a
+    /// stale runtime.
+    restart_retirements: Arc<TokioMutex<HashMap<String, CodexRestartRetirement>>>,
 }
 
 /// The cached result of a completed codex `freshAgent.create`, keyed by `requestId` in
@@ -199,19 +206,36 @@ struct CodexSession {
     consumer: tokio::task::JoinHandle<()>,
     /// Signals the exit-watcher to gracefully tear the sidecar down (a REQUESTED
     /// `freshAgent.kill`); single-shot, so `None` once sent.
-    kill_tx: Option<oneshot::Sender<()>>,
+    kill_tx: Option<oneshot::Sender<CodexKillRequest>>,
     /// Owns the sidecar child. An UNREQUESTED exit self-heals (adapter.ts:935-946): the
     /// watcher broadcasts the terminal `exited` status with NO chime, flips [`Self::exited`],
     /// and does NOT remove the session (stays mapped, matching the reference's "lazy restart
     /// on next send" invariant \u2014 PR-4 implements the actual restart, see
     /// [`FreshCodexState::ensure_session_alive`]).
-    watcher: tokio::task::JoinHandle<()>,
+    watcher: tokio::task::JoinHandle<bool>,
     /// PR-4: flipped `true` by the exit-watcher's self-heal (UNREQUESTED-exit) branch;
     /// consulted by [`FreshCodexState::ensure_session_alive`] on the next `freshAgent.send`/
     /// `freshAgent.attach` to decide whether a transparent respawn is needed (the
     /// `ensureRuntime` lazy-restart invariant, adapter.ts:935-946). Cleared back to `false`
     /// once a respawn succeeds.
     exited: Arc<AtomicBool>,
+}
+
+struct CodexKillRequest {
+    captured: oneshot::Sender<()>,
+}
+
+struct CodexRestartRetirement {
+    session_id: String,
+    runtime_id: String,
+    client: Arc<CodexAppServerClient>,
+    consumer: Option<tokio::task::JoinHandle<()>>,
+    watcher: Option<tokio::task::JoinHandle<bool>>,
+    capture_rx: Option<oneshot::Receiver<()>>,
+    capture_confirmed: bool,
+    consumer_quiesced: bool,
+    transport_closed: bool,
+    tree_quiesced: bool,
 }
 
 /// The result of [`FreshCodexState::ensure_session_alive`].
@@ -301,6 +325,7 @@ impl FreshCodexState {
             leases: Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
             terminal_liveness: Arc::new(|_, _| false),
             runtime_identity: FreshRuntimeIdentity::default(),
+            restart_retirements: Arc::new(TokioMutex::new(HashMap::new())),
         }
     }
 
@@ -446,14 +471,7 @@ impl FreshCodexState {
             guard.drain().map(|(_, s)| s).collect()
         };
         for session in drained {
-            session.consumer.abort();
-            session.client.close().await;
-            if let Some(kill_tx) = session.kill_tx {
-                let _ = kill_tx.send(());
-            }
-            // The exit-watcher performs start_kill + reap_owned_codex_sidecars on this
-            // requested-kill path; wait for it so shutdown() only returns once torn down.
-            let _ = session.watcher.await;
+            let _ = stop_codex_session(session).await;
         }
     }
 
@@ -919,15 +937,13 @@ impl FreshCodexState {
         // down our own tree and answer failed.
         if let Some(mut g) = lease_guard.take() {
             if !g.complete(&thread_id) {
+                let mut stopped = true;
                 if let Some(session) = self.sessions.lock().await.remove(&thread_id) {
-                    session.consumer.abort();
-                    session.client.close().await;
-                    if let Some(kill_tx) = session.kill_tx {
-                        let _ = kill_tx.send(());
-                    }
-                    let _ = session.watcher.await;
+                    stopped = stop_codex_session(session).await;
                 }
-                g.fail(); // own tree torn down -- reopen the key
+                if stopped {
+                    g.fail(); // confirmed own tree down -- reopen the key
+                }
                 self.fail_create(
                     &request_id,
                     "FRESH_AGENT_CREATE_FAILED",
@@ -1260,19 +1276,15 @@ impl FreshCodexState {
         let session_id = msg.session_id.clone();
 
         let removed = self.sessions.lock().await.remove(&session_id);
-        if let Some(session) = removed {
-            session.consumer.abort();
-            session.client.close().await;
-            if let Some(kill_tx) = session.kill_tx {
-                let _ = kill_tx.send(());
-            }
-            // The exit-watcher performs start_kill + reap on this requested-kill path; wait
-            // for it so the sidecar is actually gone before we broadcast success.
-            let _ = session.watcher.await;
-        }
+        let quiesced = match removed {
+            Some(session) => stop_codex_session(session).await,
+            None => true,
+        };
         // Task 12: an explicitly-killed session must reopen its durable id (the watcher
         // also clears it; idempotent -- this covers watcher-less test sessions too).
-        self.leases.clear_binding(PROVIDER, &session_id);
+        if quiesced {
+            self.leases.clear_binding(PROVIDER, &session_id);
+        }
 
         // Explicit kill evicts this session's requestId dedup cache entries (mirrors
         // `clearFreshAgentCreateCachesForSession`, `ws-handler.ts:1044-1050`, called from
@@ -1296,6 +1308,38 @@ impl FreshCodexState {
     /// coordinator. The descriptor check and map removal share one lock scope,
     /// so a stale restart can never remove a newer route for the same thread.
     pub async fn shutdown_for_restart(&self, session_id: &str, expected_runtime_id: &str) -> bool {
+        self.shutdown_for_restart_detailed(session_id, expected_runtime_id)
+            .await
+            == crate::RestartShutdownOutcome::Stopped
+    }
+
+    pub async fn shutdown_for_restart_detailed(
+        &self,
+        session_id: &str,
+        expected_runtime_id: &str,
+    ) -> crate::RestartShutdownOutcome {
+        let quarantined = {
+            let retirements = self.restart_retirements.lock().await;
+            match retirements.get(expected_runtime_id) {
+                Some(retirement) if retirement.session_id == session_id => true,
+                Some(_) => return crate::RestartShutdownOutcome::Stale,
+                None => {
+                    if retirements
+                        .values()
+                        .any(|retirement| retirement.session_id == session_id)
+                    {
+                        return crate::RestartShutdownOutcome::Stale;
+                    }
+                    false
+                }
+            }
+        };
+        if quarantined {
+            return self
+                .continue_codex_restart_retirement(expected_runtime_id)
+                .await;
+        }
+
         let removed = {
             let mut sessions = self.sessions.lock().await;
             match sessions.get(session_id) {
@@ -1306,19 +1350,131 @@ impl FreshCodexState {
             }
         };
         let Some(session) = removed else {
-            return false;
+            return crate::RestartShutdownOutcome::Stale;
         };
-        session.consumer.abort();
-        session.client.close().await;
-        if let Some(kill_tx) = session.kill_tx {
-            let _ = kill_tx.send(());
+        let CodexSession {
+            runtime,
+            client,
+            consumer,
+            kill_tx,
+            watcher,
+            ..
+        } = session;
+        let (captured_tx, captured_rx) = oneshot::channel();
+        let capture_rx = kill_tx.and_then(|kill_tx| {
+            kill_tx
+                .send(CodexKillRequest {
+                    captured: captured_tx,
+                })
+                .is_ok()
+                .then_some(captured_rx)
+        });
+        self.restart_retirements.lock().await.insert(
+            expected_runtime_id.to_string(),
+            CodexRestartRetirement {
+                session_id: session_id.to_string(),
+                runtime_id: runtime.runtime_id,
+                client,
+                consumer: Some(consumer),
+                watcher: Some(watcher),
+                capture_rx,
+                capture_confirmed: false,
+                consumer_quiesced: false,
+                transport_closed: false,
+                tree_quiesced: false,
+            },
+        );
+        self.continue_codex_restart_retirement(expected_runtime_id)
+            .await
+    }
+
+    async fn continue_codex_restart_retirement(
+        &self,
+        expected_runtime_id: &str,
+    ) -> crate::RestartShutdownOutcome {
+        let Some(mut retirement) = self
+            .restart_retirements
+            .lock()
+            .await
+            .remove(expected_runtime_id)
+        else {
+            return crate::RestartShutdownOutcome::Stale;
+        };
+
+        if !retirement.capture_confirmed {
+            if let Some(mut captured) = retirement.capture_rx.take() {
+                if tokio::time::timeout(Duration::from_secs(1), &mut captured)
+                    .await
+                    .is_ok()
+                {
+                    retirement.capture_confirmed = true;
+                } else {
+                    retirement.capture_rx = Some(captured);
+                }
+            }
         }
-        let _ = session.watcher.await;
-        self.leases.clear_binding(PROVIDER, session_id);
+
+        // Only after the watcher has captured the pid/start-time tree may
+        // transport closure or consumer cancellation make the direct sidecar
+        // exit. Retain unfinished handles in quarantine for a same-request
+        // coordinator retry.
+        if retirement.capture_confirmed {
+            if !retirement.consumer_quiesced {
+                if let Some(mut consumer) = retirement.consumer.take() {
+                    consumer.abort();
+                    if tokio::time::timeout(RESTART_CONSUMER_JOIN_BUDGET, &mut consumer)
+                        .await
+                        .is_ok()
+                    {
+                        retirement.consumer_quiesced = true;
+                    } else {
+                        retirement.consumer = Some(consumer);
+                    }
+                } else {
+                    retirement.consumer_quiesced = true;
+                }
+            }
+            if !retirement.transport_closed {
+                retirement.client.close().await;
+                retirement.transport_closed = true;
+            }
+            if !retirement.tree_quiesced {
+                if let Some(mut watcher) = retirement.watcher.take() {
+                    match tokio::time::timeout(RESTART_WATCHER_JOIN_BUDGET, &mut watcher).await {
+                        Ok(Ok(true)) => retirement.tree_quiesced = true,
+                        Ok(_) => {}
+                        Err(_) => retirement.watcher = Some(watcher),
+                    }
+                }
+            }
+        }
+
+        if !(retirement.capture_confirmed
+            && retirement.consumer_quiesced
+            && retirement.transport_closed
+            && retirement.tree_quiesced)
+        {
+            tracing::error!(
+                provider = PROVIDER,
+                session_id = %retirement.session_id,
+                runtime_id = %retirement.runtime_id,
+                capture_confirmed = retirement.capture_confirmed,
+                consumer_quiesced = retirement.consumer_quiesced,
+                transport_closed = retirement.transport_closed,
+                tree_quiesced = retirement.tree_quiesced,
+                "freshagent.codex.restart_shutdown_not_quiescent"
+            );
+            self.restart_retirements
+                .lock()
+                .await
+                .insert(expected_runtime_id.to_string(), retirement);
+            return crate::RestartShutdownOutcome::RetirementIncomplete;
+        }
+        self.leases.clear_binding(PROVIDER, &retirement.session_id);
         self.create_dedup
-            .clear_for_session(|record| record.session_id == session_id)
+            .clear_for_session(|record| record.session_id == retirement.session_id)
             .await;
-        true
+        crate::RestartShutdownOutcome::Stopped
     }
 
     // ── freshAgent.attach (reload-rehydrate, PR-4) ──────────────────────────
@@ -2588,15 +2744,13 @@ impl FreshCodexState {
             if !g.complete(thread_id) {
                 // Revoked mid-resume (expired holder): tear our own session down and
                 // reopen the key -- never keep a session a contender may replace.
+                let mut stopped = true;
                 if let Some(session) = self.sessions.lock().await.remove(thread_id) {
-                    session.consumer.abort();
-                    session.client.close().await;
-                    if let Some(kill_tx) = session.kill_tx {
-                        let _ = kill_tx.send(());
-                    }
-                    let _ = session.watcher.await;
+                    stopped = stop_codex_session(session).await;
                 }
-                g.fail();
+                if stopped {
+                    g.fail();
+                }
                 return Err(ResumeSessionError::Transient(
                     "session lease revoked during attach-resume; torn down".to_string(),
                 ));
@@ -3360,18 +3514,47 @@ fn build_codex_turn_json(raw_turn: &Value, ordinal: usize) -> Result<Vec<Value>,
 ///   `exited` status with NO chime (a crash is not a positive completion). The session is
 ///   intentionally left mapped by the caller (this fn does not touch `sessions`) — matching
 ///   the reference's "leave the runtime mapped for lazy restart" invariant.
-/// - A `freshAgent.kill` REQUESTS teardown via `kill_rx`: gracefully `start_kill` + reap, with
-///   NO self-heal event (the caller broadcasts its own `freshAgent.killed`).
+/// - A `freshAgent.kill` REQUESTS teardown via `kill_rx`: capture the tagged
+///   pid/start-time tree before transport close, terminate + confirm it, and
+///   reap the direct child, with NO self-heal event (the caller broadcasts its
+///   own `freshAgent.killed`).
+async fn stop_codex_session(mut session: CodexSession) -> bool {
+    let (captured_tx, captured_rx) = oneshot::channel();
+    let capture_requested = session.kill_tx.take().is_some_and(|kill_tx| {
+        kill_tx
+            .send(CodexKillRequest {
+                captured: captured_tx,
+            })
+            .is_ok()
+    });
+    let capture_confirmed = capture_requested
+        && tokio::time::timeout(Duration::from_secs(1), captured_rx)
+            .await
+            .is_ok();
+    session.consumer.abort();
+    let consumer_quiesced =
+        tokio::time::timeout(RESTART_CONSUMER_JOIN_BUDGET, &mut session.consumer)
+            .await
+            .is_ok();
+    session.client.close().await;
+    let tree_quiesced = matches!(
+        tokio::time::timeout(RESTART_WATCHER_JOIN_BUDGET, session.watcher).await,
+        Ok(Ok(true))
+    );
+    capture_confirmed && consumer_quiesced && tree_quiesced
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_exit_watcher(
     mut child: tokio::process::Child,
     ownership_id: String,
     thread_id: String,
     broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
-    kill_rx: oneshot::Receiver<()>,
+    kill_rx: oneshot::Receiver<CodexKillRequest>,
     exited: Arc<AtomicBool>,
     leases: Arc<crate::session_lease::FreshAgentSessionLeases>,
     runtime: freshell_protocol::RuntimeDescriptor,
-) -> tokio::task::JoinHandle<()> {
+) -> tokio::task::JoinHandle<bool> {
     tokio::spawn(async move {
         // `biased` + the REQUESTED-kill arm listed FIRST: a `freshAgent.kill` signals
         // `kill_tx` right before `start_kill()`s the child, so `child.wait()` can become
@@ -3382,13 +3565,37 @@ fn spawn_exit_watcher(
         // Checking `kill_rx` first every time both are ready eliminates that race.
         tokio::select! {
             biased;
-            _ = kill_rx => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                reap_owned_codex_sidecars(&ownership_id);
-                // Task 12: the bound session is gone -- reopen its durable id.
-                leases.clear_binding(PROVIDER, &thread_id);
-                tracing::info!(session_id = %thread_id, "freshagent.sidecar.reaped");
+            request = kill_rx => {
+                // Capture the ownership-tagged tree while the direct child and
+                // transport are still intact. The caller waits for this ack
+                // before closing the app-server client, preventing a YAMA
+                // reparent window.
+                let mut barrier = freshell_codex::transport::OwnedProcessTreeBarrier::capture(
+                    child.id().unwrap_or(0),
+                    CODEX_SIDECAR_OWNERSHIP_ENV,
+                    &ownership_id,
+                );
+                if let Ok(request) = request {
+                    let _ = request.captured.send(());
+                }
+                let tree_dead = barrier.terminate_and_confirm().await;
+                let child_reaped = matches!(
+                    tokio::time::timeout(Duration::from_secs(1), child.wait()).await,
+                    Ok(Ok(_))
+                );
+                if tree_dead && child_reaped {
+                    tracing::info!(session_id = %thread_id, "freshagent.sidecar.reaped");
+                    true
+                } else {
+                    tracing::error!(
+                        session_id = %thread_id,
+                        ownership_id,
+                        tree_dead,
+                        child_reaped,
+                        "freshagent.codex.restart_shutdown_not_quiescent"
+                    );
+                    false
+                }
             }
             _ = child.wait() => {
                 reap_owned_codex_sidecars(&ownership_id);
@@ -3414,6 +3621,7 @@ fn spawn_exit_watcher(
                 {
                     let _ = broadcast_tx.send(frame);
                 }
+                true
             }
         }
     })
@@ -4439,7 +4647,6 @@ pub(crate) mod tests {
             "codex-sidecar-test-no-turn",
         )
         .await;
-
         st.handle_interrupt(FreshAgentInterrupt {
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: "thread-1".to_string(),
@@ -4522,7 +4729,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn restart_shutdown_removes_only_the_exact_codex_runtime() {
-        let (transport, _peer) = freshell_codex::new_channel_transport();
+        let (transport, peer) = freshell_codex::new_channel_transport();
         let (client, _notifs) = CodexAppServerClient::connect(transport);
         let st = state();
         insert_fake_session(
@@ -4534,6 +4741,7 @@ pub(crate) mod tests {
             "codex-sidecar-test-restart",
         )
         .await;
+        drop(peer);
 
         assert!(
             !st.shutdown_for_restart("thread-restart", "fresh-runtime-stale")
@@ -4545,6 +4753,191 @@ pub(crate) mod tests {
                 .await
         );
         assert!(!st.has_live_session("thread-restart").await);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restart_shutdown_captures_and_kills_reparent_prone_codex_descendants_before_releasing_the_lease(
+    ) {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let st = state();
+        let temp = tempfile::tempdir().unwrap();
+        let descendant_pid_file = temp.path().join("descendant.pid");
+        let ownership_id = format!("codex-restart-tree-{}", uuid::Uuid::new_v4());
+        // The direct child exits as soon as it is killed. Its descendant ignores
+        // SIGTERM and inherits the ownership tag. Once reparented, Linux/YAMA may
+        // deny a fresh /proc/<pid>/environ scan, so restart must capture the
+        // pid/start-time pair before touching the direct child and retain it until
+        // confirmed dead.
+        let script = r#"
+(
+  trap '' TERM
+  echo "$BASHPID" > "$FRESHELL_TEST_DESCENDANT_PID"
+  while true; do read -r -t 1 _ || true; done
+) &
+while true; do read -r -t 1 _ || true; done
+"#;
+        let mut command = tokio::process::Command::new("bash");
+        command
+            .arg("-c")
+            .arg(script)
+            .env(CODEX_SIDECAR_OWNERSHIP_ENV, &ownership_id)
+            .env("FRESHELL_TEST_DESCENDANT_PID", &descendant_pid_file)
+            .kill_on_drop(true);
+        let child = command.spawn().expect("spawn reparent-prone codex fixture");
+        insert_fake_session(
+            &st,
+            "thread-tree-restart",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            child,
+            &ownership_id,
+        )
+        .await;
+        drop(peer);
+        assert_eq!(
+            st.leases
+                .claim(PROVIDER, "thread-tree-restart", "original", 1),
+            crate::session_lease::FreshSessionClaim::Acquired
+        );
+        assert!(st.leases.complete(
+            PROVIDER,
+            "thread-tree-restart",
+            "original",
+            "thread-tree-restart"
+        ));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !descendant_pid_file.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "codex descendant fixture did not start"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let descendant_pid: i32 = std::fs::read_to_string(&descendant_pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        let stopped = st
+            .shutdown_for_restart(
+                "thread-tree-restart",
+                "fresh-runtime-test-thread-tree-restart",
+            )
+            .await;
+        let descendant_alive = unsafe { libc::kill(descendant_pid, 0) == 0 };
+        if descendant_alive {
+            // Keep the red regression run from leaking its intentionally stubborn
+            // fixture when exercising the old best-effort teardown.
+            unsafe {
+                libc::kill(descendant_pid, libc::SIGKILL);
+            }
+        }
+
+        assert!(
+            stopped,
+            "restart must not report success before the captured tree is dead"
+        );
+        assert!(
+            !descendant_alive,
+            "restart success left a reparented SIGTERM-ignoring codex descendant alive"
+        );
+        assert_eq!(
+            st.leases
+                .claim(PROVIDER, "thread-tree-restart", "replacement", 2),
+            crate::session_lease::FreshSessionClaim::Acquired,
+            "the durable lease may reopen only after descendant death is confirmed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn incomplete_codex_restart_retirement_is_quarantined_for_same_runtime_retry() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let st = state();
+        insert_fake_session(
+            &st,
+            "thread-retirement-incomplete",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-retirement-incomplete",
+        )
+        .await;
+        drop(peer);
+        assert_eq!(
+            st.leases
+                .claim(PROVIDER, "thread-retirement-incomplete", "original", 1),
+            crate::session_lease::FreshSessionClaim::Acquired
+        );
+        assert!(st.leases.complete(
+            PROVIDER,
+            "thread-retirement-incomplete",
+            "original",
+            "thread-retirement-incomplete"
+        ));
+
+        let blocker_started = Arc::new(tokio::sync::Notify::new());
+        let blocker_release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        {
+            let mut sessions = st.sessions.lock().await;
+            let session = sessions
+                .get_mut("thread-retirement-incomplete")
+                .expect("inserted session");
+            let started = blocker_started.clone();
+            let release = blocker_release.clone();
+            session.consumer = tokio::task::spawn_blocking(move || {
+                started.notify_one();
+                let (released, wake) = &*release;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = wake.wait(released).unwrap();
+                }
+            });
+        }
+        blocker_started.notified().await;
+
+        assert_eq!(
+            st.shutdown_for_restart_detailed(
+                "thread-retirement-incomplete",
+                "fresh-runtime-test-thread-retirement-incomplete",
+            )
+            .await,
+            crate::RestartShutdownOutcome::RetirementIncomplete
+        );
+        assert!(!st.has_live_session("thread-retirement-incomplete").await);
+        assert!(matches!(
+            st.leases.claim(
+                PROVIDER,
+                "thread-retirement-incomplete",
+                "replacement-too-early",
+                2
+            ),
+            crate::session_lease::FreshSessionClaim::BoundLive { .. }
+        ));
+
+        {
+            let (released, wake) = &*blocker_release;
+            *released.lock().unwrap() = true;
+            wake.notify_one();
+        }
+        assert_eq!(
+            st.shutdown_for_restart_detailed(
+                "thread-retirement-incomplete",
+                "fresh-runtime-test-thread-retirement-incomplete",
+            )
+            .await,
+            crate::RestartShutdownOutcome::Stopped,
+            "same-runtime retry must finish the quarantined retirement"
+        );
+        assert_eq!(
+            st.leases
+                .claim(PROVIDER, "thread-retirement-incomplete", "replacement", 3),
+            crate::session_lease::FreshSessionClaim::Acquired
+        );
     }
 
     #[tokio::test]

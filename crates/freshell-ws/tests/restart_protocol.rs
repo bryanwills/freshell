@@ -954,6 +954,78 @@ impl RestartRuntime for NonRetryableReplacementFails {
     }
 }
 
+struct RetirementRetries {
+    shutdowns: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl RestartRuntime for RetirementRetries {
+    type ResumePlan = ();
+
+    async fn preflight(&self, _request: &AgentRestart) -> Result<(), RestartFailure> {
+        Ok(())
+    }
+
+    async fn shutdown_for_restart(
+        &self,
+        _request: &AgentRestart,
+        _plan: &(),
+    ) -> Result<(), RestartFailure> {
+        if self.shutdowns.fetch_add(1, Ordering::SeqCst) == 0 {
+            Err(RestartFailure::new(
+                AgentRestartFailureCode::ShutdownFailed,
+                "retirement barrier is not yet quiescent",
+                true,
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn create_replacement(
+        &self,
+        _request: &AgentRestart,
+        _plan: (),
+    ) -> Result<String, RestartFailure> {
+        Ok("term-after-retirement".to_string())
+    }
+}
+
+#[tokio::test]
+async fn retryable_retirement_finishes_before_replacement() {
+    let coordinator = RestartCoordinator::new();
+    coordinator.register_initial(locator(), "term-1");
+    let request = restart("retirement-r1", "term-1", 1);
+    let runtime = RetirementRetries {
+        shutdowns: AtomicUsize::new(0),
+    };
+
+    let first = coordinator.execute(request.clone(), &runtime).await;
+    assert!(matches!(
+        first.messages.last(),
+        Some(ServerMessage::AgentRestartFailed(message))
+            if message.code == AgentRestartFailureCode::ShutdownFailed
+                && message.retryable
+                && message.recovery_pending
+    ));
+    assert_eq!(
+        coordinator
+            .pending_recoveries()
+            .first()
+            .map(|pending| pending.retirement_pending),
+        Some(true)
+    );
+
+    let recovered = coordinator.execute(request, &runtime).await;
+    assert!(matches!(
+        recovered.messages.last(),
+        Some(ServerMessage::AgentRestartReplaced(message))
+            if message.runtime.runtime_id == "term-after-retirement"
+    ));
+    assert_eq!(runtime.shutdowns.load(Ordering::SeqCst), 2);
+    assert!(coordinator.pending_recoveries().is_empty());
+}
+
 #[tokio::test]
 async fn non_retryable_replacement_failure_logs_its_terminal_restart_outcome() {
     let coordinator = RestartCoordinator::new();
@@ -1091,6 +1163,69 @@ async fn identical_retry_resumes_a_persisted_post_shutdown_replacement() {
     let replay = reopened.execute(request, &runtime).await;
     assert!(replay.replayed);
     assert_eq!(runtime.attempts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn distinct_request_can_drive_and_replay_persisted_recovery() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("restart-state.json");
+    let owner = restart("pending-owner", "term-1", 1);
+    let follower = restart("pending-follower", "term-1", 1);
+    let coordinator = RestartCoordinator::new_persistent(path.clone()).unwrap();
+    coordinator.register_initial(locator(), "term-1");
+
+    let owner_failure = coordinator.execute(owner.clone(), &ReplacementFails).await;
+    assert!(matches!(
+        owner_failure.messages.last(),
+        Some(ServerMessage::AgentRestartFailed(message))
+            if message.retryable && message.recovery_pending
+    ));
+
+    // A second client must correlate to the already-retired predecessor rather
+    // than receiving RUNTIME_NOT_FOUND. Its own failed recovery attempt and
+    // request id must survive a server reopen.
+    let follower_failure = coordinator
+        .execute(follower.clone(), &ReplacementFails)
+        .await;
+    assert!(matches!(
+        follower_failure.messages.last(),
+        Some(ServerMessage::AgentRestartFailed(message))
+            if message.request_id == "pending-follower"
+                && message.retryable
+                && message.recovery_pending
+    ));
+    drop(coordinator);
+
+    let reopened = RestartCoordinator::new_persistent(path).unwrap();
+    let runtime = RecoveringReplacement {
+        attempts: AtomicUsize::new(0),
+    };
+    let owner_recovered = reopened.execute(owner.clone(), &runtime).await;
+    let owner_replacement = match owner_recovered.messages.last() {
+        Some(ServerMessage::AgentRestartReplaced(message)) => message.clone(),
+        other => panic!("owner recovery did not replace runtime: {other:?}"),
+    };
+
+    let follower_replay = reopened.execute(follower, &runtime).await;
+    assert!(follower_replay.replayed);
+    assert!(matches!(
+        follower_replay.messages.as_slice(),
+        [ServerMessage::AgentRestartReplaced(message)]
+            if message.request_id == "pending-follower"
+                && message.runtime == owner_replacement.runtime
+                && message.old_runtime.old_runtime_id
+                    == owner_replacement.old_runtime.old_runtime_id
+    ));
+    assert_eq!(
+        runtime.attempts.load(Ordering::SeqCst),
+        1,
+        "correlated follower replay must not launch another replacement"
+    );
+
+    let owner_replay = reopened.execute(owner, &runtime).await;
+    assert!(owner_replay.replayed);
+    assert_eq!(runtime.attempts.load(Ordering::SeqCst), 1);
+    assert!(reopened.pending_recoveries().is_empty());
 }
 
 #[tokio::test]
@@ -1557,6 +1692,45 @@ struct GatedSharedRuntime {
     shutdowns: AtomicUsize,
 }
 
+struct RetryThenRecoverSharedRuntime {
+    shutdowns: AtomicUsize,
+    replacements: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl RestartRuntime for RetryThenRecoverSharedRuntime {
+    type ResumePlan = ();
+
+    async fn preflight(&self, _request: &AgentRestart) -> Result<(), RestartFailure> {
+        Ok(())
+    }
+
+    async fn shutdown_for_restart(
+        &self,
+        _request: &AgentRestart,
+        _plan: &(),
+    ) -> Result<(), RestartFailure> {
+        self.shutdowns.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn create_replacement(
+        &self,
+        _request: &AgentRestart,
+        _plan: (),
+    ) -> Result<String, RestartFailure> {
+        if self.replacements.fetch_add(1, Ordering::SeqCst) == 0 {
+            Err(RestartFailure::new(
+                AgentRestartFailureCode::ReplacementFailed,
+                "first replacement attempt failed",
+                true,
+            ))
+        } else {
+            Ok("term-shared-recovered".to_string())
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl RestartRuntime for GatedSharedRuntime {
     type ResumePlan = ();
@@ -1601,6 +1775,24 @@ async fn next_restart_replaced_for(ws: &mut common::TestWs, request_id: &str) ->
         }
     }
     panic!("no correlated replacement for {request_id}");
+}
+
+async fn next_restart_failed_for(ws: &mut common::TestWs, request_id: &str) -> serde_json::Value {
+    for _ in 0..40u8 {
+        let message = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for failure {request_id}"))
+            .expect("restart websocket remains connected")
+            .expect("restart websocket frame");
+        let WsMessage::Text(text) = message else {
+            continue;
+        };
+        let frame: serde_json::Value = serde_json::from_str(&text).expect("json frame");
+        if frame["type"] == "agent.restart.failed" && frame["requestId"] == request_id {
+            return frame;
+        }
+    }
+    panic!("no correlated failure for {request_id}");
 }
 
 #[tokio::test]
@@ -1712,6 +1904,59 @@ async fn two_clients_with_distinct_requests_share_one_restart_and_reconnect_repl
         1,
         "reconnect replay must not start a second transaction"
     );
+    registry.kill_all();
+}
+
+#[tokio::test]
+async fn distinct_client_recovers_retryable_owner_transaction_and_owner_reconnect_replays() {
+    let (url, registry, state) = common::spawn_server_with_specs_and_state(vec![]).await;
+    let runtime = Arc::new(RetryThenRecoverSharedRuntime {
+        shutdowns: AtomicUsize::new(0),
+        replacements: AtomicUsize::new(0),
+    });
+    let _runtime_registration = state.restart.set_runtime(runtime.clone());
+    state.restart.register_initial(locator(), "term-retry-old");
+    let capabilities = Some(serde_json::json!({ "agentRestartV1": true }));
+    let (mut owner_ws, _) =
+        common::connect_and_capture_inventory_with_capabilities(&url, capabilities.clone()).await;
+    let owner_request = restart("retry-owner", "term-retry-old", 1);
+    owner_ws
+        .send(WsMessage::Text(
+            serde_json::to_string(&ClientMessage::AgentRestart(owner_request.clone())).unwrap(),
+        ))
+        .await
+        .unwrap();
+
+    let failure = next_restart_failed_for(&mut owner_ws, "retry-owner").await;
+    assert_eq!(failure["retryable"], true);
+    assert_eq!(failure["recoveryPending"], true);
+    drop(owner_ws);
+
+    let (mut follower_ws, _) =
+        common::connect_and_capture_inventory_with_capabilities(&url, capabilities.clone()).await;
+    let follower_request = restart("retry-follower", "term-retry-old", 1);
+    follower_ws
+        .send(WsMessage::Text(
+            serde_json::to_string(&ClientMessage::AgentRestart(follower_request)).unwrap(),
+        ))
+        .await
+        .unwrap();
+    let follower = next_restart_replaced_for(&mut follower_ws, "retry-follower").await;
+    assert_eq!(follower["runtimeId"], "term-shared-recovered");
+
+    let (mut reconnected_owner, _) =
+        common::connect_and_capture_inventory_with_capabilities(&url, capabilities).await;
+    reconnected_owner
+        .send(WsMessage::Text(
+            serde_json::to_string(&ClientMessage::AgentRestart(owner_request)).unwrap(),
+        ))
+        .await
+        .unwrap();
+    let owner_replay = next_restart_replaced_for(&mut reconnected_owner, "retry-owner").await;
+    assert_eq!(owner_replay["runtimeId"], follower["runtimeId"]);
+    assert_eq!(owner_replay["generation"], follower["generation"]);
+    assert_eq!(runtime.shutdowns.load(Ordering::SeqCst), 1);
+    assert_eq!(runtime.replacements.load(Ordering::SeqCst), 2);
     registry.kill_all();
 }
 

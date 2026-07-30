@@ -727,6 +727,7 @@ async fn handle_client_text(
                         code: AgentRestartFailureCode::CapabilityNotNegotiated,
                         message: "agent restart was not negotiated for this connection".into(),
                         retryable: false,
+                        recovery_pending: false,
                     }),
                 )
                 .await;
@@ -4000,8 +4001,29 @@ fn kill_and_broadcast(state: &WsState, terminal_id: &str) -> bool {
     false
 }
 
-pub(crate) fn shutdown_terminal_for_restart(state: &WsState, terminal_id: &str) -> bool {
-    kill_and_broadcast(state, terminal_id)
+pub(crate) async fn shutdown_terminal_for_restart(
+    state: &WsState,
+    terminal_id: &str,
+) -> Result<bool, String> {
+    // Detach and await any managed Codex sidecar before killing the PTY. The
+    // normal exit hook queues teardown in the background; restart needs the
+    // stronger barrier so replacement launch cannot overlap the old proxy or
+    // app-server process tree.
+    let managed_codex = state
+        .registry
+        .probe(terminal_id)
+        .and_then(|row| row.restart_launch)
+        .and_then(|launch| launch.codex_managed)
+        == Some(true);
+    let managed_retired = freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+        .shutdown_terminal_for_restart(terminal_id)
+        .await?;
+    if managed_codex && !managed_retired {
+        return Err(format!(
+            "managed Codex launch ownership was unavailable for terminal {terminal_id}"
+        ));
+    }
+    Ok(kill_and_broadcast(state, terminal_id))
 }
 
 pub(crate) async fn create_terminal_replacement(

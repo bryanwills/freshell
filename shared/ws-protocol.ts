@@ -796,6 +796,8 @@ export type AgentRestartFailedMessage = {
   code: AgentRestartFailureCode
   message: string
   retryable: boolean
+  /** Present on servers that make the durable post-retirement phase explicit. */
+  recoveryPending?: boolean
 }
 
 // -- Terminal lifecycle --

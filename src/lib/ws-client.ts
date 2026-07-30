@@ -342,7 +342,20 @@ export class WsClient {
     }
     if (msg.type === 'agent.restart.replaced' || msg.type === 'agent.restart.failed') {
       const inFlight = this.inFlightAgentRestarts.get(msg.requestId)
-      if (msg.type === 'agent.restart.failed' && msg.retryable && inFlight?.started) {
+      if (
+        msg.type === 'agent.restart.failed'
+        && msg.retryable
+        && (
+          msg.recoveryPending === true
+          || (msg.recoveryPending === undefined && inFlight?.started === true)
+        )
+        && inFlight
+      ) {
+        // The failure frame is the durable phase authority. A reconnect can
+        // receive this before the replayed started edge, so never infer
+        // recoverability from per-socket delivery history.
+        inFlight.started = true
+        inFlight.retryExhausted = false
         if (inFlight) {
           this.scheduleAgentRestartRetry(msg.requestId, inFlight)
         }
