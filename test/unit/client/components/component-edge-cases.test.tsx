@@ -96,6 +96,8 @@ vi.mock('lucide-react', () => ({
   Globe: ({ className }: { className?: string }) => <svg data-testid="globe-icon" className={className} />,
   FileText: ({ className }: { className?: string }) => <svg data-testid="file-text-icon" className={className} />,
   Search: ({ className }: { className?: string }) => <svg data-testid="search-icon" className={className} />,
+  RotateCcw: ({ className }: { className?: string }) => <svg data-testid="rotate-ccw-icon" className={className} />,
+  Loader2: ({ className }: { className?: string }) => <svg data-testid="loader-icon" className={className} />,
   Moon: ({ className }: { className?: string }) => <svg data-testid="moon-icon" className={className} />,
   Sun: ({ className }: { className?: string }) => <svg data-testid="sun-icon" className={className} />,
   Play: ({ className }: { className?: string }) => <svg data-testid="play-icon" className={className} />,
