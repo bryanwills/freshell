@@ -17,6 +17,8 @@ import type { PaneNode } from '@/store/paneTypes'
 
 const wsMocks = {
   send: vi.fn(),
+  requestAgentRestart: vi.fn(),
+  bindAgentRestartStore: vi.fn(),
   connect: vi.fn().mockResolvedValue(undefined),
   onMessage: vi.fn(() => vi.fn()),
   onReconnect: vi.fn(() => vi.fn()),
@@ -137,6 +139,26 @@ function createTerminalLeaf(id: string, terminalId: string): Extract<PaneNode, {
       status: 'running',
       mode: 'shell',
       shell: 'system',
+    },
+  }
+}
+
+function createResumableTerminalLeaf(): Extract<PaneNode, { type: 'leaf' }> {
+  return {
+    type: 'leaf',
+    id: 'pane-1',
+    content: {
+      kind: 'terminal',
+      terminalId: 'runtime-claude-1',
+      runtimeId: 'runtime-claude-1',
+      runtimeGeneration: 6,
+      createRequestId: 'req-runtime-claude-1',
+      status: 'running',
+      mode: 'claude',
+      sessionRef: {
+        provider: 'claude',
+        sessionId: 'durable-claude-1',
+      },
     },
   }
 }
@@ -272,6 +294,36 @@ describe('pane context menu stability (e2e)', () => {
 
     expect(screen.getByRole('menu')).toBeInTheDocument()
     expect(screen.getByRole('menuitem', { name: 'Refresh pane' })).toBeInTheDocument()
+  })
+
+  it('restarts a resumable built-in agent from its pane header menu', async () => {
+    const store = createStore(createResumableTerminalLeaf())
+    const user = userEvent.setup()
+    const { container } = renderFlow(store)
+
+    const header = await waitFor(() => {
+      const node = container.querySelector('[data-pane-id="pane-1"] [role="banner"]')
+      expect(node).not.toBeNull()
+      return node as HTMLElement
+    })
+
+    await user.pointer({ target: header, keys: '[MouseRight]' })
+    await settleMenu()
+    await user.click(screen.getByRole('menuitem', { name: 'Restart pane' }))
+
+    expect(wsMocks.requestAgentRestart).toHaveBeenCalledWith({
+      type: 'agent.restart',
+      requestId: expect.any(String),
+      provider: 'claude',
+      sessionId: 'durable-claude-1',
+      kind: 'terminal',
+      liveId: 'runtime-claude-1',
+      expectedGeneration: 6,
+    })
+    expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'terminal.kill',
+      terminalId: 'runtime-claude-1',
+    }))
   })
 
   it('keeps the terminal menu open when right-clicking inside an inactive terminal body', async () => {

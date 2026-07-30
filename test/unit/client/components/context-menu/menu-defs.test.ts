@@ -53,6 +53,7 @@ function createMockActions(): MenuActions {
     copyFreshAgentFilePath: vi.fn(),
     refreshTab: vi.fn(),
     refreshPane: vi.fn(),
+    restartPane: vi.fn(),
     replacePane: vi.fn(),
     reopenClosedTab: vi.fn(),
     generateSessionTitle: vi.fn(),
