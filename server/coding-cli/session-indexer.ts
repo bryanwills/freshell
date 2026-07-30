@@ -461,6 +461,7 @@ export class CodingCliSessionIndexer {
   private seenSessionIds = new Map<string, number>()
   private onNewSessionHandlers = new Set<(session: CodingCliSession) => void>()
   private initialized = false
+  private scanFailures = new Set<CodingCliProviderName>()
   private sessionKeyToFilePath = new Map<string, string>()
   private urgentRefreshNeeded = false
   private dirtyProviders = new Set<CodingCliProviderName>()
@@ -682,6 +683,32 @@ export class CodingCliSessionIndexer {
     })
 
     this.rootWatcher.on('error', (err) => logger.warn({ err }, 'Root watcher error'))
+  }
+
+  /** True once at least one refresh has completed (resolve endpoint: 'warming' until then). */
+  isReady(): boolean {
+    return this.initialized
+  }
+
+  /**
+   * Providers whose MOST RECENT listing attempt failed. The scan path swallows
+   * these failures into empty lists and still reports the index initialized,
+   * so without this the resolve endpoint would report 'ready' + zero matches
+   * (i.e. "not found") during a provider outage — spec violation.
+   */
+  getScanFailures(): CodingCliProviderName[] {
+    return [...this.scanFailures]
+  }
+
+  /**
+   * Public fire-and-forget refresh request (debounced scheduleRefresh). The
+   * resolve route calls this on a degraded response so the user's "Retry"
+   * converges after a failed provider recovers — otherwise a recorded scan
+   * failure could outlive the outage until the next watcher event/periodic
+   * full scan.
+   */
+  requestRefresh(): void {
+    this.scheduleRefresh()
   }
 
   onUpdate(handler: (projects: ProjectGroup[]) => void): () => void {
@@ -1047,7 +1074,11 @@ export class CodingCliSessionIndexer {
     let sessions: CodingCliSession[] = []
     try {
       sessions = await provider.listSessionsDirect()
+      this.scanFailures.delete(provider.name)
     } catch {
+      // Record per attempt (never bulk-cleared): the resolve endpoint must
+      // report this provider as unsearchable, not silently "no sessions".
+      this.scanFailures.add(provider.name)
       // A direct-listing failure is transient (e.g. the off-thread worker failed),
       // NOT "no sessions". Preserve this provider's existing direct-cache entries so
       // neither the local prune (below) nor the full-scan global prune deletes them.
@@ -1222,8 +1253,12 @@ export class CodingCliSessionIndexer {
         try {
           const files = await provider.listSessionFiles()
           filesByProvider.set(provider, files)
+          this.scanFailures.delete(provider.name)
         } catch (err) {
           logger.warn({ err, provider: provider.name }, 'Could not list session files')
+          // Record per attempt (never bulk-cleared): the resolve endpoint must
+          // report this provider as unsearchable, not silently "no sessions".
+          this.scanFailures.add(provider.name)
         }
       }),
     )
@@ -1429,8 +1464,14 @@ export class CodingCliSessionIndexer {
       // On warm rescan this processes all files normally.
       for (const provider of this.providers) {
         if (!enabledSet.has(provider.name) || provider.listSessionsDirect) continue
-        const files = filesByProvider?.get(provider) ?? await provider.listSessionFiles().catch((err) => {
+        const files = filesByProvider?.get(provider) ?? await provider.listSessionFiles().then((listed) => {
+          this.scanFailures.delete(provider.name)
+          return listed
+        }).catch((err) => {
           logger.warn({ err, provider: provider.name }, 'Could not list session files')
+          // Record per attempt (never bulk-cleared): the resolve endpoint must
+          // report this provider as unsearchable, not silently "no sessions".
+          this.scanFailures.add(provider.name)
           return [] as string[]
         })
         fileCount += files.length
@@ -1527,6 +1568,16 @@ export class CodingCliSessionIndexer {
     if (!changed) {
       logger.debug({ sessionCount, fileCount }, 'Skipping no-op refresh (no project changes)')
     }
+    // A DISABLED provider is UNSEARCHED, not failed — prune its stale failure
+    // so a failed-then-disabled provider cannot keep resolve responses
+    // 'degraded' forever (no successful scan could ever clear it).
+    for (const name of [...this.scanFailures]) {
+      if (!enabledSet.has(name)) this.scanFailures.delete(name)
+    }
+    // Readiness = at least one refresh completed. start() also sets this after
+    // its initial refresh — setting it here is idempotent and makes isReady()
+    // observable without start() (unit tests drive refresh() directly).
+    this.initialized = true
     endRefreshTimer({ projectCount: groups.length, sessionCount, fileCount, skipped: !changed })
   }
 

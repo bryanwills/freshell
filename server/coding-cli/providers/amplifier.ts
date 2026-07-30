@@ -218,6 +218,18 @@ export const amplifierProvider: CodingCliProvider = {
   // lands at the first prompt:complete.
   async listSessionFiles() {
     const projectsDir = path.join(this.homeDir, 'projects')
+    // Root-level guard: ABSENCE of the root is a legitimate empty result; any
+    // OTHER root error (EACCES/EIO/EMFILE, ...) must REJECT so the indexer
+    // records a scan failure — a provider outage must never read as "no
+    // sessions". ACCEPTED LIMITATION: deeper per-subdirectory errors inside
+    // walkMetadataFiles remain best-effort skips (partial results beat none).
+    try {
+      await fsp.readdir(projectsDir)
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException | null)?.code
+      if (code === 'ENOENT' || code === 'ENOTDIR') return []
+      throw err
+    }
     const files = await walkMetadataFiles(projectsDir)
     // Restrict to files under a `sessions` directory (projects/<slug>/sessions/<id>/metadata.json).
     return files.filter((file) =>

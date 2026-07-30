@@ -2899,3 +2899,62 @@ describe('CodingCliSessionIndexer', () => {
     expect(titles).toEqual(['Session A', 'Session B'])
   })
 })
+
+describe('readiness + scan-failure channel (resume resolve)', () => {
+  it('records a provider whose listing rejects and still reports ready after the refresh completes', async () => {
+    const provider = makeProvider([], {
+      listSessionFiles: async () => { throw new Error('EACCES: permission denied') },
+    })
+    const indexer = new CodingCliSessionIndexer([provider])
+    expect(indexer.isReady()).toBe(false)
+    await indexer.refresh()
+    expect(indexer.isReady()).toBe(true)
+    expect(indexer.getScanFailures()).toEqual(['claude'])
+  })
+
+  it('clears the failure once a subsequent refresh succeeds', async () => {
+    const file = path.join(tempDir, 'session-a.jsonl')
+    await fsp.writeFile(file, JSON.stringify({ cwd: '/project/a' }) + '\n')
+    let fail = true
+    const provider = makeProvider([], {
+      listSessionFiles: async () => {
+        if (fail) throw new Error('EIO: i/o error')
+        return [file]
+      },
+    })
+    const indexer = new CodingCliSessionIndexer([provider])
+    await indexer.refresh()
+    expect(indexer.getScanFailures()).toEqual(['claude'])
+    fail = false
+    await indexer.refresh()
+    expect(indexer.getScanFailures()).toEqual([])
+  })
+
+  it('prunes a failed provider that is later DISABLED (unsearched, not failed — no retry trap)', async () => {
+    const provider = makeProvider([], {
+      listSessionFiles: async () => { throw new Error('EACCES: permission denied') },
+    })
+    const indexer = new CodingCliSessionIndexer([provider])
+    await indexer.refresh()
+    expect(indexer.getScanFailures()).toEqual(['claude'])
+    vi.mocked(configStore.snapshot).mockResolvedValue({
+      sessionOverrides: {},
+      settings: {
+        codingCli: {
+          enabledProviders: [],
+          providers: {},
+        },
+      },
+    })
+    await indexer.refresh()
+    expect(indexer.getScanFailures()).toEqual([])
+  })
+
+  it('requestRefresh() schedules a refresh (fire-and-forget wrapper over scheduleRefresh)', async () => {
+    const provider = makeProvider([])
+    const indexer = new CodingCliSessionIndexer([provider])
+    const spy = vi.spyOn(indexer, 'scheduleRefresh').mockImplementation(() => {})
+    indexer.requestRefresh()
+    expect(spy).toHaveBeenCalledTimes(1)
+  })
+})

@@ -469,6 +469,18 @@ export const codexProvider: CodingCliProvider = {
 
   async listSessionFiles() {
     const sessionsDir = path.join(this.homeDir, 'sessions')
+    // Root-level guard: ABSENCE of the root is a legitimate empty result; any
+    // OTHER root error (EACCES/EIO/EMFILE, ...) must REJECT so the indexer
+    // records a scan failure — a provider outage must never read as "no
+    // sessions". ACCEPTED LIMITATION: deeper per-subdirectory errors inside
+    // walkJsonlFiles remain best-effort skips (partial results beat none).
+    try {
+      await fsp.readdir(sessionsDir)
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException | null)?.code
+      if (code === 'ENOENT' || code === 'ENOTDIR') return []
+      throw err
+    }
     return walkJsonlFiles(sessionsDir)
   },
 
