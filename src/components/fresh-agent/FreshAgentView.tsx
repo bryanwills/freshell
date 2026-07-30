@@ -1408,6 +1408,10 @@ export function FreshAgentView({
     paneId,
     paneContent.provider,
     paneContent.resumeSessionId,
+    // A replacement preserves the durable sessionId, so runtime fence changes
+    // are the edge that must rebind the new runtime to that durable route.
+    paneContent.runtimeGeneration,
+    paneContent.runtimeId,
     paneContent.sessionId,
     paneContent.sessionRef?.provider,
     paneContent.sessionRef?.sessionId,

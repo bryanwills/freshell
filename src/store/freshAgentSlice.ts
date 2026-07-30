@@ -252,15 +252,18 @@ const freshAgentSlice = createSlice({
         session.runtimeGeneration = replacement.generation
         session.runtimeId = replacement.runtimeId
         const previousSessionId = session.sessionId
+        // The replacement runtime is only a transport-generation fence. The
+        // provider session named by the server remains the durable route for
+        // history, mutations, and future attaches.
         const nextLocator = {
-          sessionId: replacement.runtimeId,
+          sessionId: replacement.sessionId,
           sessionType: session.sessionType,
           provider: session.provider,
         }
         const nextKey = sessionKey(nextLocator)
-        session.sessionId = replacement.runtimeId
+        session.sessionId = replacement.sessionId
         session.sessionKey = nextKey
-        session.threadId = replacement.runtimeId
+        session.threadId = replacement.sessionId
         session.snapshot = undefined
         session.latestTurnId = undefined
         session.streamingText = ''
@@ -277,7 +280,7 @@ const freshAgentSlice = createSlice({
         }
         for (const pending of Object.values(state.pendingCreates)) {
           if (pending.sessionId !== previousSessionId && pending.sessionKey !== oldKey) continue
-          pending.sessionId = replacement.runtimeId
+          pending.sessionId = replacement.sessionId
           pending.sessionKey = nextKey
           pending.sessionType = session.sessionType
           pending.provider = session.provider

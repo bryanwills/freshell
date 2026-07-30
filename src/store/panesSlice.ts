@@ -1019,7 +1019,6 @@ export const panesSlice = createSlice({
           } else {
             node.content.runtimeGeneration = replacement.generation
             node.content.runtimeId = replacement.runtimeId
-            node.content.sessionId = replacement.runtimeId
             node.content.status = 'connected'
             node.content.createError = undefined
             node.content.restoreError = undefined

@@ -10,12 +10,13 @@ import reducer, {
 } from '@/store/freshAgentSlice'
 
 const locator = {
-  sessionId: 'fresh-old',
+  // Durable provider identity and runtime identity are deliberately distinct.
+  // A restart replaces the latter while the former remains the session route.
+  sessionId: 's1',
   sessionType: 'freshcodex' as const,
   provider: 'codex' as const,
 }
 const key = makeFreshAgentSessionKey(locator)
-const replacementKey = makeFreshAgentSessionKey({ ...locator, sessionId: 'fresh-new' })
 const oldRuntime = { runtimeId: 'fresh-old', generation: 7 }
 
 function activeState() {
@@ -60,9 +61,10 @@ describe('freshAgentSlice agent restart replacement', () => {
       generation: 8,
     }))
 
-    expect(next.sessions[key]).toBeUndefined()
-    expect(next.sessions[replacementKey]).toMatchObject({
-      sessionId: 'fresh-new',
+    expect(next.sessions[key]).toMatchObject({
+      sessionId: 's1',
+      sessionKey: key,
+      threadId: 's1',
       runtimeId: 'fresh-new',
       runtimeGeneration: 8,
       status: 'starting',
@@ -71,8 +73,8 @@ describe('freshAgentSlice agent restart replacement', () => {
       pendingPermissions: {},
       pendingQuestions: {},
     })
-    expect(next.sessions[replacementKey].snapshot).toBeUndefined()
-    expect(next.sessions[replacementKey].latestTurnId).toBeUndefined()
+    expect(next.sessions[key].snapshot).toBeUndefined()
+    expect(next.sessions[key].latestTurnId).toBeUndefined()
   })
 
   it('rejects old-runtime transport events after replacement but accepts the replacement generation', () => {
@@ -90,14 +92,14 @@ describe('freshAgentSlice agent restart replacement', () => {
 
     state = reducer(state, setStreaming({ ...locator, active: true, runtime: oldRuntime }))
     state = reducer(state, setSessionStatus({ ...locator, status: 'running', runtime: oldRuntime }))
-    expect(state.sessions[replacementKey].streamingActive).toBe(false)
-    expect(state.sessions[replacementKey].status).toBe('starting')
+    expect(state.sessions[key].streamingActive).toBe(false)
+    expect(state.sessions[key].status).toBe('starting')
 
     const replacementRuntime = { runtimeId: 'fresh-new', generation: 8 }
-    const replacementLocator = { ...locator, sessionId: 'fresh-new' }
+    const replacementLocator = locator
     state = reducer(state, setStreaming({ ...replacementLocator, active: true, runtime: replacementRuntime }))
     state = reducer(state, setSessionStatus({ ...replacementLocator, status: 'running', runtime: replacementRuntime }))
-    expect(state.sessions[replacementKey].streamingActive).toBe(true)
-    expect(state.sessions[replacementKey].status).toBe('running')
+    expect(state.sessions[key].streamingActive).toBe(true)
+    expect(state.sessions[key].status).toBe('running')
   })
 })

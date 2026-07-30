@@ -122,7 +122,7 @@ describe('panesSlice agent restart replacement', () => {
         kind: 'fresh-agent',
         sessionType: 'freshcodex',
         provider: 'codex',
-        sessionId: 'fresh-old',
+        sessionId: 's1',
         createRequestId: 'fresh-create',
         status: 'idle',
         sessionRef: { provider: 'codex', sessionId: 's1' },
@@ -145,7 +145,7 @@ describe('panesSlice agent restart replacement', () => {
     const content = leaves(next.layouts.tab1)[0].content
     expect(content).toMatchObject({
       kind: 'fresh-agent',
-      sessionId: 'fresh-new',
+      sessionId: 's1',
       runtimeId: 'fresh-new',
       runtimeGeneration: 8,
       sessionRef: { provider: 'codex', sessionId: 's1' },
