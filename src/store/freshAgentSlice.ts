@@ -67,7 +67,11 @@ function resolveSessionKey(
   }
 
   const session = key ? state.sessions[key] : undefined
-  if (!session || !payload.runtime) return key
+  if (!session) return key
+  // Once a session has a live runtime fence, an untagged frame is no more
+  // trustworthy than one from a different runtime. This also protects direct
+  // reducer callers outside the WebSocket transport boundary.
+  if (!payload.runtime) return session.runtimeGeneration === undefined ? key : undefined
   if (session.runtimeGeneration === undefined) {
     session.runtimeId = payload.runtime.runtimeId
     session.runtimeGeneration = payload.runtime.generation

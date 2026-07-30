@@ -299,6 +299,54 @@ describe('fresh-agent-ws', () => {
     expect(actionTypes).toContain(flushPersistedLayoutNow.type)
   })
 
+  it('drops untagged and stale transport events at the central handler when their pane is runtime-fenced', () => {
+    const actionTypes: string[] = []
+    const store = createFreshAgentPaneStore(actionTypes)
+    const sessionId = 'ses-runtime-fenced'
+    const send = (event: Record<string, unknown>, runtime?: { runtimeId: string, generation: number }) =>
+      handleFreshAgentMessage(store.dispatch, {
+        type: 'freshAgent.event',
+        sessionId,
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        event: { sessionId, ...event },
+        ...(runtime ? { runtime } : {}),
+      }, undefined, store.getState)
+
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        sessionId,
+        createRequestId: 'req-runtime-fenced',
+        status: 'running',
+        runtimeId: 'runtime-current',
+        runtimeGeneration: 8,
+      },
+    }))
+
+    // The current runtime is allowed to create the session. Every later
+    // mutation must carry exactly that runtime fence.
+    expect(send({ type: 'freshAgent.session.snapshot', latestTurnId: null, status: 'idle' }, {
+      runtimeId: 'runtime-current', generation: 8,
+    })).toBe(true)
+    actionTypes.length = 0
+
+    expect(send({ type: 'freshAgent.status', status: 'running' })).toBe(true)
+    expect(send({ type: 'freshAgent.permission.request', requestId: 'approval-stale', tool: { name: 'Bash' } })).toBe(true)
+    expect(send({ type: 'freshAgent.question.request', requestId: 'question-stale', questions: [] }, {
+      runtimeId: 'runtime-old', generation: 7,
+    })).toBe(true)
+    expect(send({ type: 'freshAgent.turn.complete', at: 1234 })).toBe(true)
+
+    const session = store.getState().freshAgent.sessions[`freshcodex:codex:${sessionId}`]
+    expect(session).toMatchObject({ status: 'idle', pendingPermissions: {}, pendingQuestions: {} })
+    expect(actionTypes).not.toContain('turnCompletion/recordTurnComplete')
+  })
+
   it('projects Claude freshAgent.event snapshot and lost-session transport updates into fresh-agent session state', () => {
     const store = createFreshAgentStore()
 
