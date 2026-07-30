@@ -225,8 +225,10 @@ export default function ResumeSessionDialog({ open, onClose, onResume }: ResumeS
   return createPortal(
     <div
       className={`fixed inset-0 bg-black/50 flex items-center justify-center p-4 ${OVERLAY_Z.modal}`}
+      role="presentation"
       onMouseDown={(e) => { if (e.target === e.currentTarget) onClose() }}
     >
+      {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions */}
       <div
         ref={dialogRef}
         role="dialog"
