@@ -547,6 +547,9 @@ export function FreshAgentView({
   const dispatch = useAppDispatch()
   const ws = getWsClient()
   const appStore = useAppStore()
+  useEffect(() => {
+    ws.bindAgentRestartStore?.(appStore)
+  }, [appStore, ws])
   const terminalFontSize = useAppSelector(
     (state) => state.settings.settings.terminal?.fontSize,
   ) ?? 16
@@ -1465,6 +1468,18 @@ export function FreshAgentView({
   useEffect(() => {
     if (typeof ws.onMessage !== 'function') return
     const unsubscribe = ws.onMessage((message) => {
+      const currentRuntimeGeneration = paneContentRef.current.runtimeGeneration
+      const messageRuntime = 'runtime' in message ? message.runtime : undefined
+      if (
+        currentRuntimeGeneration !== undefined
+        && messageRuntime
+        && (
+          messageRuntime.runtimeId !== paneContentRef.current.runtimeId
+          || messageRuntime.generation < currentRuntimeGeneration
+        )
+      ) {
+        return
+      }
       if (message.type === 'pane.reconcile.result') {
         // Fold-ownership rule (pane-reconcile.ts): fold ONLY the result whose
         // reconcileId this view minted for its .lost reconcile; foreign
@@ -1492,6 +1507,9 @@ export function FreshAgentView({
         return
       }
       if (message.type === 'freshAgent.created' && message.requestId === paneContentRef.current.createRequestId) {
+        if (paneContentRef.current.runtimeGeneration !== undefined && !message.runtime) {
+          return
+        }
         releasePendingRebind()
         clearReserveRedrive() // Task 14: a completed create ends the reservation window
         const current = paneContentRef.current
@@ -1502,6 +1520,12 @@ export function FreshAgentView({
           content: {
             ...current,
             sessionId: message.sessionId,
+            ...(message.runtime
+              ? {
+                runtimeId: message.runtime.runtimeId,
+                runtimeGeneration: message.runtime.generation,
+              }
+              : {}),
             sessionRef: message.sessionRef ?? current.sessionRef,
             resumeSessionId: getCreatedResumeSessionId(current, {
               sessionId: message.sessionId,
@@ -1561,6 +1585,12 @@ export function FreshAgentView({
           content: {
             ...current,
             sessionId: message.sessionId,
+            ...(message.runtime
+              ? {
+                runtimeId: message.runtime.runtimeId,
+                runtimeGeneration: message.runtime.generation,
+              }
+              : {}),
             sessionRef,
             resumeSessionId: message.sessionId,
             restoreError: undefined,

@@ -619,6 +619,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
   // All hooks MUST be called before any conditional returns
   const ws = useMemo(() => getWsClient(), [])
+  useEffect(() => {
+    ws.bindAgentRestartStore?.(appStore)
+  }, [appStore, ws])
   // Playwright can opt a pane into state-only mode so activity chrome tests
   // don't race the live terminal create/attach lifecycle.
   const suppressNetworkEffects = typeof window !== 'undefined'
@@ -4032,6 +4035,17 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         }
 
         if (msg.type === 'terminal.attach.ready' && msg.terminalId === tid) {
+          const currentRuntimeGeneration = contentRef.current?.runtimeGeneration
+          if (
+            currentRuntimeGeneration !== undefined
+            && (
+              !msg.runtime
+              || msg.runtime.runtimeId !== contentRef.current?.runtimeId
+              || msg.runtime.generation !== currentRuntimeGeneration
+            )
+          ) {
+            return
+          }
           if (!isCurrentAttachMessage(msg)) {
             if (debugRef.current) {
               log.debug('Ignoring stale attach generation message', {
@@ -4056,6 +4070,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             geometryEpochRef.current,
           )
           const previousStreamId = getTerminalCheckpointStreamId()
+          const attachRuntime = msg.runtime
+          if (attachRuntime) {
+            updateContent({
+              runtimeId: attachRuntime.runtimeId,
+              runtimeGeneration: attachRuntime.generation,
+            })
+          }
           const activeAttach = currentAttachRef.current
           const expectedStreamId = activeAttach?.expectedStreamId ?? previousStreamId
           const expectedGeometryAuthority = activeAttach?.expectedGeometryAuthority ?? geometryAuthorityRef.current
@@ -4215,6 +4236,17 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           // this point; see terminal-restore.ts).
           clearTerminalRestoreRequestId(reqId)
           const newId = msg.terminalId as string
+          const currentRuntimeGeneration = contentRef.current?.runtimeGeneration
+          if (
+            currentRuntimeGeneration !== undefined
+            && (
+              !msg.runtime
+              || msg.runtime.runtimeId !== contentRef.current?.runtimeId
+              || msg.runtime.generation < currentRuntimeGeneration
+            )
+          ) {
+            return
+          }
           const handled = handledCreatedMessageRef.current
           if (handled?.requestId === reqId && handled.terminalId === newId) {
             if (debugRef.current) {
@@ -4249,6 +4281,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             currentResumeSessionId: contentRef.current?.resumeSessionId,
           })
           const createdSessionRef = (msg as { sessionRef?: TerminalPaneContent['sessionRef'] }).sessionRef
+          const createdRuntime = msg.runtime
           const createdCwd = typeof msg.cwd === 'string' && msg.cwd.trim() ? msg.cwd : undefined
           const createdSessionUpdates = buildSessionAssociationContentUpdates(contentRef.current, createdSessionRef)
           terminalIdRef.current = newId
@@ -4257,6 +4290,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           lastKnownTerminalIdRef.current = newId
           updateContent({
             terminalId: newId,
+            ...(createdRuntime
+              ? {
+                runtimeId: createdRuntime.runtimeId,
+                runtimeGeneration: createdRuntime.generation,
+              }
+              : {}),
             serverInstanceId: serverInstanceIdRef.current,
             streamId: undefined,
             status: 'running',

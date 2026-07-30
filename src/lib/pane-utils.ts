@@ -1,8 +1,58 @@
-import type { PaneContent, PaneNode, PaneRefreshTarget } from '@/store/paneTypes'
+import type {
+  FreshAgentPaneContent,
+  PaneContent,
+  PaneNode,
+  PaneRefreshTarget,
+  TerminalPaneContent,
+} from '@/store/paneTypes'
+import type { AgentRestartReplacedMessage, AgentRuntimeKind } from '@shared/ws-protocol'
 
 export interface PaneEntry {
   paneId: string
   content: PaneContent
+}
+
+type RestartablePaneContent = TerminalPaneContent | FreshAgentPaneContent
+
+function paneRuntimeKind(content: RestartablePaneContent): AgentRuntimeKind {
+  return content.kind === 'terminal' ? 'terminal' : 'fresh-agent'
+}
+
+function paneRuntimeProvider(content: RestartablePaneContent): string {
+  return content.kind === 'terminal' ? content.mode : content.provider
+}
+
+function paneLiveRuntimeId(content: RestartablePaneContent): string | undefined {
+  return content.runtimeId
+    ?? (content.kind === 'terminal' ? content.terminalId : content.sessionId)
+}
+
+/**
+ * A restart broadcast names durable identity plus the exact old runtime
+ * generation. Only panes viewing that same runtime may follow the replacement.
+ */
+export function paneMatchesAgentRuntimeReplacement(
+  content: PaneContent,
+  replacement: AgentRestartReplacedMessage,
+): content is RestartablePaneContent {
+  if (content.kind !== 'terminal' && content.kind !== 'fresh-agent') return false
+  if (paneRuntimeKind(content) !== replacement.kind) return false
+  if (paneRuntimeProvider(content) !== replacement.provider) return false
+  if (
+    content.sessionRef?.provider !== replacement.provider
+    || content.sessionRef.sessionId !== replacement.sessionId
+  ) {
+    return false
+  }
+  if (replacement.generation <= replacement.oldGeneration) return false
+  if (paneLiveRuntimeId(content) !== replacement.oldRuntimeId) return false
+  if (
+    content.runtimeGeneration !== undefined
+    && content.runtimeGeneration !== replacement.oldGeneration
+  ) {
+    return false
+  }
+  return true
 }
 
 /**

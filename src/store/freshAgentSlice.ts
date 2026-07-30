@@ -5,6 +5,7 @@ import {
   type FreshAgentSessionType,
 } from '@shared/fresh-agent'
 import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
+import type { AgentRestartReplacedMessage, RuntimeDescriptor } from '@shared/ws-protocol'
 import type {
   FreshAgentContentBlock,
   FreshAgentPermissionRequest,
@@ -29,6 +30,7 @@ type SessionMutationPayload = {
   sessionId: string
   sessionType?: FreshAgentSessionType
   provider?: FreshAgentRuntimeProvider
+  runtime?: RuntimeDescriptor
 }
 
 const initialState: FreshAgentState = {
@@ -36,6 +38,7 @@ const initialState: FreshAgentState = {
   pendingCreates: {},
   pendingCreateFailures: {},
   availableModels: [],
+  retiredRuntimeGenerations: {},
 }
 
 function sessionKey(locator: FreshAgentSessionPayload): string {
@@ -46,15 +49,37 @@ function resolveSessionKey(
   state: FreshAgentState,
   payload: SessionMutationPayload,
 ): string | undefined {
+  if (
+    payload.runtime
+    && (state.retiredRuntimeGenerations?.[payload.runtime.runtimeId] ?? -1) >= payload.runtime.generation
+  ) {
+    return undefined
+  }
+  let key: string | undefined
   if (payload.sessionType && payload.provider) {
-    return sessionKey({
+    key = sessionKey({
       sessionId: payload.sessionId,
       sessionType: payload.sessionType,
       provider: payload.provider,
     })
+  } else {
+    key = Object.values(state.sessions).find((session) => session.sessionId === payload.sessionId)?.sessionKey
   }
 
-  return Object.values(state.sessions).find((session) => session.sessionId === payload.sessionId)?.sessionKey
+  const session = key ? state.sessions[key] : undefined
+  if (!session || !payload.runtime) return key
+  if (session.runtimeGeneration === undefined) {
+    session.runtimeId = payload.runtime.runtimeId
+    session.runtimeGeneration = payload.runtime.generation
+    return key
+  }
+  if (
+    session.runtimeId !== payload.runtime.runtimeId
+    || session.runtimeGeneration !== payload.runtime.generation
+  ) {
+    return undefined
+  }
+  return key
 }
 
 function createSession(locator: FreshAgentSessionPayload, status: FreshAgentSessionStatus): FreshAgentSessionState {
@@ -99,14 +124,33 @@ function resolveOrEnsureSession(
   payload: SessionMutationPayload,
   status: FreshAgentSessionStatus = 'starting',
 ): FreshAgentSessionState | undefined {
+  if (
+    payload.runtime
+    && (state.retiredRuntimeGenerations?.[payload.runtime.runtimeId] ?? -1) >= payload.runtime.generation
+  ) {
+    return undefined
+  }
   const key = resolveSessionKey(state, payload)
   if (key && state.sessions[key]) return state.sessions[key]
+  if (key === undefined && Object.values(state.sessions).some((session) => (
+    session.sessionId === payload.sessionId
+    && (!payload.sessionType || session.sessionType === payload.sessionType)
+    && (!payload.provider || session.provider === payload.provider)
+  ))) {
+    // A matching session exists, but its runtime fence rejected this event.
+    return undefined
+  }
   if (!payload.sessionType || !payload.provider) return undefined
-  return ensureSession(state, {
+  const session = ensureSession(state, {
     sessionId: payload.sessionId,
     sessionType: payload.sessionType,
     provider: payload.provider,
   }, status)
+  if (payload.runtime) {
+    session.runtimeId = payload.runtime.runtimeId
+    session.runtimeGeneration = payload.runtime.generation
+  }
+  return session
 }
 
 function resetHydratedHistoryState(session: FreshAgentSessionState): void {
@@ -185,6 +229,62 @@ const freshAgentSlice = createSlice({
   name: 'freshAgent',
   initialState,
   reducers: {
+    applyAgentRestartReplaced(state, action: PayloadAction<AgentRestartReplacedMessage>) {
+      const replacement = action.payload
+      if (replacement.kind !== 'fresh-agent') return
+      state.retiredRuntimeGenerations ??= {}
+      state.retiredRuntimeGenerations[replacement.oldRuntimeId] = Math.max(
+        state.retiredRuntimeGenerations[replacement.oldRuntimeId] ?? -1,
+        replacement.oldGeneration,
+      )
+      for (const [oldKey, session] of Object.entries(state.sessions)) {
+        if (session.provider !== replacement.provider) continue
+        if (replacement.generation <= replacement.oldGeneration) continue
+        const currentRuntimeId = session.runtimeId ?? session.sessionId
+        if (currentRuntimeId !== replacement.oldRuntimeId) continue
+        if (
+          session.runtimeGeneration !== undefined
+          && session.runtimeGeneration !== replacement.oldGeneration
+        ) {
+          continue
+        }
+
+        session.runtimeGeneration = replacement.generation
+        session.runtimeId = replacement.runtimeId
+        const previousSessionId = session.sessionId
+        const nextLocator = {
+          sessionId: replacement.runtimeId,
+          sessionType: session.sessionType,
+          provider: session.provider,
+        }
+        const nextKey = sessionKey(nextLocator)
+        session.sessionId = replacement.runtimeId
+        session.sessionKey = nextKey
+        session.threadId = replacement.runtimeId
+        session.snapshot = undefined
+        session.latestTurnId = undefined
+        session.streamingText = ''
+        session.streamingActive = false
+        session.pendingPermissions = {}
+        session.pendingQuestions = {}
+        session.lastError = undefined
+        session.lastErrorCode = undefined
+        session.lost = false
+        writeSessionStatus(session, 'starting')
+        if (nextKey !== oldKey) {
+          state.sessions[nextKey] = session
+          delete state.sessions[oldKey]
+        }
+        for (const pending of Object.values(state.pendingCreates)) {
+          if (pending.sessionId !== previousSessionId && pending.sessionKey !== oldKey) continue
+          pending.sessionId = replacement.runtimeId
+          pending.sessionKey = nextKey
+          pending.sessionType = session.sessionType
+          pending.provider = session.provider
+        }
+      }
+    },
+
     registerPendingCreate(state, action: PayloadAction<{
       requestId: string
       expectsHistoryHydration: boolean
@@ -212,6 +312,7 @@ const freshAgentSlice = createSlice({
       sessionId: string
       sessionType?: FreshAgentSessionType
       provider?: FreshAgentRuntimeProvider
+      runtime?: RuntimeDescriptor
     }>) {
       const pending = state.pendingCreates[action.payload.requestId]
       const sessionType = action.payload.sessionType ?? pending?.sessionType
@@ -221,7 +322,27 @@ const freshAgentSlice = createSlice({
       const locator = { sessionId: action.payload.sessionId, sessionType, provider }
       const key = sessionKey(locator)
       const expectsHistoryHydration = pending?.expectsHistoryHydration ?? false
+      if (
+        action.payload.runtime
+        && (state.retiredRuntimeGenerations?.[action.payload.runtime.runtimeId] ?? -1)
+        >= action.payload.runtime.generation
+      ) {
+        return
+      }
       const session = ensureSession(state, locator, 'connected')
+      if (action.payload.runtime) {
+        if (
+          session.runtimeGeneration !== undefined
+          && (
+            session.runtimeId !== action.payload.runtime.runtimeId
+            || session.runtimeGeneration > action.payload.runtime.generation
+          )
+        ) {
+          return
+        }
+        session.runtimeId = action.payload.runtime.runtimeId
+        session.runtimeGeneration = action.payload.runtime.generation
+      }
       if (session.status === 'starting' || session.status === 'creating') {
         writeSessionStatus(session, 'connected')
       } else {
@@ -371,13 +492,36 @@ const freshAgentSlice = createSlice({
       }
     },
 
-    freshAgentSnapshotReceived(state, action: PayloadAction<{ snapshot: FreshAgentSnapshot }>) {
+    freshAgentSnapshotReceived(state, action: PayloadAction<{
+      snapshot: FreshAgentSnapshot
+      runtime?: RuntimeDescriptor
+    }>) {
       const snapshot = action.payload.snapshot
+      if (
+        action.payload.runtime
+        && (state.retiredRuntimeGenerations?.[action.payload.runtime.runtimeId] ?? -1)
+        >= action.payload.runtime.generation
+      ) {
+        return
+      }
       const session = ensureSession(state, {
         sessionId: snapshot.threadId,
         sessionType: snapshot.sessionType,
         provider: snapshot.provider,
       }, snapshot.status as FreshAgentSessionStatus)
+      if (action.payload.runtime) {
+        if (
+          session.runtimeGeneration !== undefined
+          && (
+            session.runtimeId !== action.payload.runtime.runtimeId
+            || session.runtimeGeneration !== action.payload.runtime.generation
+          )
+        ) {
+          return
+        }
+        session.runtimeId = action.payload.runtime.runtimeId
+        session.runtimeGeneration = action.payload.runtime.generation
+      }
       session.snapshot = snapshot
       writeSessionStatus(session, snapshot.status as FreshAgentSessionStatus)
       session.latestTurnId = snapshot.latestTurnId
@@ -623,6 +767,7 @@ const freshAgentSlice = createSlice({
 })
 
 export const {
+  applyAgentRestartReplaced,
   addAssistantMessage,
   addPermissionRequest,
   addQuestionRequest,

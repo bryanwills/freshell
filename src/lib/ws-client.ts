@@ -7,8 +7,18 @@ import {
 import { getAuthToken } from '@/lib/auth'
 import { sanitizeSessionLocators } from '@/lib/session-utils'
 import { WS_PROTOCOL_VERSION } from '@shared/ws-version'
-import type { ReadyCapabilities, ServerMessage, SessionLocator } from '@shared/ws-protocol'
+import type {
+  ClientMessage,
+  ReadyCapabilities,
+  RuntimeDescriptor,
+  ServerMessage,
+  SessionLocator,
+} from '@shared/ws-protocol'
 import { createLogger } from '@/lib/client-logger'
+import { applyAgentRestartReplaced as applyPaneAgentRestartReplaced } from '@/store/panesSlice'
+import { applyAgentRestartReplaced as applyFreshAgentRestartReplaced } from '@/store/freshAgentSlice'
+import type { FreshAgentState } from '@/store/freshAgentTypes'
+import type { PanesState } from '@/store/paneTypes'
 
 const log = createLogger('WsClient')
 
@@ -69,6 +79,21 @@ type InFlightCreate = {
   lastResendEpoch: number
 }
 
+type AgentRestartClientMessage = Extract<ClientMessage, { type: 'agent.restart' }>
+
+type InFlightAgentRestart = {
+  message: AgentRestartClientMessage
+  lastResendEpoch: number
+}
+
+type AgentRestartStore = {
+  dispatch: (action: unknown) => unknown
+  getState: () => {
+    panes: PanesState
+    freshAgent: FreshAgentState
+  }
+}
+
 const CONNECTION_TIMEOUT_MS = 10_000
 
 // Bounded pre-verdict create hold: when the server acks paneReconcileV1, pane
@@ -104,6 +129,24 @@ function isTerminalAttachMessage(msg: unknown): msg is TerminalAttachClientMessa
     && candidate.terminalId.length > 0
 }
 
+function isAgentRestartMessage(msg: unknown): msg is AgentRestartClientMessage {
+  if (!msg || typeof msg !== 'object') return false
+  const candidate = msg as Partial<AgentRestartClientMessage>
+  return candidate.type === 'agent.restart'
+    && typeof candidate.requestId === 'string'
+    && candidate.requestId.length > 0
+}
+
+function runtimeDescriptorFromMessage(msg: ServerMessage): RuntimeDescriptor | undefined {
+  if (!('runtime' in msg)) return undefined
+  const runtime = msg.runtime
+  if (!runtime || typeof runtime !== 'object') return undefined
+  return typeof runtime.runtimeId === 'string'
+    && typeof runtime.generation === 'number'
+    ? runtime
+    : undefined
+}
+
 export class WsClient {
   private ws: WebSocket | null = null
   private _state: ConnectionState = 'disconnected'
@@ -134,6 +177,10 @@ export class WsClient {
   private readyTimeout: number | null = null
   private reconnectEpoch = 0
   private inFlightCreates = new Map<string, InFlightCreate>()
+  private inFlightAgentRestarts = new Map<string, InFlightAgentRestart>()
+  private completedAgentRestartResults = new Map<string, string>()
+  private retiredRuntimeGenerations = new Map<string, number>()
+  private agentRestartStore?: AgentRestartStore
   private preReadyCreateQueue = new Map<string, unknown>()
   // Sender-level pre-verdict create hold (only when paneReconcileV1 is acked):
   // pane creates wait here until their pane's verdict folds (cancelCreate
@@ -229,6 +276,40 @@ export class WsClient {
   }
 
   private handleIncomingMessage(msg: ServerMessage): void {
+    if (msg.type === 'agent.restart.replaced' || msg.type === 'agent.restart.failed') {
+      const fingerprint = JSON.stringify(msg)
+      if (this.completedAgentRestartResults.get(msg.requestId) === fingerprint) {
+        return
+      }
+      this.completedAgentRestartResults.set(msg.requestId, fingerprint)
+      if (this.completedAgentRestartResults.size > 1_000) {
+        const oldest = this.completedAgentRestartResults.keys().next().value
+        if (typeof oldest === 'string') this.completedAgentRestartResults.delete(oldest)
+      }
+      this.inFlightAgentRestarts.delete(msg.requestId)
+
+      if (msg.type === 'agent.restart.replaced') {
+        this.retiredRuntimeGenerations.set(
+          msg.oldRuntimeId,
+          Math.max(this.retiredRuntimeGenerations.get(msg.oldRuntimeId) ?? -1, msg.oldGeneration),
+        )
+        // This is the single replacement fold. It runs before public message
+        // handlers, so React effects can only observe the committed descriptor.
+        this.agentRestartStore?.dispatch(applyPaneAgentRestartReplaced(msg))
+        this.agentRestartStore?.dispatch(applyFreshAgentRestartReplaced(msg))
+      }
+    }
+
+    const runtime = runtimeDescriptorFromMessage(msg)
+    if (
+      runtime
+      && (this.retiredRuntimeGenerations.get(runtime.runtimeId) ?? -1) >= runtime.generation
+    ) {
+      // A quiescing old runtime can still have buffered output/status frames
+      // in transit after the committed replacement. Never deliver them.
+      return
+    }
+
     if (msg.type === 'ready') {
       this._serverInstanceId = typeof msg.serverInstanceId === 'string' && msg.serverInstanceId.trim()
         ? msg.serverInstanceId
@@ -242,6 +323,14 @@ export class WsClient {
       this._state = 'ready'
       if (isReconnect) {
         this.reconnectEpoch += 1
+      }
+
+      if (this.serverCapabilities.agentRestartV1 === true) {
+        for (const entry of this.inFlightAgentRestarts.values()) {
+          if (entry.lastResendEpoch === this.reconnectEpoch) continue
+          this.sendNow(entry.message)
+          entry.lastResendEpoch = this.reconnectEpoch
+        }
       }
 
       if (perfConfig.enabled && this.connectStartedAt !== null) {
@@ -470,7 +559,13 @@ export class WsClient {
           type: 'hello',
           token,
           protocolVersion: WS_PROTOCOL_VERSION,
-          capabilities: { uiScreenshotV1: true, terminalOutputBatchV1: true, paneReconcileV1: true, paneReconcileFreshAgentV1: true },
+          capabilities: {
+            uiScreenshotV1: true,
+            terminalOutputBatchV1: true,
+            paneReconcileV1: true,
+            paneReconcileFreshAgentV1: true,
+            agentRestartV1: true,
+          },
           ...helloExtensions,
         })
       }
@@ -650,6 +745,9 @@ export class WsClient {
     this._state = 'disconnected'
     this.pendingMessages = []
     this.inFlightCreates.clear()
+    this.inFlightAgentRestarts.clear()
+    this.completedAgentRestartResults.clear()
+    this.retiredRuntimeGenerations.clear()
     this.preReadyCreateQueue.clear()
     this.resetReconcileHold({ requeueHeld: false })
     this.serverCapabilities = {}
@@ -680,6 +778,20 @@ export class WsClient {
    */
   send(msg: unknown) {
     if (this.intentionalClose) return
+
+    if (isAgentRestartMessage(msg)) {
+      const current = this.inFlightAgentRestarts.get(msg.requestId)
+      if (current && JSON.stringify(current.message) !== JSON.stringify(msg)) {
+        throw new Error(`agent.restart requestId ${msg.requestId} was reused with a different request`)
+      }
+      const entry = current ?? { message: msg, lastResendEpoch: -1 }
+      this.inFlightAgentRestarts.set(msg.requestId, entry)
+      if (this._state === 'ready' && this.ws?.readyState === WebSocket.OPEN) {
+        this.sendNow(entry.message)
+        entry.lastResendEpoch = this.reconnectEpoch
+      }
+      return
+    }
 
     if (isTerminalInputMessage(msg)) {
       markTerminalInputSent(msg.terminalId)
@@ -760,6 +872,31 @@ export class WsClient {
       type: 'tabs.sync.client.retire',
       ...payload,
     })
+  }
+
+  /**
+   * Start a restart transaction that survives a dropped requester socket.
+   * The byte-identical request is replayed after the next ready frame.
+   */
+  requestAgentRestart(message: AgentRestartClientMessage): void {
+    if (
+      this._state === 'ready'
+      && this.serverCapabilities.agentRestartV1 !== true
+    ) {
+      throw new Error('This server does not support agent runtime restart.')
+    }
+    this.send(message)
+  }
+
+  /**
+   * Install the one Redux fold target for restart broadcasts. Calling this
+   * from multiple mounted pane views is intentionally idempotent.
+   */
+  bindAgentRestartStore(store: AgentRestartStore): void {
+    if (this.agentRestartStore && this.agentRestartStore !== store) {
+      throw new Error('WsClient agent restart store is already bound')
+    }
+    this.agentRestartStore = store
   }
 
   onMessage(handler: MessageHandler): () => void {

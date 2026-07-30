@@ -1,6 +1,7 @@
 import type { AppDispatch } from '@/store/store'
 import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '@shared/fresh-agent'
 import type { SessionRef } from '@shared/session-contract'
+import type { RuntimeDescriptor } from '@shared/ws-protocol'
 import { createLogger } from '@/lib/client-logger'
 import { consumeCancelledCreate, consumeCreateRoute, rememberCreateRoute } from '@/lib/create-cancellation'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
@@ -38,6 +39,7 @@ type FreshAgentCreatedMessage = {
   sessionType: FreshAgentSessionType
   provider?: FreshAgentRuntimeProvider
   runtimeProvider?: FreshAgentRuntimeProvider
+  runtime?: RuntimeDescriptor
 }
 
 type FreshAgentCreateFailedMessage = {
@@ -55,6 +57,7 @@ type FreshAgentSessionMaterializedMessage = {
   sessionType: FreshAgentSessionType
   provider: FreshAgentRuntimeProvider
   sessionRef?: SessionRef
+  runtime?: RuntimeDescriptor
 }
 
 type FreshAgentKilledMessage = {
@@ -81,6 +84,7 @@ type FreshAgentEventMessage = {
   sessionType: FreshAgentSessionType
   provider: FreshAgentRuntimeProvider
   event: Record<string, unknown>
+  runtime?: RuntimeDescriptor
 }
 
 export function registerFreshAgentCreate(
@@ -128,6 +132,7 @@ export function handleFreshAgentMessage(dispatch: AppDispatch, msg: Record<strin
         sessionId: created.sessionId,
         sessionType: created.sessionType,
         provider,
+        runtime: created.runtime,
       }))
       return true
     }
@@ -198,6 +203,7 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
     sessionId,
     sessionType: msg.sessionType,
     provider: msg.provider,
+    runtime: msg.runtime,
   }
 
   switch (event.type) {

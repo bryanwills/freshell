@@ -19,7 +19,11 @@ import {
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
 import { matchesDerivedPaneTitle } from '@/lib/pane-title'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
-import { buildPaneRefreshTarget, paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
+import {
+  buildPaneRefreshTarget,
+  paneMatchesAgentRuntimeReplacement,
+  paneRefreshTargetMatchesContent,
+} from '@/lib/pane-utils'
 import { loadPersistedPanes, loadPersistedTabs } from './persistMiddleware.js'
 import { hasPaneTreeShape, isWellFormedPaneTree } from './paneTreeValidation.js'
 import { createLogger } from '@/lib/client-logger'
@@ -28,6 +32,7 @@ import { RestoreErrorSchema, sanitizeSessionRef, type RestoreError } from '@shar
 import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
 import { migrateLegacyFreshAgentContent, migrateLegacyFreshAgentDurableState } from '@shared/fresh-agent'
 import { normalizeFreshAgentStyleOverride } from '@shared/settings'
+import type { AgentRestartReplacedMessage } from '@shared/ws-protocol'
 
 
 const log = createLogger('PanesSlice')
@@ -82,6 +87,12 @@ function normalizePaneContent(
     return {
       kind: 'terminal',
       terminalId: typeof input.terminalId === 'string' ? input.terminalId : undefined,
+      runtimeId: typeof input.runtimeId === 'string' ? input.runtimeId : undefined,
+      runtimeGeneration: typeof input.runtimeGeneration === 'number'
+        && Number.isInteger(input.runtimeGeneration)
+        && input.runtimeGeneration >= 0
+        ? input.runtimeGeneration
+        : undefined,
       createRequestId: typeof input.createRequestId === 'string' && input.createRequestId
         ? input.createRequestId
         : previousCreateRequestId || nanoid(),
@@ -131,6 +142,12 @@ function normalizePaneContent(
         sessionType: input.sessionType,
         provider: input.provider,
         sessionId: input.sessionId,
+        runtimeId: typeof input.runtimeId === 'string' ? input.runtimeId : undefined,
+        runtimeGeneration: typeof input.runtimeGeneration === 'number'
+          && Number.isInteger(input.runtimeGeneration)
+          && input.runtimeGeneration >= 0
+          ? input.runtimeGeneration
+          : undefined,
         createRequestId: typeof input.createRequestId === 'string' && input.createRequestId
           ? input.createRequestId
           : previousCreateRequestId || nanoid(),
@@ -181,6 +198,12 @@ function normalizePaneContent(
       sessionType: input.sessionType,
       provider: input.provider,
       sessionId: input.sessionId,
+      runtimeId: typeof input.runtimeId === 'string' ? input.runtimeId : undefined,
+      runtimeGeneration: typeof input.runtimeGeneration === 'number'
+        && Number.isInteger(input.runtimeGeneration)
+        && input.runtimeGeneration >= 0
+        ? input.runtimeGeneration
+        : undefined,
       createRequestId: typeof input.createRequestId === 'string' && input.createRequestId
         ? input.createRequestId
         : previousCreateRequestId || nanoid(),
@@ -957,6 +980,57 @@ export const panesSlice = createSlice({
   name: 'panes',
   initialState,
   reducers: {
+    /**
+     * Fold one server-committed runtime replacement into every local viewer.
+     * The old live identity and generation are both fenced, so replayed or
+     * out-of-order broadcasts are idempotent and cannot repoint a newer pane.
+     */
+    applyAgentRestartReplaced: (
+      state,
+      action: PayloadAction<AgentRestartReplacedMessage>,
+    ) => {
+      const replacement = action.payload
+      for (const [tabId, root] of Object.entries(state.layouts)) {
+        let changed = false
+        const replace = (node: PaneNode): PaneNode => {
+          if (node.type === 'split') {
+            const left = replace(node.children[0])
+            const right = replace(node.children[1])
+            if (left === node.children[0] && right === node.children[1]) return node
+            return { ...node, children: [left, right] }
+          }
+          if (!paneMatchesAgentRuntimeReplacement(node.content, replacement)) return node
+
+          changed = true
+          if (node.content.kind === 'terminal') {
+            // Commit the generation before the live ID so a render/effect
+            // always observes a fully fenced descriptor.
+            node.content.runtimeGeneration = replacement.generation
+            node.content.runtimeId = replacement.runtimeId
+            node.content.terminalId = replacement.runtimeId
+            node.content.streamId = undefined
+            node.content.status = 'running'
+            node.content.restoreError = undefined
+            // TerminalView intentionally excludes terminalId from its network
+            // effect dependencies because terminal.created attaches inline.
+            // A restart fold uses the existing volatile epoch to trigger the
+            // one replacement rebind without duplicating ordinary attaches.
+            node.content.reconcileEpoch = (node.content.reconcileEpoch ?? 0) + 1
+          } else {
+            node.content.runtimeGeneration = replacement.generation
+            node.content.runtimeId = replacement.runtimeId
+            node.content.sessionId = replacement.runtimeId
+            node.content.status = 'connected'
+            node.content.createError = undefined
+            node.content.restoreError = undefined
+          }
+          return node
+        }
+        state.layouts[tabId] = replace(root)
+        if (changed) reconcileRefreshRequestsForTab(state, tabId)
+      }
+    },
+
     initLayout: (
       state,
       action: PayloadAction<{ tabId: string; content: PaneContentInput; paneId?: string }>
@@ -2193,6 +2267,7 @@ export const panesSlice = createSlice({
 })
 
 export const {
+  applyAgentRestartReplaced,
   initLayout,
   restoreLayout,
   resetLayout,
