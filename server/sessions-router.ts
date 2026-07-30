@@ -5,6 +5,7 @@ import { cleanString } from './utils.js'
 import { makeSessionKey, type CodingCliProviderName } from './coding-cli/types.js'
 import type { CodingCliProvider } from './coding-cli/provider.js'
 import { CodingCliProviderSchema } from '../shared/ws-protocol.js'
+import { DEFAULT_ENABLED_CLI_PROVIDERS } from '../shared/coding-cli-defaults.js'
 import { logger } from './logger.js'
 import { setResponsePerfContext } from './request-logger.js'
 import { cascadeSessionRenameToTerminal } from './rename-cascade.js'
@@ -252,7 +253,7 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
   // The indexer scans ONLY settings-enabled providers, so a disabled
   // provider's sessions can never be found. Report those as UNSEARCHED so
   // "not found" never overclaims. Order matches the canonical provider list.
-  const KNOWN_RESUME_PROVIDERS = ['claude', 'codex', 'opencode', 'amplifier'] as const
+  const KNOWN_RESUME_PROVIDERS = DEFAULT_ENABLED_CLI_PROVIDERS
 
   router.post('/sessions/resolve', async (req, res) => {
     const parsed = ResumeResolveRequestSchema.safeParse(req.body ?? {})
