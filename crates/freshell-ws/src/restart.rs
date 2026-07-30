@@ -1311,6 +1311,19 @@ impl RestartCoordinator {
             return outcome;
         }
 
+        // A distinct requester can race the transaction owner with the exact
+        // same locator + old runtime generation. The locator lock intentionally
+        // makes the follower wait for that one teardown/replacement. Once it
+        // enters, adopt the owner's durable successful result under the
+        // follower's own request id instead of misclassifying the now-replaced
+        // generation as stale.
+        if let Some(outcome) = self.join_completed_replacement(&request) {
+            for message in &outcome.messages {
+                emit(message);
+            }
+            return outcome;
+        }
+
         let expected = RuntimeDescriptor {
             runtime_id: request.live_id.clone(),
             generation: request.expected_generation,
@@ -1546,6 +1559,55 @@ impl RestartCoordinator {
             messages: vec![started, terminal],
             replayed: false,
         }
+    }
+
+    fn join_completed_replacement(&self, request: &AgentRestart) -> Option<RestartOutcome> {
+        let joined = {
+            let ownership = self.ownership.lock().expect("restart ownership lock");
+            ownership.results.values().find_map(|stored| {
+                let same_old_runtime = stored.fingerprint.provider == request.provider
+                    && stored.fingerprint.session_id == request.session_id
+                    && stored.fingerprint.kind == request.kind
+                    && stored.fingerprint.live_id == request.live_id
+                    && stored.fingerprint.expected_generation == request.expected_generation;
+                if !same_old_runtime {
+                    return None;
+                }
+                match &stored.terminal {
+                    ServerMessage::AgentRestartReplaced(replaced) => {
+                        let mut correlated = replaced.clone();
+                        correlated.request_id = request.request_id.clone();
+                        Some(ServerMessage::AgentRestartReplaced(correlated))
+                    }
+                    _ => None,
+                }
+            })
+        }?;
+
+        if let Err(error) = self.try_update_ownership("join_completed_replacement", |ownership| {
+            self.insert_result_locked(ownership, request, joined.clone());
+        }) {
+            return Some(self.persistence_failure(
+                request,
+                RuntimeDescriptor {
+                    runtime_id: request.live_id.clone(),
+                    generation: request.expected_generation,
+                },
+                error,
+            ));
+        }
+        tracing::info!(
+            request_id = %request.request_id,
+            provider = %request.provider,
+            session_id = %request.session_id,
+            old_runtime_id = %request.live_id,
+            old_generation = request.expected_generation,
+            "agent.restart.joined"
+        );
+        Some(RestartOutcome {
+            messages: vec![joined],
+            replayed: true,
+        })
     }
 
     async fn recover_pending_with_events<R, F>(

@@ -388,3 +388,39 @@ Expected: diff check is silent; commit only if verification changed one of those
     — passed.
 - No Node backend changes, external provider processes, or live-port
   operations were used.
+
+#### Final review iteration 4 — 2026-07-30
+
+- Claude/Kilroy restart teardown now reaches a full quiescence barrier before
+  it releases durable bindings or reports success:
+  - captures the ownership-tagged sidecar/CLI tree while the sidecar is still
+    the server's child;
+  - uses bounded SIGTERM-to-SIGKILL escalation and PID/start-time confirmation;
+  - awaits stdout-consumer cancellation and direct-child reaping;
+  - fails closed, with structured diagnostics, if any barrier is unconfirmed.
+- The active-turn regression proves that no predecessor event or durable write
+  occurs after restart shutdown returns and that an ownership-tagged,
+  SIGTERM-resistant CLI descendant is dead before the replacement lease opens.
+- Distinct request IDs for the same locator and old runtime generation now join
+  the completed transaction after the locator lock. The follower receives and
+  durably stores a successful `agent.restart.replaced` terminal result
+  correlated to its own request ID. Reconnect and coordinator-reopen replay do
+  not repeat teardown.
+- Red/green and focused regression evidence:
+  - `cargo test -p freshell-freshagent restart_shutdown_quiesces_active_consumer_and_owned_cli_before_success -- --nocapture`
+  - `cargo test -p freshell-ws --test restart_protocol concurrent_distinct_requests_for_one_old_runtime_share_the_replacement -- --nocapture`
+  - `cargo test -p freshell-ws --test restart_protocol two_clients_with_distinct_requests_share_one_restart_and_reconnect_replays_follower -- --nocapture`
+- Full impacted verification:
+  - `cargo test -p freshell-freshagent --lib` — 328 passed.
+  - `cargo test -p freshell-ws --test restart_protocol` — 44 passed.
+  - `cargo fmt --all -- --check` — passed.
+  - `cargo clippy -p freshell-freshagent -p freshell-ws --all-targets -- -A clippy::too_many_arguments -D warnings`
+    — passed.
+- Broader `cargo test -p freshell-ws` runs progressed through the changed
+  restart target but did not complete because three unrelated timing fixtures
+  failed on separate runs (`configured_plain_codex_restart_keeps_app_server_settings_off_cli_argv`,
+  `crashing_agent_is_resumed_twice_then_settles_exited`, and
+  `in_tui_fork_rebinds_the_pane_identity`). Each passed immediately when rerun
+  alone; the full restart target remained 44/44 throughout.
+- No Node backend changes, external provider processes, or live-port
+  operations were used.

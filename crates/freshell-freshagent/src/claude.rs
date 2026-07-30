@@ -72,6 +72,12 @@ const PROVIDER: &str = "claude";
 const CLAUDE_SIDECAR_OWNERSHIP_ENV: &str = "FRESHELL_CLAUDE_SIDECAR_ID";
 /// Cold-boot budget for the sidecar to answer the `create` request (`created`).
 const SIDECAR_CREATE_BUDGET: Duration = Duration::from_secs(45);
+/// The consumer has no blocking work after cancellation; this bound prevents a
+/// broken task from holding the restart transaction forever.
+const RESTART_CONSUMER_JOIN_BUDGET: Duration = Duration::from_secs(1);
+/// `kill_and_confirm_tree_dead` already bounds signal escalation. This separate
+/// wait reaps the direct child so shutdown success never leaves a zombie.
+const RESTART_CHILD_REAP_BUDGET: Duration = Duration::from_secs(1);
 
 /// Shared, cheaply-cloneable freshclaude WS state (mergeable into the server app + WsState).
 #[derive(Clone)]
@@ -681,16 +687,69 @@ impl FreshClaudeState {
             return false;
         };
 
-        session.consumer.abort();
-        let mut stdin = session.stdin;
-        let _ = stdin.write_all(b"{\"type\":\"shutdown\"}\n").await;
-        let _ = stdin.flush().await;
-        if let Some(pid) = session.child.id() {
-            terminate_pid(pid as i32);
+        let ClaudeSession {
+            stdin,
+            mut child,
+            ownership_id,
+            mut consumer,
+            ..
+        } = session;
+        drop(stdin);
+
+        // Capture the ownership-tagged process tree while the sidecar is still
+        // our child, then use the shared bounded SIGTERM -> SIGKILL escalation.
+        // This must happen before closing the stdout reader: a noisy sidecar
+        // can otherwise exit on EPIPE and reparent its CLI before Linux/YAMA
+        // lets us capture the inherited ownership tag.
+        let tree_dead = match child.id() {
+            Some(pid) => {
+                crate::session_lease::kill_and_confirm_tree_dead(
+                    pid,
+                    CLAUDE_SIDECAR_OWNERSHIP_ENV,
+                    &ownership_id,
+                )
+                .await
+            }
+            None => child.try_wait().ok().flatten().is_some(),
+        };
+
+        // Cancellation is not a quiescence barrier until the JoinHandle has
+        // completed. In particular, the consumer may be inside an awaited
+        // durable identity write when restart begins.
+        consumer.abort();
+        let consumer_quiesced = tokio::time::timeout(RESTART_CONSUMER_JOIN_BUDGET, &mut consumer)
+            .await
+            .is_ok();
+
+        if !tree_dead {
+            let _ = child.start_kill();
         }
-        let mut child = session.child;
-        let _ = child.start_kill();
-        reap_owned_claude_sidecars(&session.ownership_id);
+        let mut child_reaped = matches!(
+            tokio::time::timeout(RESTART_CHILD_REAP_BUDGET, child.wait()).await,
+            Ok(Ok(_))
+        );
+        if !child_reaped {
+            let _ = child.start_kill();
+            child_reaped = matches!(
+                tokio::time::timeout(RESTART_CHILD_REAP_BUDGET, child.wait()).await,
+                Ok(Ok(_))
+            );
+        }
+        // Only after every captured process is confirmed dead and the direct
+        // child is reaped may the durable lease be reopened.
+        if !(consumer_quiesced && tree_dead && child_reaped) {
+            tracing::error!(
+                provider = PROVIDER,
+                session_id = durable_session_id,
+                runtime_id = expected_runtime_id,
+                ownership_id,
+                consumer_quiesced,
+                tree_dead,
+                child_reaped,
+                "freshagent.claude.restart_shutdown_not_quiescent"
+            );
+            return false;
+        }
 
         self.create_dedup
             .clear_for_session(|record| record.session_id == map_key)
@@ -1788,6 +1847,132 @@ pub(crate) mod tests {
             st.leases.claim(PROVIDER, durable, "replacement", 3),
             crate::session_lease::FreshSessionClaim::Acquired,
             "successful explicit restart teardown must reopen the durable lease"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restart_shutdown_quiesces_active_consumer_and_owned_cli_before_success() {
+        let (st, mut rx) = state_with_bus();
+        let temp = tempfile::tempdir().unwrap();
+        let write_log = temp.path().join("durable-writes.log");
+        let descendant_pid = temp.path().join("descendant.pid");
+        let ownership_id = format!("test-active-restart-{}", uuid::Uuid::new_v4());
+        let script = r#"
+trap '' TERM
+(
+  trap '' TERM
+  echo "$BASHPID" > "$FRESHELL_TEST_DESCENDANT_PID"
+  while true; do
+    echo durable-write >> "$FRESHELL_TEST_DURABLE_WRITE_LOG"
+    echo '{"type":"sdk.message.delta","delta":{"text":"old"}}'
+    read -r -t 0.01 _ || true
+  done
+) &
+wait
+"#;
+        let mut child = tokio::process::Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .env(CLAUDE_SIDECAR_OWNERSHIP_ENV, &ownership_id)
+            .env("FRESHELL_TEST_DURABLE_WRITE_LOG", &write_log)
+            .env("FRESHELL_TEST_DESCENDANT_PID", &descendant_pid)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn active fake sidecar");
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let runtime = freshell_protocol::RuntimeDescriptor {
+            runtime_id: "fresh-runtime-active-restart".to_string(),
+            generation: 1,
+        };
+        let consumer = st.spawn_consumer(
+            BufReader::new(stdout).lines(),
+            "active-restart".to_string(),
+            "freshclaude".to_string(),
+            "active-restart".to_string(),
+            None,
+            Arc::new(std::sync::Mutex::new("active-restart".to_string())),
+            runtime.clone(),
+        );
+        st.sessions.lock().await.insert(
+            "active-restart".to_string(),
+            ClaudeSession {
+                runtime,
+                session_type: SessionType::Freshclaude,
+                stdin,
+                child,
+                ownership_id,
+                consumer,
+                sidecar_session_id: "active-restart".to_string(),
+                cli_session_id: Some("active-restart".to_string()),
+                broadcast_id: Arc::new(std::sync::Mutex::new("active-restart".to_string())),
+            },
+        );
+        st.cli_index
+            .lock()
+            .await
+            .insert("active-restart".to_string(), "active-restart".to_string());
+        assert_eq!(
+            st.leases.claim(PROVIDER, "active-restart", "original", 1),
+            crate::session_lease::FreshSessionClaim::Acquired
+        );
+        assert!(st
+            .leases
+            .complete(PROVIDER, "active-restart", "original", "active-restart"));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !descendant_pid.exists() || !write_log.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "active fake CLI did not start"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let pid: i32 = std::fs::read_to_string(&descendant_pid)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        let stopped = st
+            .shutdown_for_restart("active-restart", "fresh-runtime-active-restart")
+            .await;
+        while rx.try_recv().is_ok() {}
+        let writes_at_return = std::fs::metadata(&write_log).unwrap().len();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let writes_after_grace = std::fs::metadata(&write_log).unwrap().len();
+        let predecessor_event_after_return = rx.try_recv().ok();
+        let descendant_alive = unsafe { libc::kill(pid, 0) == 0 };
+        if descendant_alive {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+
+        assert!(
+            stopped,
+            "restart shutdown must confirm the owned tree is dead"
+        );
+        assert!(
+            !descendant_alive,
+            "shutdown success must not leave an owned active-turn CLI descendant"
+        );
+        assert_eq!(
+            writes_at_return, writes_after_grace,
+            "the predecessor must not write durable state after shutdown returns"
+        );
+        assert!(
+            predecessor_event_after_return.is_none(),
+            "the cancelled predecessor consumer must not broadcast after shutdown returns"
+        );
+        assert_eq!(
+            st.leases
+                .claim(PROVIDER, "active-restart", "replacement", 2),
+            crate::session_lease::FreshSessionClaim::Acquired,
+            "the durable lease reopens only after full quiescence"
         );
     }
 

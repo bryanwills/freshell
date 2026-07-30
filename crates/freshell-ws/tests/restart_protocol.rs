@@ -15,7 +15,7 @@ use freshell_ws::restart::{
     ProductionFreshResumePlan, ProductionFreshRuntime, RestartCoordinator, RestartFailure,
     RestartResumeContext, RestartRuntime, RuntimeLocator,
 };
-use futures_util::SinkExt;
+use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
@@ -360,6 +360,60 @@ async fn resend_after_requester_disconnect_replays_the_stored_terminal_result() 
         1,
         "replay must not run teardown twice"
     );
+}
+
+#[tokio::test]
+async fn concurrent_distinct_requests_for_one_old_runtime_share_the_replacement() {
+    let temp = tempfile::tempdir().unwrap();
+    let persistence_path = temp.path().join("restart-state.json");
+    let coordinator = RestartCoordinator::new_persistent(persistence_path.clone()).unwrap();
+    coordinator.register_initial(locator(), "term-1");
+    let runtime = Arc::new(FakeRuntime::resumable("term-2"));
+    let first_request = restart("r1", "term-1", 1);
+    let second_request = restart("r2", "term-1", 1);
+
+    let (first, second) = tokio::join!(
+        coordinator.execute(first_request, runtime.as_ref()),
+        coordinator.execute(second_request.clone(), runtime.as_ref()),
+    );
+
+    let first_replaced = first
+        .messages
+        .iter()
+        .find_map(|message| match message {
+            ServerMessage::AgentRestartReplaced(replaced) => Some(replaced),
+            _ => None,
+        })
+        .expect("transaction owner receives replacement");
+    let second_replaced = second
+        .messages
+        .iter()
+        .find_map(|message| match message {
+            ServerMessage::AgentRestartReplaced(replaced) => Some(replaced),
+            _ => None,
+        })
+        .expect("transaction follower receives correlated replacement");
+    assert_eq!(first_replaced.request_id, "r1");
+    assert_eq!(second_replaced.request_id, "r2");
+    assert_eq!(first_replaced.old_runtime, second_replaced.old_runtime);
+    assert_eq!(first_replaced.runtime, second_replaced.runtime);
+    assert_eq!(
+        runtime.shutdowns.load(Ordering::SeqCst),
+        1,
+        "distinct request ids for the same old generation must share one teardown"
+    );
+
+    let reopened = RestartCoordinator::new_persistent(persistence_path).unwrap();
+    let replay = reopened.execute(second_request, runtime.as_ref()).await;
+    assert!(replay.replayed);
+    assert!(matches!(
+        replay.messages.as_slice(),
+        [ServerMessage::AgentRestartReplaced(replaced)]
+            if replaced.request_id == "r2"
+                && replaced.runtime.runtime_id == "term-2"
+                && replaced.runtime.generation == 2
+    ));
+    assert_eq!(runtime.shutdowns.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -1497,6 +1551,58 @@ impl RestartRuntime for ConcurrentRuntime {
     }
 }
 
+struct GatedSharedRuntime {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    shutdowns: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl RestartRuntime for GatedSharedRuntime {
+    type ResumePlan = ();
+
+    async fn preflight(&self, _request: &AgentRestart) -> Result<(), RestartFailure> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(())
+    }
+
+    async fn shutdown_for_restart(
+        &self,
+        _request: &AgentRestart,
+        _plan: &(),
+    ) -> Result<(), RestartFailure> {
+        self.shutdowns.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn create_replacement(
+        &self,
+        _request: &AgentRestart,
+        _plan: (),
+    ) -> Result<String, RestartFailure> {
+        Ok("term-shared-replacement".to_string())
+    }
+}
+
+async fn next_restart_replaced_for(ws: &mut common::TestWs, request_id: &str) -> serde_json::Value {
+    for _ in 0..40u8 {
+        let message = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for replacement {request_id}"))
+            .expect("restart websocket remains connected")
+            .expect("restart websocket frame");
+        let WsMessage::Text(text) = message else {
+            continue;
+        };
+        let frame: serde_json::Value = serde_json::from_str(&text).expect("json frame");
+        if frame["type"] == "agent.restart.replaced" && frame["requestId"] == request_id {
+            return frame;
+        }
+    }
+    panic!("no correlated replacement for {request_id}");
+}
+
 #[tokio::test]
 async fn unrelated_provider_runtimes_restart_concurrently() {
     let coordinator = RestartCoordinator::new();
@@ -1529,6 +1635,84 @@ async fn unrelated_provider_runtimes_restart_concurrently() {
     })
     .await
     .expect("unrelated runtime locks must not serialize each other");
+}
+
+#[tokio::test]
+async fn two_clients_with_distinct_requests_share_one_restart_and_reconnect_replays_follower() {
+    let (url, registry, state) = common::spawn_server_with_specs_and_state(vec![]).await;
+    let runtime = Arc::new(GatedSharedRuntime {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        shutdowns: AtomicUsize::new(0),
+    });
+    let _runtime_registration = state.restart.set_runtime(runtime.clone());
+    state.restart.register_initial(locator(), "term-shared-old");
+    let capabilities = Some(serde_json::json!({ "agentRestartV1": true }));
+    let (mut owner_ws, _) =
+        common::connect_and_capture_inventory_with_capabilities(&url, capabilities.clone()).await;
+    let (mut follower_ws, _) =
+        common::connect_and_capture_inventory_with_capabilities(&url, capabilities.clone()).await;
+
+    owner_ws
+        .send(WsMessage::Text(
+            serde_json::to_string(&ClientMessage::AgentRestart(restart(
+                "two-client-owner",
+                "term-shared-old",
+                1,
+            )))
+            .unwrap(),
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        runtime.entered.notified(),
+    )
+    .await
+    .expect("owner reached preflight");
+
+    let follower_request = restart("two-client-follower", "term-shared-old", 1);
+    follower_ws
+        .send(WsMessage::Text(
+            serde_json::to_string(&ClientMessage::AgentRestart(follower_request.clone())).unwrap(),
+        ))
+        .await
+        .unwrap();
+    let accepted_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while state.restart.retained_lock_counts().0 < 2 {
+        assert!(
+            tokio::time::Instant::now() < accepted_deadline,
+            "follower request was not accepted before owner release"
+        );
+        tokio::task::yield_now().await;
+    }
+    runtime.release.notify_waiters();
+
+    let owner = next_restart_replaced_for(&mut owner_ws, "two-client-owner").await;
+    let follower = next_restart_replaced_for(&mut follower_ws, "two-client-follower").await;
+    assert_eq!(owner["runtimeId"], "term-shared-replacement");
+    assert_eq!(follower["runtimeId"], owner["runtimeId"]);
+    assert_eq!(follower["generation"], owner["generation"]);
+    assert_eq!(runtime.shutdowns.load(Ordering::SeqCst), 1);
+
+    drop(follower_ws);
+    let (mut reconnected, _) =
+        common::connect_and_capture_inventory_with_capabilities(&url, capabilities).await;
+    reconnected
+        .send(WsMessage::Text(
+            serde_json::to_string(&ClientMessage::AgentRestart(follower_request)).unwrap(),
+        ))
+        .await
+        .unwrap();
+    let replay = next_restart_replaced_for(&mut reconnected, "two-client-follower").await;
+    assert_eq!(replay["runtimeId"], "term-shared-replacement");
+    assert_eq!(replay["generation"], 2);
+    assert_eq!(
+        runtime.shutdowns.load(Ordering::SeqCst),
+        1,
+        "reconnect replay must not start a second transaction"
+    );
+    registry.kill_all();
 }
 
 #[tokio::test]
