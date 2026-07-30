@@ -1,5 +1,5 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 
@@ -181,5 +181,125 @@ describe('ResumeSessionDialog', () => {
     const { onClose } = renderDialog()
     fireEvent.keyDown(screen.getByTestId('resume-dialog'), { key: 'Escape' })
     expect(onClose).toHaveBeenCalled()
+  })
+
+  it('ignores STALE responses: a late first response cannot override or auto-resume', async () => {
+    // Overlapping resolves (edit-then-Enter) can deliver out of order; a stale
+    // single-match response must NEVER auto-resume — it could open the WRONG session.
+    let resolveFirst!: (value: unknown) => void
+    apiPost
+      .mockReturnValueOnce(new Promise((resolve) => { resolveFirst = resolve }))
+      .mockReturnValueOnce(ok([]))
+    renderDialog()
+    typeAndResolve('ed2afda6')
+    typeAndResolve(V4)
+    await screen.findByTestId('resume-error')
+    expect(screen.getByTestId('resume-error').textContent).toMatch(/no matching session/i)
+    // The stale FIRST response now arrives with a single match: ignore it.
+    await act(async () => {
+      resolveFirst({ status: 'ready', matches: [match()], hint: null })
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(resumeSessionInTab).not.toHaveBeenCalled()
+    expect(screen.getByTestId('resume-error').textContent).toMatch(/no matching session/i)
+  })
+
+  it('EDITING the input invalidates the previous result: stale resume-anyway cannot act', async () => {
+    // Without this, resolve(A) -> "not found" -> replace text with B ->
+    // "Resume anyway" would still be actionable against STALE id A.
+    apiPost.mockReturnValue(ok([]))
+    renderDialog()
+    typeAndResolve(V4)
+    await screen.findByTestId('resume-anyway-button')
+    fireEvent.change(screen.getByTestId('resume-input'), { target: { value: SES } })
+    expect(screen.queryByTestId('resume-anyway-button')).toBeNull()
+    expect(screen.queryByTestId('resume-error')).toBeNull()
+  })
+
+  it('single match WITHOUT a cwd does NOT auto-resume: asks for a working directory instead', async () => {
+    // Exact-id fallback hits can lack a recorded cwd; the spec requires a
+    // concrete working directory before opening — never auto-open without one.
+    apiPost.mockReturnValue(ok([match({ cwd: undefined })]))
+    renderDialog()
+    typeAndResolve(V7)
+    const row = await screen.findByTestId('resume-match')
+    expect(resumeSessionInTab).not.toHaveBeenCalled()
+    fireEvent.change(screen.getByTestId('resume-anyway-cwd'), { target: { value: '/repo/beta' } })
+    fireEvent.click(row)
+    expect(resumeSessionInTab).toHaveBeenCalledTimes(1)
+    expect(resumeSessionInTab.mock.calls[0][2]).toMatchObject({
+      provider: 'codex',
+      sessionId: V7,
+      cwd: '/repo/beta',
+    })
+  })
+
+  it('cwd-less match with a BLANK working-directory field: confirm is blocked with an inline error', async () => {
+    apiPost.mockReturnValue(ok([match({ cwd: undefined })]))
+    renderDialog()
+    typeAndResolve(V7)
+    const row = await screen.findByTestId('resume-match')
+    fireEvent.change(screen.getByTestId('resume-anyway-cwd'), { target: { value: '   ' } })
+    fireEvent.click(row)
+    expect(resumeSessionInTab).not.toHaveBeenCalled()
+    expect(screen.getByTestId('resume-error').textContent).toMatch(/working directory/i)
+  })
+
+  it('"Resume anyway" is DISABLED while the working-directory field is blank', async () => {
+    apiPost.mockReturnValue(ok([]))
+    renderDialog()
+    typeAndResolve(V4)
+    const anyway = await screen.findByTestId('resume-anyway-button')
+    fireEvent.change(screen.getByTestId('resume-anyway-cwd'), { target: { value: '  ' } })
+    expect(anyway).toBeDisabled()
+    fireEvent.click(anyway)
+    expect(resumeSessionInTab).not.toHaveBeenCalled()
+  })
+
+  it('a NON-ready response never auto-resumes, even with a single cwd match (degraded seam)', async () => {
+    // Pins the ordering the future 'degraded' status depends on: any non-ready
+    // response must be handled as a retry state BEFORE match handling.
+    apiPost.mockReturnValue(Promise.resolve({ status: 'warming', matches: [match()], hint: null }))
+    renderDialog()
+    typeAndResolve(V7)
+    await screen.findByTestId('resume-warming')
+    expect(resumeSessionInTab).not.toHaveBeenCalled()
+  })
+
+  it('traps Tab focus inside the dialog: wraps last→first and first→last (Shift+Tab)', () => {
+    renderDialog()
+    const dialog = screen.getByTestId('resume-dialog')
+    const input = screen.getByTestId('resume-input')
+    const resolveBtn = screen.getByTestId('resume-resolve-button')
+    resolveBtn.focus()
+    fireEvent.keyDown(dialog, { key: 'Tab' })
+    expect(document.activeElement).toBe(input)
+    fireEvent.keyDown(dialog, { key: 'Tab', shiftKey: true })
+    expect(document.activeElement).toBe(resolveBtn)
+  })
+
+  it('locks background scroll while open; restores scroll and focus on close', () => {
+    const outside = document.createElement('button')
+    document.body.appendChild(outside)
+    outside.focus()
+    const store = configureStore({
+      reducer: { connection: () => ({ serverInstanceId: 'srv-1' }) },
+    })
+    const onClose = vi.fn()
+    const { rerender } = render(
+      <Provider store={store}>
+        <ResumeSessionDialog open onClose={onClose} />
+      </Provider>,
+    )
+    expect(document.body.style.overflow).toBe('hidden')
+    rerender(
+      <Provider store={store}>
+        <ResumeSessionDialog open={false} onClose={onClose} />
+      </Provider>,
+    )
+    expect(document.body.style.overflow).toBe('')
+    expect(document.activeElement).toBe(outside)
+    outside.remove()
   })
 })
