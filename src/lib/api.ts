@@ -740,3 +740,34 @@ export async function searchSessions(options: SearchOptions): Promise<SearchResp
 
   return response
 }
+
+export type ResumeResolveMatch = {
+  provider: 'claude' | 'codex' | 'opencode' | 'amplifier'
+  sessionId: string
+  cwd?: string
+  projectPath: string
+  sessionType: string
+  title?: string
+  firstUserMessage?: string
+  lastActivityAt: number
+  matchType: 'exact' | 'prefix'
+  matchedToken: string
+}
+
+export type ResumeResolveResponse = {
+  /** 'degraded' = zero matches AND a provider could not be searched — retry, NOT "not found". */
+  indexState: 'ready' | 'warming' | 'degraded'
+  tokens: string[]
+  agentHint: { provider: ResumeResolveMatch['provider']; source: 'command' | 'word' | 'id-format' } | null
+  homeDir: string
+  /** Providers whose search FAILED (fallback threw, or last index scan failed). */
+  providerErrors: Array<ResumeResolveMatch['provider']>
+  /** Providers DISABLED in settings — not scanned at all; absence claims must name them. */
+  unsearchedProviders: Array<ResumeResolveMatch['provider']>
+  matches: ResumeResolveMatch[]
+}
+
+/** Resume-button resolve (POST /api/sessions/resolve) — see docs/plans/2026-07-29-resume-button-spec.md. */
+export async function resolveResumeInput(input: string): Promise<ResumeResolveResponse> {
+  return api.post<ResumeResolveResponse>('/api/sessions/resolve', { input })
+}
