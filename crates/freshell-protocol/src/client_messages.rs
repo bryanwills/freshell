@@ -137,6 +137,14 @@ pub struct HelloCapabilities {
     /// advertises the capability back (§4.2). Absent for the frozen client.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pane_reconcile_v1: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_reconcile_fresh_agent_v1: Option<bool>,
+    /// Explicit opt-in for the additive restart transaction surface. Because
+    /// protocol v7 servers accept-and-strip unknown hello capabilities, a new
+    /// client can connect to an older v7 server and must wait for the matching
+    /// `ready.capabilities.agentRestartV1` advertisement before sending.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_restart_v1: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

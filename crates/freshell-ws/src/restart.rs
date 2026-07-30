@@ -228,14 +228,13 @@ pub struct RestartCoordinator {
     locator_lock_order: Arc<Mutex<VecDeque<RuntimeLocator>>>,
     request_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     request_lock_order: Arc<Mutex<VecDeque<String>>>,
-    result_limit: usize,
     lock_limit: usize,
     ownership_limit: usize,
     registered_runtime:
         Arc<std::sync::RwLock<Option<std::sync::Weak<dyn RestartRuntime<ResumePlan = ()>>>>>,
 }
 
-const DEFAULT_RESTART_RESULT_LIMIT: usize = 1_024;
+const DEFAULT_RESTART_PERSISTED_GENERATION_LIMIT: usize = 1_024;
 const DEFAULT_RESTART_LOCK_LIMIT: usize = 1_024;
 const DEFAULT_RESTART_OWNERSHIP_LIMIT: usize = 4_096;
 
@@ -270,13 +269,15 @@ impl Default for RestartCoordinator {
 
 impl RestartCoordinator {
     pub fn new() -> Self {
-        let mut coordinator =
-            Self::new_with_limits(DEFAULT_RESTART_RESULT_LIMIT, DEFAULT_RESTART_LOCK_LIMIT);
+        let mut coordinator = Self::new_with_limits(
+            DEFAULT_RESTART_PERSISTED_GENERATION_LIMIT,
+            DEFAULT_RESTART_LOCK_LIMIT,
+        );
         coordinator.ownership_limit = DEFAULT_RESTART_OWNERSHIP_LIMIT;
         coordinator
     }
 
-    pub fn new_with_limits(result_limit: usize, lock_limit: usize) -> Self {
+    pub fn new_with_limits(ownership_limit: usize, lock_limit: usize) -> Self {
         Self {
             ownership: Arc::new(Mutex::new(RuntimeOwnership::default())),
             persistence_path: None,
@@ -285,9 +286,8 @@ impl RestartCoordinator {
             locator_lock_order: Arc::new(Mutex::new(VecDeque::new())),
             request_locks: Arc::new(Mutex::new(HashMap::new())),
             request_lock_order: Arc::new(Mutex::new(VecDeque::new())),
-            result_limit: result_limit.max(1),
             lock_limit: lock_limit.max(1),
-            ownership_limit: result_limit.max(1),
+            ownership_limit: ownership_limit.max(1),
             registered_runtime: Arc::new(std::sync::RwLock::new(None)),
         }
     }
@@ -295,20 +295,20 @@ impl RestartCoordinator {
     pub fn new_persistent(path: impl Into<PathBuf>) -> std::io::Result<Self> {
         Self::new_persistent_with_limits(
             path,
-            DEFAULT_RESTART_RESULT_LIMIT,
+            DEFAULT_RESTART_PERSISTED_GENERATION_LIMIT,
             DEFAULT_RESTART_LOCK_LIMIT,
         )
     }
 
     pub fn new_persistent_with_limits(
         path: impl Into<PathBuf>,
-        result_limit: usize,
+        ownership_limit: usize,
         lock_limit: usize,
     ) -> std::io::Result<Self> {
         let path = path.into();
-        let result_limit = result_limit.max(1);
+        let ownership_limit = ownership_limit.max(1);
         let lock_limit = lock_limit.max(1);
-        let ownership = Self::load_persisted(&path, result_limit)?;
+        let ownership = Self::load_persisted(&path, ownership_limit)?;
         Ok(Self {
             ownership: Arc::new(Mutex::new(ownership)),
             persistence_path: Some(Arc::new(path)),
@@ -317,9 +317,8 @@ impl RestartCoordinator {
             locator_lock_order: Arc::new(Mutex::new(VecDeque::new())),
             request_locks: Arc::new(Mutex::new(HashMap::new())),
             request_lock_order: Arc::new(Mutex::new(VecDeque::new())),
-            result_limit,
             lock_limit,
-            ownership_limit: result_limit,
+            ownership_limit,
             registered_runtime: Arc::new(std::sync::RwLock::new(None)),
         })
     }
@@ -330,7 +329,7 @@ impl RestartCoordinator {
         coordinator
     }
 
-    fn load_persisted(path: &Path, result_limit: usize) -> std::io::Result<RuntimeOwnership> {
+    fn load_persisted(path: &Path, ownership_limit: usize) -> std::io::Result<RuntimeOwnership> {
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -345,9 +344,6 @@ impl RestartCoordinator {
             )
         })?;
         let mut persisted_results = persisted.results;
-        if persisted_results.len() > result_limit {
-            persisted_results.drain(..persisted_results.len().saturating_sub(result_limit));
-        }
         let pending_recoveries: HashMap<_, _> = persisted
             .pending_recoveries
             .into_iter()
@@ -362,8 +358,8 @@ impl RestartCoordinator {
             .map(|entry| entry.request_id.clone())
             .collect();
         let mut generations = persisted.generations;
-        if generations.len() > result_limit {
-            generations.drain(..generations.len().saturating_sub(result_limit));
+        if generations.len() > ownership_limit {
+            generations.drain(..generations.len().saturating_sub(ownership_limit));
         }
         let generation_order = generations
             .iter()
@@ -499,12 +495,11 @@ impl RestartCoordinator {
                 terminal,
             },
         );
-        while ownership.results.len() > self.result_limit {
-            let Some(oldest) = ownership.result_order.pop_front() else {
-                break;
-            };
-            ownership.results.remove(&oldest);
-        }
+        // A terminal restart result is the server's durable reply to a request
+        // that may have lost its socket before delivery. Do not evict it based
+        // on local cache pressure: there is no client acknowledgement or
+        // negotiated expiry protocol yet, so eviction would make an identical
+        // reconnect retry indistinguishable from a brand-new transaction.
     }
 
     pub fn pending_recoveries(&self) -> Vec<PendingRestartRecovery> {
@@ -954,19 +949,11 @@ impl RestartCoordinator {
             }
             ServerMessage::TerminalInventory(frame) => {
                 for terminal in &mut frame.terminals {
-                    terminal.runtime = if terminal.status
-                        == freshell_protocol::TerminalRunStatus::Running
-                    {
-                        self.observe_terminal(
-                            &terminal.terminal_id,
-                            terminal.session_ref.as_ref(),
-                            terminal.runtime.as_ref(),
-                        )
-                    } else {
-                        terminal.runtime.clone().or_else(|| {
-                            self.runtime_for_live(AgentRuntimeKind::Terminal, &terminal.terminal_id)
-                        })
-                    };
+                    terminal.runtime = self.observe_terminal(
+                        &terminal.terminal_id,
+                        terminal.session_ref.as_ref(),
+                        terminal.runtime.as_ref(),
+                    );
                 }
             }
             ServerMessage::TerminalOutput(frame) => {
@@ -1074,20 +1061,20 @@ impl RestartCoordinator {
             }
             ServerMessage::FreshAgentEvent(frame) => {
                 if frame.runtime.is_none() {
-                    frame.runtime = self
+                    let alias = self
                         .ownership
                         .lock()
                         .expect("restart ownership lock")
                         .fresh_event_aliases
                         .get(&(frame.provider.clone(), frame.session_id.clone()))
-                        .cloned()
-                        .or_else(|| {
-                            self.runtime_for_locator(&RuntimeLocator::new(
-                                AgentRuntimeKind::FreshAgent,
-                                &frame.provider,
-                                &frame.session_id,
-                            ))
-                        });
+                        .cloned();
+                    frame.runtime = alias.or_else(|| {
+                        self.runtime_for_locator(&RuntimeLocator::new(
+                            AgentRuntimeKind::FreshAgent,
+                            &frame.provider,
+                            &frame.session_id,
+                        ))
+                    });
                 }
             }
             ServerMessage::PaneReconcileResult(frame) => {
@@ -1114,11 +1101,41 @@ impl RestartCoordinator {
         }
     }
 
+    /// Verify the descriptor portion of the `agentRestartV1` capability
+    /// contract after [`Self::observe_server_message`] enrichment.
+    ///
+    /// Fields remain optional in the protocol types so a new v7 client can
+    /// still parse an older v7 server. Once `ready.capabilities.agentRestartV1`
+    /// is present, these runtime-addressed surfaces are required.
+    pub fn restart_runtime_contract_satisfied(message: &ServerMessage) -> bool {
+        match message {
+            ServerMessage::TerminalCreated(frame) => frame.runtime.is_some(),
+            ServerMessage::TerminalAttachReady(frame) => frame.runtime.is_some(),
+            ServerMessage::TerminalInventory(frame) => frame
+                .terminals
+                .iter()
+                .all(|terminal| terminal.runtime.is_some()),
+            ServerMessage::TerminalOutput(frame) => frame.runtime.is_some(),
+            ServerMessage::TerminalOutputBatch(frame) => frame.runtime.is_some(),
+            ServerMessage::TerminalOutputGap(frame) => frame.runtime.is_some(),
+            ServerMessage::TerminalExit(frame) => frame.runtime.is_some(),
+            ServerMessage::TerminalSessionAssociated(frame) => frame.runtime.is_some(),
+            ServerMessage::FreshAgentCreated(frame) => frame.runtime.is_some(),
+            ServerMessage::FreshAgentEvent(frame) => frame.runtime.is_some(),
+            ServerMessage::FreshAgentSessionMaterialized(frame) => frame.runtime.is_some(),
+            ServerMessage::PaneReconcileResult(frame) => frame.verdicts.iter().all(|verdict| {
+                verdict.verdict != freshell_protocol::ReconcileVerdict::Attach
+                    || verdict.runtime.is_some()
+            }),
+            _ => true,
+        }
+    }
+
     /// Enrich a pre-serialized broadcast frame when it belongs to the typed
     /// protocol. Unknown extension frames pass through byte-for-byte.
-    pub fn observe_serialized(&self, json: &str) -> String {
+    pub fn observe_serialized(&self, json: &str) -> Option<String> {
         let Ok(envelope) = serde_json::from_str::<serde_json::Value>(json) else {
-            return json.to_string();
+            return Some(json.to_string());
         };
         if !matches!(
             envelope.get("type").and_then(serde_json::Value::as_str),
@@ -1129,13 +1146,20 @@ impl RestartCoordinator {
                     | "freshAgent.session.materialized"
             )
         ) {
-            return json.to_string();
+            return Some(json.to_string());
         }
         let Ok(mut message) = serde_json::from_str::<ServerMessage>(json) else {
-            return json.to_string();
+            return Some(json.to_string());
         };
         self.observe_server_message(&mut message);
-        serde_json::to_string(&message).unwrap_or_else(|_| json.to_string())
+        if !Self::restart_runtime_contract_satisfied(&message) {
+            tracing::error!(
+                message = ?message,
+                "agent.restart.runtime_descriptor_contract.failed"
+            );
+            return None;
+        }
+        Some(serde_json::to_string(&message).unwrap_or_else(|_| json.to_string()))
     }
 
     pub fn register_supplied(
@@ -1241,6 +1265,14 @@ impl RestartCoordinator {
                 emit(&outcome.messages[0]);
                 return outcome;
             }
+            if let Some(replacement) = self.runtime_for_locator(&locator).filter(|current| {
+                current.runtime_id != pending.old_runtime.runtime_id
+                    && current.generation > pending.old_runtime.generation
+            }) {
+                return self
+                    .adopt_pending_replacement_with_events(request, pending, replacement, emit)
+                    .await;
+            }
             return self
                 .recover_pending_with_events(request, pending, runtime, emit)
                 .await;
@@ -1323,6 +1355,17 @@ impl RestartCoordinator {
         emit(&started);
 
         if let Err(failure) = runtime.shutdown_for_restart(&request, &plan).await {
+            tracing::warn!(
+                request_id = %request.request_id,
+                provider = %request.provider,
+                session_id = %request.session_id,
+                runtime_id = %expected.runtime_id,
+                generation = expected.generation,
+                code = ?failure.code,
+                retryable = failure.retryable,
+                error = %failure.message,
+                "agent.restart.shutdown.failed"
+            );
             let terminal = self.failure_message(&request, expected.clone(), &failure);
             let persisted = self.try_update_ownership("store_failed_shutdown", |ownership| {
                 ownership.pending_recoveries.remove(&request.request_id);
@@ -1359,6 +1402,17 @@ impl RestartCoordinator {
             Ok(runtime_id) => runtime_id,
             Err(failure) => {
                 if failure.retryable {
+                    tracing::warn!(
+                        request_id = %request.request_id,
+                        provider = %request.provider,
+                        session_id = %request.session_id,
+                        runtime_id = %expected.runtime_id,
+                        generation = expected.generation,
+                        code = ?failure.code,
+                        retryable = true,
+                        error = %failure.message,
+                        "agent.restart.replacement.retryable_failure"
+                    );
                     let failed = self.failure_frame(&request, expected.clone(), &failure);
                     let persisted = self.try_update_ownership(
                         "record_retryable_replacement_failure",
@@ -1407,6 +1461,17 @@ impl RestartCoordinator {
                 AgentRestartFailureCode::ReplacementFailed,
                 "replacement did not produce a distinct live runtime",
                 true,
+            );
+            tracing::warn!(
+                request_id = %request.request_id,
+                provider = %request.provider,
+                session_id = %request.session_id,
+                runtime_id = %expected.runtime_id,
+                generation = expected.generation,
+                code = ?failure.code,
+                retryable = true,
+                error = %failure.message,
+                "agent.restart.replacement.retryable_failure"
             );
             let failed = self.failure_frame(&request, expected.clone(), &failure);
             let persisted =
@@ -1471,6 +1536,17 @@ impl RestartCoordinator {
         {
             Ok(runtime_id) => runtime_id,
             Err(failure) => {
+                tracing::warn!(
+                    request_id = %request.request_id,
+                    provider = %request.provider,
+                    session_id = %request.session_id,
+                    old_runtime_id = %pending.old_runtime.runtime_id,
+                    old_generation = pending.old_runtime.generation,
+                    code = ?failure.code,
+                    retryable = failure.retryable,
+                    error = %failure.message,
+                    "agent.restart.recovery.failed"
+                );
                 let failed = self.failure_frame(&request, pending.old_runtime.clone(), &failure);
                 let persisted = if failure.retryable {
                     self.try_update_ownership("record_retryable_recovery_failure", |ownership| {
@@ -1510,6 +1586,17 @@ impl RestartCoordinator {
                 "replacement did not produce a distinct live runtime",
                 true,
             );
+            tracing::warn!(
+                request_id = %request.request_id,
+                provider = %request.provider,
+                session_id = %request.session_id,
+                old_runtime_id = %pending.old_runtime.runtime_id,
+                old_generation = pending.old_runtime.generation,
+                code = ?failure.code,
+                retryable = true,
+                error = %failure.message,
+                "agent.restart.recovery.failed"
+            );
             let failed = self.failure_frame(&request, pending.old_runtime.clone(), &failure);
             let persisted =
                 self.try_update_ownership("reject_reused_recovery_runtime", |ownership| {
@@ -1547,6 +1634,56 @@ impl RestartCoordinator {
                 };
             }
         };
+        emit(&terminal);
+        RestartOutcome {
+            messages: vec![started, terminal],
+            replayed: false,
+        }
+    }
+
+    async fn adopt_pending_replacement_with_events<F>(
+        &self,
+        request: AgentRestart,
+        pending: PendingRestartRecovery,
+        replacement: RuntimeDescriptor,
+        mut emit: F,
+    ) -> RestartOutcome
+    where
+        F: FnMut(&ServerMessage),
+    {
+        let started = ServerMessage::AgentRestartStarted(AgentRestartStarted {
+            request_id: request.request_id.clone(),
+            provider: request.provider.clone(),
+            session_id: request.session_id.clone(),
+            kind: request.kind,
+            runtime: pending.old_runtime.clone(),
+        });
+        tracing::info!(
+            request_id = %request.request_id,
+            provider = %request.provider,
+            session_id = %request.session_id,
+            old_runtime_id = %pending.old_runtime.runtime_id,
+            old_generation = pending.old_runtime.generation,
+            runtime_id = %replacement.runtime_id,
+            generation = replacement.generation,
+            "agent.restart.recovery.adopting_registered_replacement"
+        );
+        emit(&started);
+        let terminal =
+            match self.commit_replacement(&request, &pending.old_runtime, replacement.runtime_id) {
+                Ok((_replacement, terminal)) => terminal,
+                Err(error) => {
+                    let terminal = self
+                        .persistence_failure(&request, pending.old_runtime, error)
+                        .messages
+                        .remove(0);
+                    emit(&terminal);
+                    return RestartOutcome {
+                        messages: vec![started, terminal],
+                        replayed: false,
+                    };
+                }
+            };
         emit(&terminal);
         RestartOutcome {
             messages: vec![started, terminal],
@@ -1749,18 +1886,135 @@ struct ProductionResumePlan {
     cwd: Option<String>,
 }
 
+/// Narrow production seam over the three fresh-agent runtime managers.
+///
+/// Keeping this seam at the adapter boundary lets integration tests exercise
+/// the real [`ProductionRestartRuntime`] ordering and broadcast correlation
+/// without launching external Claude, Codex, or OpenCode binaries.
+#[async_trait::async_trait]
+pub trait ProductionFreshRuntime: Send + Sync {
+    async fn has_live_session(
+        &self,
+        provider: freshell_protocol::AgentProvider,
+        session_id: &str,
+    ) -> bool;
+
+    async fn shutdown_for_restart(
+        &self,
+        provider: freshell_protocol::AgentProvider,
+        session_id: &str,
+        expected_runtime_id: &str,
+    ) -> bool;
+
+    async fn handle_create(
+        &self,
+        provider: freshell_protocol::AgentProvider,
+        create: freshell_protocol::FreshAgentCreate,
+    );
+}
+
+struct WsStateFreshRuntime {
+    state: crate::WsState,
+}
+
+#[async_trait::async_trait]
+impl ProductionFreshRuntime for WsStateFreshRuntime {
+    async fn has_live_session(
+        &self,
+        provider: freshell_protocol::AgentProvider,
+        session_id: &str,
+    ) -> bool {
+        match provider {
+            freshell_protocol::AgentProvider::Claude => {
+                self.state.fresh_claude.has_live_session(session_id).await
+            }
+            freshell_protocol::AgentProvider::Codex => {
+                self.state.fresh_codex.has_live_session(session_id).await
+            }
+            freshell_protocol::AgentProvider::Opencode => {
+                self.state.fresh_opencode.has_live_session(session_id).await
+            }
+            freshell_protocol::AgentProvider::Amplifier => false,
+        }
+    }
+
+    async fn shutdown_for_restart(
+        &self,
+        provider: freshell_protocol::AgentProvider,
+        session_id: &str,
+        expected_runtime_id: &str,
+    ) -> bool {
+        match provider {
+            freshell_protocol::AgentProvider::Claude => {
+                self.state
+                    .fresh_claude
+                    .shutdown_for_restart(session_id, expected_runtime_id)
+                    .await
+            }
+            freshell_protocol::AgentProvider::Codex => {
+                self.state
+                    .fresh_codex
+                    .shutdown_for_restart(session_id, expected_runtime_id)
+                    .await
+            }
+            freshell_protocol::AgentProvider::Opencode => {
+                self.state
+                    .fresh_opencode
+                    .shutdown_for_restart(session_id, expected_runtime_id)
+                    .await
+            }
+            freshell_protocol::AgentProvider::Amplifier => false,
+        }
+    }
+
+    async fn handle_create(
+        &self,
+        provider: freshell_protocol::AgentProvider,
+        create: freshell_protocol::FreshAgentCreate,
+    ) {
+        match provider {
+            freshell_protocol::AgentProvider::Claude => {
+                self.state.fresh_claude.handle_create(create).await
+            }
+            freshell_protocol::AgentProvider::Codex => {
+                self.state.fresh_codex.handle_create(create).await
+            }
+            freshell_protocol::AgentProvider::Opencode => {
+                self.state.fresh_opencode.handle_create(create).await
+            }
+            freshell_protocol::AgentProvider::Amplifier => {}
+        }
+    }
+}
+
 /// Production adapter that deliberately delegates to the same built-in
 /// terminal restore and fresh-agent resume paths used by ordinary clients.
 pub struct ProductionRestartRuntime {
     state: crate::WsState,
     plans: Mutex<HashMap<String, ProductionResumePlan>>,
+    fresh_runtime: Arc<dyn ProductionFreshRuntime>,
 }
 
 impl ProductionRestartRuntime {
     pub fn new(state: crate::WsState) -> Self {
+        let fresh_runtime = Arc::new(WsStateFreshRuntime {
+            state: state.clone(),
+        });
+        Self::with_fresh_runtime(state, fresh_runtime)
+    }
+
+    /// Construct the production adapter around a faithful fresh-runtime seam.
+    /// Production uses [`Self::new`]; integration tests inject deterministic
+    /// managers while preserving the adapter's real preflight, teardown,
+    /// resume request, broadcast correlation, and generation commit paths.
+    pub fn with_fresh_runtime(
+        state: crate::WsState,
+        fresh_runtime: Arc<dyn ProductionFreshRuntime>,
+    ) -> Self {
         Self {
             state,
             plans: Mutex::new(HashMap::new()),
+            fresh_runtime,
         }
     }
 
@@ -1829,18 +2083,9 @@ impl ProductionRestartRuntime {
         provider: freshell_protocol::AgentProvider,
         session_id: &str,
     ) -> bool {
-        match provider {
-            freshell_protocol::AgentProvider::Claude => {
-                self.state.fresh_claude.has_live_session(session_id).await
-            }
-            freshell_protocol::AgentProvider::Codex => {
-                self.state.fresh_codex.has_live_session(session_id).await
-            }
-            freshell_protocol::AgentProvider::Opencode => {
-                self.state.fresh_opencode.has_live_session(session_id).await
-            }
-            freshell_protocol::AgentProvider::Amplifier => false,
-        }
+        self.fresh_runtime
+            .has_live_session(provider, session_id)
+            .await
     }
 
     async fn create_fresh_replacement(
@@ -1873,18 +2118,7 @@ impl ProductionRestartRuntime {
                 session_id: request.session_id.clone(),
             }),
         };
-        match provider {
-            freshell_protocol::AgentProvider::Claude => {
-                self.state.fresh_claude.handle_create(create).await
-            }
-            freshell_protocol::AgentProvider::Codex => {
-                self.state.fresh_codex.handle_create(create).await
-            }
-            freshell_protocol::AgentProvider::Opencode => {
-                self.state.fresh_opencode.handle_create(create).await
-            }
-            freshell_protocol::AgentProvider::Amplifier => unreachable!(),
-        }
+        self.fresh_runtime.handle_create(provider, create).await;
         loop {
             let frame = tokio::time::timeout(std::time::Duration::from_secs(30), receiver.recv())
                 .await
@@ -2045,27 +2279,10 @@ impl RestartRuntime for ProductionRestartRuntime {
                 }
             }
             AgentRuntimeKind::FreshAgent => {
-                let stopped = match provider {
-                    freshell_protocol::AgentProvider::Claude => {
-                        self.state
-                            .fresh_claude
-                            .shutdown_for_restart(&request.session_id, &request.live_id)
-                            .await
-                    }
-                    freshell_protocol::AgentProvider::Codex => {
-                        self.state
-                            .fresh_codex
-                            .shutdown_for_restart(&request.session_id, &request.live_id)
-                            .await
-                    }
-                    freshell_protocol::AgentProvider::Opencode => {
-                        self.state
-                            .fresh_opencode
-                            .shutdown_for_restart(&request.session_id, &request.live_id)
-                            .await
-                    }
-                    freshell_protocol::AgentProvider::Amplifier => unreachable!(),
-                };
+                let stopped = self
+                    .fresh_runtime
+                    .shutdown_for_restart(provider, &request.session_id, &request.live_id)
+                    .await;
                 if !stopped {
                     return Err(RestartFailure::new(
                         AgentRestartFailureCode::StaleGeneration,

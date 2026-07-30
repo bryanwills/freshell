@@ -403,7 +403,7 @@ pub fn spawn_idle_monitor(
 /// would lose scrollback). On a truly fresh boot the registry is empty, so this stays
 /// byte-identical to the clean-boot handshake the oracle's T0/determinism tiers pin.
 pub fn build_handshake(state: &WsState) -> Vec<ServerMessage> {
-    build_handshake_with_capabilities(state, false, false)
+    build_handshake_with_capabilities(state, false, false, false)
 }
 
 /// [`build_handshake`], parameterized on the connection's negotiated
@@ -415,6 +415,7 @@ pub fn build_handshake_with_capabilities(
     state: &WsState,
     pane_reconcile_v1: bool,
     pane_reconcile_fresh_agent_v1: bool,
+    agent_restart_v1: bool,
 ) -> Vec<ServerMessage> {
     let boot_id = state.boot_id.as_ref().clone();
     let mut messages = vec![
@@ -422,12 +423,12 @@ pub fn build_handshake_with_capabilities(
             timestamp: now_iso(),
             boot_id: Some(boot_id.clone()),
             server_instance_id: Some(state.server_instance_id.as_ref().clone()),
-            capabilities: (pane_reconcile_v1 || pane_reconcile_fresh_agent_v1).then_some(
-                freshell_protocol::ReadyCapabilities {
+            capabilities: (pane_reconcile_v1 || pane_reconcile_fresh_agent_v1 || agent_restart_v1)
+                .then_some(freshell_protocol::ReadyCapabilities {
                     pane_reconcile_v1: pane_reconcile_v1.then_some(true),
                     pane_reconcile_fresh_agent_v1: pane_reconcile_fresh_agent_v1.then_some(true),
-                },
-            ),
+                    agent_restart_v1: agent_restart_v1.then_some(true),
+                }),
         }),
         ServerMessage::SettingsUpdated(SettingsUpdated {
             settings: state.settings.as_ref().clone(),
@@ -639,10 +640,23 @@ async fn handle_socket(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // Restart transactions are additive within protocol v7. The matching
+    // ready advertisement is the positive version guard: older v7 servers
+    // strip this unknown hello key and therefore never authorize a new client
+    // to send `agent.restart`.
+    let agent_restart_v1 = value
+        .get("capabilities")
+        .and_then(|c| c.get("agentRestartV1"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     // Authenticated: emit the ordered handshake.
-    for msg in
-        build_handshake_with_capabilities(&state, pane_reconcile_v1, pane_reconcile_fresh_agent_v1)
-    {
+    for msg in build_handshake_with_capabilities(
+        &state,
+        pane_reconcile_v1,
+        pane_reconcile_fresh_agent_v1,
+        agent_restart_v1,
+    ) {
         let json = match serde_json::to_string(&msg) {
             Ok(json) => json,
             Err(_) => return,
@@ -680,6 +694,7 @@ async fn handle_socket(
         ui_screenshot_v1,
         pane_reconcile_v1,
         pane_reconcile_fresh_agent_v1,
+        agent_restart_v1,
         origin_kind,
     )
     .await;
@@ -872,7 +887,7 @@ mod tests {
     #[test]
     fn handshake_advertises_pane_reconcile_only_when_negotiated() {
         let s = state();
-        let negotiated = build_handshake_with_capabilities(&s, true, false);
+        let negotiated = build_handshake_with_capabilities(&s, true, false, false);
         let ready = serde_json::to_value(&negotiated[0]).unwrap();
         assert_eq!(
             ready["capabilities"],
@@ -886,9 +901,27 @@ mod tests {
             "non-negotiating hello must not change ready's shape: {ready}"
         );
         // Same shape as an explicit `false` negotiation.
-        let unnegotiated = build_handshake_with_capabilities(&s, false, false);
+        let unnegotiated = build_handshake_with_capabilities(&s, false, false, false);
         let ready2 = serde_json::to_value(&unnegotiated[0]).unwrap();
         assert!(ready2.get("capabilities").is_none());
+    }
+
+    #[test]
+    fn handshake_advertises_restart_only_when_negotiated() {
+        let s = state();
+        let upgraded = build_handshake_with_capabilities(&s, false, false, true);
+        let ready = serde_json::to_value(&upgraded[0]).unwrap();
+        assert_eq!(
+            ready["capabilities"],
+            serde_json::json!({ "agentRestartV1": true })
+        );
+
+        let older_v7_shape = build_handshake_with_capabilities(&s, false, false, false);
+        let ready = serde_json::to_value(&older_v7_shape[0]).unwrap();
+        assert!(
+            ready.get("capabilities").is_none(),
+            "an older v7 server has no positive restart negotiation"
+        );
     }
 
     #[test]

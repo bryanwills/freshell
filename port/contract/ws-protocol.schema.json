@@ -625,6 +625,10 @@
             "capabilities": {
               "additionalProperties": false,
               "properties": {
+                "agentRestartV1": {
+                  "const": true,
+                  "type": "boolean"
+                },
                 "paneReconcileFreshAgentV1": {
                   "const": true,
                   "type": "boolean"
@@ -3744,6 +3748,10 @@
         "capabilities": {
           "additionalProperties": false,
           "properties": {
+            "agentRestartV1": {
+              "const": true,
+              "type": "boolean"
+            },
             "paneReconcileFreshAgentV1": {
               "const": true,
               "type": "boolean"
@@ -4299,6 +4307,10 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
+        "agentRestartV1": {
+          "const": true,
+          "type": "boolean"
+        },
         "paneReconcileFreshAgentV1": {
           "const": true,
           "type": "boolean"

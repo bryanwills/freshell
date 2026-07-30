@@ -757,19 +757,27 @@ pub type TestWs =
 /// handshake frame (the 4th handshake message; `config_fallback` is None in
 /// this harness, so the handshake is exactly 4 frames).
 pub async fn connect_and_capture_inventory(url: &str) -> (TestWs, serde_json::Value) {
+    connect_and_capture_inventory_with_capabilities(url, None).await
+}
+
+pub async fn connect_and_capture_inventory_with_capabilities(
+    url: &str,
+    capabilities: Option<serde_json::Value>,
+) -> (TestWs, serde_json::Value) {
     let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
         .await
         .expect("ws connect");
-    ws.send(WsMessage::Text(
-        serde_json::json!({
-            "type": "hello",
-            "token": AUTH_TOKEN,
-            "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
-        })
-        .to_string(),
-    ))
-    .await
-    .expect("send hello");
+    let mut hello = serde_json::json!({
+        "type": "hello",
+        "token": AUTH_TOKEN,
+        "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
+    });
+    if let Some(capabilities) = capabilities {
+        hello["capabilities"] = capabilities;
+    }
+    ws.send(WsMessage::Text(hello.to_string()))
+        .await
+        .expect("send hello");
 
     let mut inventory = serde_json::Value::Null;
     for _ in 0..4u8 {

@@ -1599,6 +1599,9 @@
         "capabilities": {
           "additionalProperties": false,
           "properties": {
+            "agentRestartV1": {
+              "type": "boolean"
+            },
             "paneReconcileFreshAgentV1": {
               "type": "boolean"
             },

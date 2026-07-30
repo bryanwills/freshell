@@ -60,6 +60,13 @@ export const RuntimeDescriptorSchema = z.object({
   generation: z.number().int().nonnegative(),
 })
 export type RuntimeDescriptor = z.infer<typeof RuntimeDescriptorSchema>
+/**
+ * Runtime fields remain optional on legacy v7 message shapes solely so an
+ * upgraded client can parse older v7 servers. After a ready frame advertises
+ * `capabilities.agentRestartV1`, the upgraded server guarantees descriptors on
+ * terminal create/attach/inventory/reconcile/output/exit and fresh-agent
+ * create/materialize/event/reconcile runtime surfaces.
+ */
 
 // ──────────────────────────────────────────────────────────────
 // Terminal metadata schemas (used in both directions)
@@ -286,6 +293,10 @@ export const HelloSchema = z.object({
     // STRIP unknown keys, so without this the capability would silently no-op.
     paneReconcileV1: z.literal(true).optional(),
     paneReconcileFreshAgentV1: z.literal(true).optional(),
+    // A v7 client must wait for the matching ready advertisement. Older v7
+    // servers strip this unknown hello key and therefore safely look
+    // unsupported to the upgraded client.
+    agentRestartV1: z.literal(true).optional(),
   }).optional(),
   client: z.object({
     mobile: z.boolean().optional(),
@@ -665,6 +676,7 @@ export const ReadyCapabilitiesSchema = z
   .object({
     paneReconcileV1: z.literal(true).optional(),
     paneReconcileFreshAgentV1: z.literal(true).optional(),
+    agentRestartV1: z.literal(true).optional(),
   })
   .optional()
 

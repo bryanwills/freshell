@@ -127,6 +127,7 @@ pub async fn run(
     ui_screenshot_v1: bool,
     pane_reconcile_v1: bool,
     pane_reconcile_fresh_agent_v1: bool,
+    agent_restart_v1: bool,
     origin_kind: &'static str,
 ) {
     let (mut ws_tx, mut ws_rx) = socket.split();
@@ -173,6 +174,13 @@ pub async fn run(
         let restart = state.restart.clone();
         Arc::new(move |mut msg| {
             restart.observe_server_message(&mut msg);
+            if !crate::restart::RestartCoordinator::restart_runtime_contract_satisfied(&msg) {
+                tracing::error!(
+                    message = ?msg,
+                    "agent.restart.runtime_descriptor_contract.failed"
+                );
+                return;
+            }
             if let Some(msg) = output_queue.route(msg) {
                 let _ = tx.send(msg);
             }
@@ -273,6 +281,7 @@ pub async fn run(
                             terminal_output_batch_v1,
                             pane_reconcile_v1,
                             pane_reconcile_fresh_agent_v1,
+                            agent_restart_v1,
                             &mut create_limiter,
                             &create_cancel_rx,
                         )
@@ -377,7 +386,9 @@ pub async fn run(
                 match frame {
                     // A pre-serialized server→client frame — forward it verbatim.
                     Ok(json) => {
-                        let json = state.restart.observe_serialized(&json);
+                        let Some(json) = state.restart.observe_serialized(&json) else {
+                            continue;
+                        };
                         if ws_tx.send(Message::Text(json.into())).await.is_err() {
                             close_reason = "send_error";
                             break;
@@ -488,6 +499,7 @@ async fn handle_client_text(
     terminal_output_batch_v1: bool,
     pane_reconcile_v1: bool,
     pane_reconcile_fresh_agent_v1: bool,
+    agent_restart_v1: bool,
     create_limiter: &mut crate::create_limit::CreateRateLimiter,
     create_cancel_rx: &tokio::sync::watch::Receiver<bool>,
 ) -> bool {
@@ -694,6 +706,15 @@ async fn handle_client_text(
         }
         ClientMessage::TerminalKill(kill) => handle_kill(kill, ws_tx, state).await,
         ClientMessage::AgentRestart(request) => {
+            if !agent_restart_v1 {
+                tracing::warn!(
+                    request_id = %request.request_id,
+                    provider = %request.provider,
+                    session_id = %request.session_id,
+                    "agent.restart.rejected_unnegotiated"
+                );
+                return true;
+            }
             let restart = state.restart.clone();
             let broadcast_tx = Arc::clone(&state.broadcast_tx);
             tokio::spawn(async move {

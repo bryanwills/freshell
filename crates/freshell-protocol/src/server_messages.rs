@@ -869,6 +869,11 @@ pub struct ReadyCapabilities {
     /// omitted from the wire entirely otherwise (frozen-client inertness).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pane_reconcile_fresh_agent_v1: Option<bool>,
+    /// Restart transaction support. A v7 client must treat absence as
+    /// unsupported and must not send `agent.restart`; older v7 servers simply
+    /// strip the hello opt-in and omit this advertisement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_restart_v1: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
