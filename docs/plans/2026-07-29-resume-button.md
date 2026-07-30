@@ -25,7 +25,7 @@
 - Deployment reality (AGENTS.md "Rust Server (Self-Hosted Production)"): the canonical self-hosted production deployment is the **Rust server** on port 3002, which serves the same `dist/client` from disk but has **no** `/api/sessions/resolve` route. Per spec, this feature's API is implemented on the Node server only (the Rust `IndexExistenceProbe` is NOT this feature's API) — so the client MUST degrade gracefully when the endpoint is missing: a 404 from resolve shows an explicit "this server build does not support resume-by-id" error (never a generic failure, never a broken-looking button). Rust parity is a recorded follow-up (Task 1 verification log), not a silent scope cut.
 - Id-family case rules: UUID/hex tokens compare and dedupe **case-insensitively**; `ses_` + base62 ids are **case-SENSITIVE** everywhere (base62 upper/lower case are distinct values — two ids differing only in case are different sessions).
 - Server work budget: resolve requests are bounded — candidate tokens capped (`MAX_RESUME_CANDIDATES`), exact-id fallbacks gated on strict id shape and limited per request, and the opencode by-id busy timeout is short (500 ms). One request must never stall the event loop for a prolonged period.
-- Repo: TDD red-green-refactor for every task; run tests via the coordinated wrapper `npm run test:vitest -- --config <config> <files> --run` (check `npm run test:status` before broad runs).
+- Repo: TDD red-green-refactor for every unit of new behavior: each test file is WRITTEN and RUN RED before its implementation exists (Tasks 2–8 order their steps this way — do not reorder), and every implementation task ends with an explicit REFACTOR pass (with tests green, review the new code for duplication/naming/structure, apply safe improvements, re-run that task's tests) before its commit step. Task 9's acceptance flows are integration gates over already-TDD'd units and are expected green. Run tests via the coordinated wrapper `npm run test:vitest -- --config <config> <files> --run` (check `npm run test:status` before broad runs; broad runs WAIT for the coordinator gate — never skip, never kill a foreign holder).
 - Repo: NodeNext ESM — server/shared relative imports use `.js` extensions. Client imports use `@/` and `@shared/` aliases (no extension).
 - Repo: a11y for all new UI — semantic elements, labels/aria, testable via role/label.
 - Repo: `README.md` is the only end-user markdown doc; `docs/index.html` must be updated for major UI changes (this is one).
@@ -447,15 +447,19 @@ EOF
 ### Task 3: Indexer readiness getter + cross-provider session resolver
 
 **Files:**
-- Modify: `server/coding-cli/session-indexer.ts` (add one public method to `CodingCliSessionIndexer`, class starts ~line 442; `initialized` is an existing private field)
+- Modify: `server/coding-cli/session-indexer.ts` (add public methods to `CodingCliSessionIndexer`, class starts ~line 442; `initialized` is an existing private field)
+- Modify: `server/coding-cli/providers/claude.ts`, `server/coding-cli/providers/codex.ts`, `server/coding-cli/providers/amplifier.ts` (root-level scan failures must PROPAGATE — see Step 4; without this the provider-health channel cannot observe real filesystem failures for these three providers, because they currently swallow ALL errors into empty results)
 - Create: `server/coding-cli/session-resolver.ts`
 - Test: `test/unit/server/coding-cli/session-resolver.test.ts`
+- Test: modify `test/unit/server/coding-cli/session-indexer.test.ts` (existing file — readiness + scan-failure cases)
+- Test: root-failure cases for the three providers (add to their existing test files if present — check `ls test/unit/server/coding-cli` — else create `test/unit/server/coding-cli/provider-root-failures.test.ts`)
 
 **Interfaces:**
 - Consumes: `ProjectGroup`, `CodingCliSession`, `CodingCliProviderName` from `server/coding-cli/types.js`; indexer snapshot shape `getProjects(): ProjectGroup[]` (already public — see `SessionsRouterDeps.codingCliIndexer`).
 - Produces (used by Tasks 4–6):
-  - `CodingCliSessionIndexer.isReady(): boolean`
-  - `CodingCliSessionIndexer.getScanFailures(): CodingCliProviderName[]` — providers whose most recent listing attempt FAILED (the indexer currently swallows these into empty lists and still reports itself initialized; the resolve route must surface them as degraded, never as "not found")
+  - `CodingCliSessionIndexer.isReady(): boolean` — true once at least one full `refresh()` has completed (Step 4 sets `initialized` at the end of `refresh()`, so this is observable without `start()`)
+  - `CodingCliSessionIndexer.getScanFailures(): CodingCliProviderName[]` — currently-ENABLED providers whose most recent listing attempt FAILED (the indexer currently swallows these into empty lists and still reports itself initialized; the resolve route must surface them as degraded, never as "not found"; a DISABLED provider is pruned from this set — it is UNSEARCHED, not failed)
+  - `CodingCliSessionIndexer.requestRefresh(): void` — public fire-and-forget wrapper around the private `scheduleRefresh()`; the resolve route calls it on a degraded response so a user "Retry" converges once the failed provider recovers
   - `resolveSessionCandidates(candidates: string[], deps: SessionResolverDeps): Promise<{ matches: ResolveMatch[]; providerErrors: CodingCliProviderName[] }>` — `providerErrors` lists providers whose exact-id fallback THREW (provider unavailable ≠ not found)
   - `type ResolveMatch = { provider: CodingCliProviderName; sessionId: string; cwd?: string; projectPath: string; sessionType: string; title?: string; firstUserMessage?: string; lastActivityAt: number; matchType: 'exact' | 'prefix'; matchedToken: string }`
   - `type ExactIdFallback = (id: string) => Promise<ResolveMatch | null>`
@@ -649,6 +653,22 @@ describe('resolveSessionCandidates', () => {
     expect(matches).toEqual([])
     expect(providerErrors).toEqual(['opencode'])
   })
+
+  it('a failed exact-id fallback does NOT hide a later lower-priority match — BOTH the match and the provider error are returned', async () => {
+    // First token: full claude UUID, index miss, claude fallback THROWS.
+    // Second token: prefix that matches an indexed amplifier session.
+    // The caller (route) needs the surviving match AND the error so it can
+    // report 'degraded' and the client can refuse to auto-resume.
+    const MISSING_V4 = 'ed2afda6-a340-443e-ba60-024a1b3554b9'
+    const snapshot = projects([session({ provider: 'amplifier', sessionId: '417e8345-90ab-4cde-8f01-234567890abc' })])
+    const { matches, providerErrors } = await resolveSessionCandidates([MISSING_V4, '417e8345'], {
+      getProjects: () => snapshot,
+      fallbacks: { claudeTranscriptById: async () => { throw new Error('EACCES') } },
+    })
+    expect(matches).toHaveLength(1)
+    expect(matches[0]).toMatchObject({ provider: 'amplifier', matchType: 'prefix' })
+    expect(providerErrors).toEqual(['claude'])
+  })
 })
 ```
 
@@ -734,7 +754,12 @@ function isCaseInsensitiveToken(token: string): boolean {
  * One scan answers all agents at once (spec: "evidence decides") — no per-agent
  * probe ordering. Candidates are tried best-first; the first token that
  * resolves anywhere wins. A fallback that throws marks its provider in
- * providerErrors (unavailable ≠ not found).
+ * providerErrors (unavailable ≠ not found) — AND resolution still continues
+ * to prefix/later-candidate matches, so callers get BOTH the surviving
+ * matches and the errors. The route turns non-empty providerErrors into
+ * indexState 'degraded' even when matches exist: a failed HIGHER-priority
+ * exact search means a surviving lower-priority match may be the wrong
+ * session, so the client must never auto-resume it (hard requirement).
  */
 export async function resolveSessionCandidates(
   candidates: string[],
@@ -798,7 +823,7 @@ export async function resolveSessionCandidates(
 In `server/coding-cli/session-indexer.ts`, inside `class CodingCliSessionIndexer`, directly ABOVE the existing `onUpdate(...)` method (~line 687), add:
 
 ```typescript
-  /** True once the initial full scan has completed (resolve endpoint: 'warming' until then). */
+  /** True once at least one refresh has completed (resolve endpoint: 'warming' until then). */
   isReady(): boolean {
     return this.initialized
   }
@@ -812,7 +837,20 @@ In `server/coding-cli/session-indexer.ts`, inside `class CodingCliSessionIndexer
   getScanFailures(): CodingCliProviderName[] {
     return [...this.scanFailures]
   }
+
+  /**
+   * Public fire-and-forget refresh request (debounced scheduleRefresh). The
+   * resolve route calls this on a degraded response so the user's "Retry"
+   * converges after a failed provider recovers — otherwise a recorded scan
+   * failure could outlive the outage until the next watcher event/periodic
+   * full scan.
+   */
+  requestRefresh(): void {
+    this.scheduleRefresh()
+  }
 ```
+
+Make readiness observable without `start()`: at the END of a successful `refresh()` pass (after the snapshot swap), set `this.initialized = true`. `start()` already sets it after its initial refresh — this is idempotent, and it makes `isReady()` mean "at least one refresh completed", which is exactly what the resolve endpoint needs. (Tests then use `refresh()` directly — do NOT use `start()` in unit tests: it installs watchers and timers that need cleanup.)
 
 Add the backing field next to the existing `private initialized = false` (~line 463):
 
@@ -822,7 +860,16 @@ Add the backing field next to the existing `private initialized = false` (~line 
 
 Then wire per-provider success/failure recording into EVERY place the refresh path converts a provider listing failure into an empty result. Verified: the file-based catch is `provider.listSessionFiles().catch((err) => { logger.warn(...); return [] })` at ~line 1432 — change it to also `this.scanFailures.add(provider.name)` in the catch, and `this.scanFailures.delete(provider.name)` on success. Audit and instrument the SAME way: the equivalent listing catch(es) inside `lightweightScan` (cold-start path) and any failure handling in `refreshDirectProvider` (direct-listing providers). Record per attempt (add on failure, delete on success) — do NOT bulk-clear the set per refresh, or an untouched failed provider would be wrongly reported healthy after an incremental refresh.
 
-Add one focused test to the EXISTING `test/unit/server/coding-cli/session-indexer.test.ts` (reuse its harness/provider stubs): a provider whose `listSessionFiles` rejects → after `refresh()`, `getScanFailures()` contains that provider's name and `isReady()` is still true; after the stub is repaired and `refresh()` runs again, `getScanFailures()` is empty.
+DISABLED-provider lifecycle (must not trap the user): at the end of each refresh pass, PRUNE `scanFailures` entries for providers that are no longer in the enabled/scanned provider set (the same `enabledProviders` filter the scan already applies, ~line 1385). A disabled provider is UNSEARCHED, not failed — the resolve route reports it via `unsearchedProviders`; leaving its stale failure in `scanFailures` would keep responses `degraded` forever with a Retry that can never succeed.
+
+MAKE THE FAILURES OBSERVABLE — provider root-error propagation (without this, the instrumentation above records nothing for three of the four providers): the indexer's catches can only fire if `listSessionFiles()` actually REJECTS, but today `claude.ts` (~lines 541–563), `codex.ts` (`walkJsonlFiles`, ~lines 433–439) and `amplifier.ts` (`walkMetadataFiles`, ~lines 142–148) swallow ALL directory/stat errors into empty results, so EACCES/EIO/EMFILE outages read as successful empty scans → false "not found". Fix each provider the same way:
+- Distinguish absence from failure: treat `ENOENT`/`ENOTDIR` on the provider's ROOT directory (claude: `<home>/projects`; codex/amplifier: the walker's top-level root) as a legitimate empty result; RETHROW any other error from the root-level enumeration so `listSessionFiles()` rejects and the indexer records the scan failure. For the recursive walkers, add the root-level guard in `listSessionFiles` itself (readdir the root outside the walker, absence → `[]`, other errors → throw), keeping the recursive descent best-effort.
+- Per-subdirectory/per-file errors deeper in the tree remain best-effort skips (partial results beat none) — document this as an accepted limitation in a code comment at each site.
+- (The opencode provider's listing already runs through the worker runner whose failures reject — verify, do not change.)
+
+Tests:
+- Add to the EXISTING `test/unit/server/coding-cli/session-indexer.test.ts` (reuse its harness/provider stubs): (a) a provider whose `listSessionFiles` rejects → after `refresh()`, `getScanFailures()` contains that provider's name and `isReady()` is true (readiness comes from the completed refresh — see above); (b) after the stub is repaired and `refresh()` runs again, `getScanFailures()` is empty; (c) a provider fails, then is REMOVED from the enabled provider set → after the next `refresh()`, `getScanFailures()` no longer contains it (pruned, not trapped); (d) `requestRefresh()` schedules a refresh (spy on the scheduled path or observe a subsequent snapshot change with fake timers).
+- Provider root-failure tests (real fs, throwaway tmp dirs only — never a real HOME): for each of claude/codex/amplifier, (a) missing root → `listSessionFiles()` resolves `[]`; (b) root with mode `0o000` → `listSessionFiles()` REJECTS with `EACCES` (guard with `it.skipIf(process.getuid?.() === 0)` since root bypasses permissions; restore the mode in `afterEach` so cleanup works).
 
 - [ ] **Step 5: Run tests to verify they pass**
 
@@ -830,14 +877,24 @@ Add one focused test to the EXISTING `test/unit/server/coding-cli/session-indexe
 npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/session-resolver.test.ts test/unit/server/coding-cli/session-indexer.test.ts --run
 npm run typecheck:server
 ```
-Expected: PASS, clean typecheck.
+Expected: PASS, clean typecheck. (Also run the provider root-failure test file(s) from Step 4 with the same wrapper — include whichever file(s) you added them to.)
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Refactor pass, then commit**
+
+Refactor (TDD's third step): with tests green, re-read the new resolver, the indexer additions, and the provider root-guard changes for duplication/naming/structure (e.g. the three identical root-guard blocks may deserve a tiny shared helper); apply safe improvements and re-run the Step 5 commands.
 
 ```bash
-git add server/coding-cli/session-resolver.ts server/coding-cli/session-indexer.ts test/unit/server/coding-cli/session-resolver.test.ts
+git add server/coding-cli/session-resolver.ts server/coding-cli/session-indexer.ts server/coding-cli/providers/claude.ts server/coding-cli/providers/codex.ts server/coding-cli/providers/amplifier.ts test/unit/server/coding-cli/session-resolver.test.ts test/unit/server/coding-cli/session-indexer.test.ts
+# ALSO add the provider root-failure test file(s) touched/created in Step 4.
 git commit -m "$(cat <<'EOF'
-feat(server): cross-provider session resolver over the index snapshot
+feat(server): cross-provider session resolver + indexer readiness/scan-failure channel
+
+- session-resolver over the index snapshot (exact > fallback > prefix, provider
+  errors surface alongside surviving matches)
+- indexer: isReady() (set on refresh completion), getScanFailures() with
+  disabled-provider pruning, requestRefresh()
+- claude/codex/amplifier providers: root-level scan failures now REJECT instead
+  of reading as empty results, so the health channel covers all four providers
 
 🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
 
@@ -945,6 +1002,28 @@ describe('locateClaudeTranscriptById', () => {
     expect(hit).not.toBeNull()
     expect(hit!.cwd).toBeUndefined()
   })
+
+  it('finds a SUBAGENT transcript at <project>/<parent>/subagents/<id>.jsonl (index-missed child session)', async () => {
+    // Claude also stores child-session transcripts one level deeper (see
+    // claude.ts listSessionFiles): the exact-id contract covers them too.
+    const PARENT_ID = 'aaaaaaaa-a340-443e-ba60-024a1b3554b4'
+    const dir = path.join(root, '-home-u-proj', PARENT_ID, 'subagents')
+    await fsp.mkdir(dir, { recursive: true })
+    await fsp.writeFile(path.join(dir, `${SESSION_ID}.jsonl`), JSON.stringify({ cwd: '/home/u/proj' }) + '\n')
+    const hit = await locateClaudeTranscriptById(SESSION_ID, [root])
+    expect(hit).not.toBeNull()
+    expect(hit!.cwd).toBe('/home/u/proj')
+    expect(hit!.filePath.endsWith(path.join('subagents', `${SESSION_ID}.jsonl`))).toBe(true)
+  })
+
+  it('prefers the direct layout when both layouts contain the id (pass ordering)', async () => {
+    await writeTranscript('-x', SESSION_ID, [JSON.stringify({ cwd: '/direct' })])
+    const dir = path.join(root, '-x', 'aaaaaaaa-a340-443e-ba60-024a1b3554b4', 'subagents')
+    await fsp.mkdir(dir, { recursive: true })
+    await fsp.writeFile(path.join(dir, `${SESSION_ID}.jsonl`), JSON.stringify({ cwd: '/sub' }) + '\n')
+    const hit = await locateClaudeTranscriptById(SESSION_ID, [root])
+    expect(hit!.cwd).toBe('/direct')
+  })
 })
 ```
 
@@ -980,15 +1059,21 @@ function isAbsenceError(err: unknown): boolean {
 }
 
 /**
- * Exact-id fallback for claude sessions the index missed: claude stores one
- * transcript per session at <root>/<project-dir>/<sessionId>.jsonl, so an
- * exact id can be located with one readdir per root + one stat per project dir
- * (no full scan, no glob).
+ * Exact-id fallback for claude sessions the index missed. Claude stores
+ * transcripts in TWO layouts (both indexed by the provider — see claude.ts
+ * listSessionFiles ~line 571):
+ *   1. direct:   <root>/<project-dir>/<sessionId>.jsonl
+ *   2. subagent: <root>/<project-dir>/<parent-session>/subagents/<sessionId>.jsonl
+ * An exact pasted id must resolve for BOTH — child sessions included — so the
+ * locator probes the cheap direct layout first (one readdir per root + one
+ * stat per project dir) and only on a total miss falls back to the subagent
+ * layout (one readdir per project dir + one stat per session subdirectory).
  *
  * ERROR CONTRACT: expected absence (ENOENT/ENOTDIR — missing root, missing
- * transcript) is a miss (null). Any OTHER failure (EACCES, EMFILE, EIO, …)
- * PROPAGATES: the resolver records it as a provider error and the route
- * reports 'degraded' — a provider failure must never read as "not found".
+ * transcript, non-directory entries probed as directories) is a miss (null).
+ * Any OTHER failure (EACCES, EMFILE, EIO, …) PROPAGATES: the resolver records
+ * it as a provider error and the route reports 'degraded' — a provider
+ * failure must never read as "not found".
  */
 export async function locateClaudeTranscriptById(
   sessionId: string,
@@ -999,28 +1084,47 @@ export async function locateClaudeTranscriptById(
   // accepts UUIDs in ANY case and Linux filesystems are case-sensitive, so
   // normalize before building paths and return the canonical lowercase id.
   const id = sessionId.toLowerCase()
+  // PASS 1 — direct layout.
   for (const root of roots) {
-    let projectDirs: string[]
-    try {
-      projectDirs = await fsp.readdir(root)
-    } catch (err) {
-      if (isAbsenceError(err)) continue
-      throw err
+    for (const dir of await readdirOrEmpty(root)) {
+      const hit = await probeTranscript(path.join(root, dir, `${id}.jsonl`), id)
+      if (hit) return hit
     }
-    for (const dir of projectDirs) {
-      const candidate = path.join(root, dir, `${id}.jsonl`)
-      let stat
-      try {
-        stat = await fsp.stat(candidate)
-      } catch (err) {
-        if (isAbsenceError(err)) continue
-        throw err
+  }
+  // PASS 2 — subagent layout (only when the direct layout missed everywhere).
+  for (const root of roots) {
+    for (const dir of await readdirOrEmpty(root)) {
+      const projectDir = path.join(root, dir)
+      for (const entry of await readdirOrEmpty(projectDir)) {
+        const hit = await probeTranscript(path.join(projectDir, entry, 'subagents', `${id}.jsonl`), id)
+        if (hit) return hit
       }
-      const cwd = await readCwdFromTranscriptHead(candidate)
-      return { sessionId: id, cwd, filePath: candidate, lastActivityAt: stat.mtimeMs }
     }
   }
   return null
+}
+
+/** readdir treating absence as empty; anything else PROPAGATES (provider failure). */
+async function readdirOrEmpty(dir: string): Promise<string[]> {
+  try {
+    return await fsp.readdir(dir)
+  } catch (err) {
+    if (isAbsenceError(err)) return []
+    throw err
+  }
+}
+
+/** stat + cwd-read for one candidate; absence = null, anything else PROPAGATES. */
+async function probeTranscript(candidate: string, id: string): Promise<ClaudeTranscriptHit | null> {
+  let stat
+  try {
+    stat = await fsp.stat(candidate)
+  } catch (err) {
+    if (isAbsenceError(err)) return null
+    throw err
+  }
+  const cwd = await readCwdFromTranscriptHead(candidate)
+  return { sessionId: id, cwd, filePath: candidate, lastActivityAt: stat.mtimeMs }
 }
 
 async function readCwdFromTranscriptHead(filePath: string): Promise<string | undefined> {
@@ -1249,9 +1353,16 @@ export async function runOpencodeSessionByIdQuery(
 }
 ```
 
-- [ ] **Step 4: Off-thread worker + runner (event-loop safety)**
+- [ ] **Step 4: Off-thread worker + runner (event-loop safety) — tests FIRST (red), then implement (green)**
 
-Create `server/coding-cli/providers/opencode-by-id.worker.ts` and `server/coding-cli/providers/opencode-by-id-runner.ts` by MIRRORING the existing pair `opencode-listing.worker.ts` / `opencode-listing-runner.ts` in the same directory (read both first — they are the repo's canonical off-thread sqlite pattern). Keep every load-bearing detail of that pattern:
+**Step 4a (RED):** Create `test/unit/server/coding-cli/opencode-by-id-runner.test.ts` FIRST, by mirroring the existing `test/unit/server/coding-cli/opencode-listing-runner.test.ts` (same injectable-spawn harness): ok-row message resolves; ok-null resolves null; err message rejects; malformed/truncated message rejects; timeout terminates the worker and rejects. Add ONE integration case that runs the REAL worker against the Step 1 tmp-DB fixture and resolves the root session (proves the off-thread wiring end to end; tmp DB only — never a real HOME, session safety rule). Then run it and verify it FAILS:
+
+```bash
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/opencode-by-id-runner.test.ts --run
+```
+Expected: FAIL — runner module not found.
+
+**Step 4b (GREEN):** Create `server/coding-cli/providers/opencode-by-id.worker.ts` and `server/coding-cli/providers/opencode-by-id-runner.ts` by MIRRORING the existing pair `opencode-listing.worker.ts` / `opencode-listing-runner.ts` in the same directory (read both first — they are the repo's canonical off-thread sqlite pattern). Keep every load-bearing detail of that pattern:
 - sentinel-guarded auto-run in the worker module (importing it on the main thread must never spawn/post anything),
 - `SELF_EXT` sibling resolution (`.ts` in dev/test via tsx, `.js` in compiled dist),
 - `execArgv` APPENDED to `process.execArgv` with `--disable-warning=ExperimentalWarning`,
@@ -1269,9 +1380,9 @@ export async function runOpencodeSessionByIdOffThread(dbPath: string, sessionId:
 
 Worker/spawn/timeout failures REJECT (provider unavailable ≠ not found — Task 6's fallback lets that propagate). Per-request cost is bounded upstream (shape gate + `FALLBACK_BUDGET_PER_REQUEST`), so worst case is two short-lived workers per request — and the EVENT LOOP stays free even when the DB is locked for the full 500 ms busy timeout.
 
-Create `test/unit/server/coding-cli/opencode-by-id-runner.test.ts` by mirroring the existing `test/unit/server/coding-cli/opencode-listing-runner.test.ts` (same injectable-spawn harness): ok-row message resolves; ok-null resolves null; err message rejects; malformed/truncated message rejects; timeout terminates the worker and rejects. Add ONE integration case that runs the REAL worker against the Step 1 tmp-DB fixture and resolves the root session (proves the off-thread wiring end to end; tmp DB only — never a real HOME, session safety rule).
+- [ ] **Step 5: Run tests to verify they pass, then refactor pass**
 
-- [ ] **Step 5: Run tests to verify they pass**
+Refactor (TDD's third step): with tests green, compare the new worker/runner pair against the listing pair for drift and factor out any safe shared helpers; re-run the commands below after any change.
 
 ```bash
 npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/opencode-by-id-query.test.ts test/unit/server/coding-cli/opencode-by-id-runner.test.ts --run
@@ -1309,8 +1420,8 @@ EOF
 - Produces: HTTP contract used by the client (Task 7):
   - Request: `POST /api/sessions/resolve` body `{ input: string }` (1–20000 chars; 400 on invalid body; candidate tokens are already capped by `MAX_RESUME_CANDIDATES` in the parser).
   - Response 200: `{ indexState: 'ready' | 'warming' | 'degraded', tokens: string[], agentHint: { provider, source } | null, homeDir: string, providerErrors: CodingCliProviderName[], unsearchedProviders: CodingCliProviderName[], matches: ResolveMatch[] }`.
-    - `providerErrors` = providers that could NOT be searched because something FAILED: an exact-id fallback threw, or the provider's most recent index scan failed (`indexer.getScanFailures()`).
-    - `degraded` = zero matches AND `providerErrors` non-empty (provider unavailable ≠ not found — the client shows retry, never "no matching session").
+    - `providerErrors` = ENABLED providers that could NOT be searched because something FAILED: an exact-id fallback threw, or the provider's most recent index scan failed (`indexer.getScanFailures()`, filtered to enabled providers — a DISABLED provider belongs in `unsearchedProviders`, never here, or a failed-then-disabled provider would trap the user in a permanent degraded state).
+    - `degraded` = `providerErrors` non-empty, EVEN WHEN matches exist: a failed provider means a higher-priority exact match may have been missed, so a surviving lower-priority/prefix match must NOT auto-resume (client rule) — and zero matches must show retry, never "no matching session". A degraded response also fire-and-forgets `indexer.requestRefresh()` so the user's Retry converges once the provider recovers.
     - `unsearchedProviders` = providers DISABLED in settings. Verified: `session-indexer.ts` filters the scan by `settings.codingCli.enabledProviders` (~line 1385), so a disabled provider's sessions are ABSENT from `getProjects()` and cannot be found — the client must say so instead of implying the id does not exist. (The claude/opencode exact-id fallbacks do not consult the index, so exact pasted ids for those two resolve even while disabled.)
 - Wiring note: `server/index.ts` (~line 748) passes the live `CodingCliSessionIndexer` instance as `codingCliIndexer`, so the new optional `isReady` dep is picked up structurally — verify this when editing; if `index.ts` instead builds an object literal for `codingCliIndexer`, add `isReady: () => codingCliIndexer.isReady()` to that literal.
 
@@ -1503,6 +1614,49 @@ describe('POST /api/sessions/resolve', () => {
     expect(res.body.matches).toEqual([])
   })
 
+  it('reports degraded EVEN WITH matches when a higher-priority exact-id fallback failed (client must not auto-resume a lower-priority match)', async () => {
+    // Unindexed full claude UUID (fallback throws) + a second token that
+    // prefix-matches the indexed amplifier session: the match survives, but
+    // the response must be degraded so the client refuses to auto-resume.
+    const MISSING_V4 = 'ed2afda6-a340-443e-ba60-024a1b3554b9'
+    const res = await request(makeApp({
+      resolveFallbacks: { claudeTranscriptById: async () => { throw new Error('EACCES') } },
+    })).post('/api/sessions/resolve').send({ input: `${MISSING_V4} 417e8345` })
+    expect(res.status).toBe(200)
+    expect(res.body.indexState).toBe('degraded')
+    expect(res.body.providerErrors).toEqual(['claude'])
+    expect(res.body.matches).toHaveLength(1)
+    expect(res.body.matches[0].provider).toBe('amplifier')
+  })
+
+  it('a degraded response fire-and-forgets indexer.requestRefresh() so Retry can converge', async () => {
+    const requestRefresh = vi.fn()
+    await request(makeApp({
+      codingCliIndexer: {
+        getProjects: () => [], refresh: async () => {}, isReady: () => true,
+        getScanFailures: () => ['codex'], requestRefresh,
+      },
+    })).post('/api/sessions/resolve').send({ input: CODEX_V7 })
+    expect(requestRefresh).toHaveBeenCalled()
+  })
+
+  it('a scan failure for a DISABLED provider is excluded from providerErrors (unsearched, not degraded)', async () => {
+    const res = await request(makeApp({
+      configStore: {
+        getSettings: async () => ({ codingCli: { enabledProviders: ['claude'] } }),
+        patchSessionOverride: async () => ({}),
+        deleteSession: async () => {},
+      },
+      codingCliIndexer: {
+        getProjects: () => snapshot(), refresh: async () => {}, isReady: () => true,
+        getScanFailures: () => ['codex'],
+      },
+    })).post('/api/sessions/resolve').send({ input: CLAUDE_V4 })
+    expect(res.body.providerErrors).toEqual([])
+    expect(res.body.unsearchedProviders).toEqual(['codex', 'opencode', 'amplifier'])
+    expect(res.body.indexState).toBe('ready')
+  })
+
   it('reports DISABLED providers as unsearched, never silently as absence', async () => {
     const res = await request(makeApp({
       configStore: {
@@ -1521,12 +1675,14 @@ describe('POST /api/sessions/resolve', () => {
 })
 ```
 
+ALSO create `test/unit/server/coding-cli/resolve-fallbacks.test.ts` NOW, before any implementation exists (TDD red — its full case list is specified in Step 5, which later verifies it green): both test files must fail before Step 3.
+
 - [ ] **Step 2: Run tests to verify they fail**
 
 ```bash
-npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/sessions-resolve-router.test.ts --run
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/sessions-resolve-router.test.ts test/unit/server/coding-cli/resolve-fallbacks.test.ts --run
 ```
-Expected: FAIL — TS error on unknown deps (`homeDir`, `resolveFallbacks`, `isReady`) and/or 404 on the route.
+Expected: FAIL — TS error on unknown deps (`homeDir`, `resolveFallbacks`, `isReady`) and/or 404 on the route; `resolve-fallbacks` module not found.
 
 - [ ] **Step 3: Implement the default fallback wiring**
 
@@ -1684,6 +1840,7 @@ Extend `SessionsRouterDeps`: inside the existing `codingCliIndexer` object type 
     refresh: () => Promise<void>
     isReady?: () => boolean
     getScanFailures?: () => CodingCliProviderName[]
+    requestRefresh?: () => void
   }
   /** Test override for the exact-id fallbacks (defaults to buildResolveFallbacks(...)). */
   resolveFallbacks?: ResolveFallbacks
@@ -1732,15 +1889,25 @@ Add the route inside `createSessionsRouter(deps)`, after the `router.post('/sess
         fallbacks: withRequestBudget(resolveFallbacks),
       })
       // A provider whose last index scan FAILED was not searched either —
-      // the indexer swallows listing failures and still reports ready.
-      const scanFailures = deps.codingCliIndexer.getScanFailures?.() ?? []
+      // the indexer swallows listing failures and still reports ready. A
+      // DISABLED provider is UNSEARCHED (reported above), never a provider
+      // error: without this filter a failed-then-disabled provider would
+      // keep responses degraded forever (no successful scan can ever clear
+      // it) and trap the user in a Retry loop.
+      const scanFailures = (deps.codingCliIndexer.getScanFailures?.() ?? [])
+        .filter((name) => enabled.has(name))
       const providerErrors = [...new Set([...fallbackErrors, ...scanFailures])]
-      // degraded = zero matches AND something FAILED: absence needs evidence
-      // (spec) — the client shows retry, never "no matching session".
+      // degraded = something FAILED — even when matches exist: a failed
+      // provider means a HIGHER-priority exact match may have been missed,
+      // so the client must not auto-resume a surviving lower-priority match
+      // (and with zero matches it shows retry, never "no matching session").
       const indexState: 'ready' | 'warming' | 'degraded' =
         deps.codingCliIndexer.isReady?.() === false ? 'warming'
-        : matches.length === 0 && providerErrors.length > 0 ? 'degraded'
+        : providerErrors.length > 0 ? 'degraded'
         : 'ready'
+      // Fire-and-forget: give the user's Retry a chance to converge once a
+      // failed provider recovers (scan failures only clear on a new scan).
+      if (indexState === 'degraded') deps.codingCliIndexer.requestRefresh?.()
       res.json({
         indexState,
         tokens: candidates,
@@ -1757,9 +1924,9 @@ Add the route inside `createSessionsRouter(deps)`, after the `router.post('/sess
   })
 ```
 
-- [ ] **Step 5: Test the PRODUCTION fallback composition (`buildResolveFallbacks` + `withRequestBudget`)**
+- [ ] **Step 5: Verify the PRODUCTION fallback-composition tests (`buildResolveFallbacks` + `withRequestBudget`) — written RED in Step 1 — now pass**
 
-The router tests above inject fallbacks, so they never exercise the production composition. Create `test/unit/server/coding-cli/resolve-fallbacks.test.ts` (node environment) covering, at minimum:
+The router tests above inject fallbacks, so they never exercise the production composition. `test/unit/server/coding-cli/resolve-fallbacks.test.ts` (node environment; created in Step 1 before any implementation existed) covers, at minimum:
 
 - `withRequestBudget` shape-before-budget: a wrong-shape token returns null WITHOUT calling the inner fallback and WITHOUT consuming budget; the (budget+1)-th valid-shape token returns null without calling the inner fallback.
 - `buildResolveFallbacks` claude wiring: stub provider `{ name: 'claude', getSessionRoots: () => [tmpRoot] }` with a real transcript fixture (reuse Task 4's `writeTranscript` shape) → returns the full match tuple; with a metadata-store stub whose `getAll()` returns `{ ['claude:' + id]: { sessionType: 'freshclaude' } }` → `sessionType` is `'freshclaude'`; with no metadata → `'claude'`; metadata-store `getAll()` REJECTING → still resolves with `'claude'` (metadata failure must not become a provider error).
@@ -1786,7 +1953,9 @@ npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/
 ```
 Expected: PASS (no regressions from the deps change).
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 8: Refactor pass, then commit**
+
+Refactor (TDD's third step): with tests green, re-read the route handler and `resolve-fallbacks.ts` for duplication/clarity (e.g. the enabled-provider set logic); apply safe improvements and re-run Steps 5–7's commands.
 
 ```bash
 git add server/sessions-router.ts server/coding-cli/resolve-fallbacks.ts server/coding-cli/providers/opencode.ts test/unit/server/sessions-resolve-router.test.ts test/unit/server/coding-cli/resolve-fallbacks.test.ts
@@ -2094,6 +2263,41 @@ describe('ResumeSessionDialog', () => {
     await pasteAndResolve('ses_root0000000000000000000000')
     expect(screen.getByLabelText(/agent/i)).toHaveValue('opencode')
   })
+
+  it('DEGRADED single match with cwd: NO auto-resume — match listed with degraded notice + Retry', async () => {
+    // A failed provider means a higher-priority exact match may have been
+    // missed: auto-opening the surviving match could open the WRONG session.
+    mockResolve.mockResolvedValue(response({
+      indexState: 'degraded', providerErrors: ['claude'], matches: [match()],
+    }))
+    const { onResume } = renderDialog()
+    await pasteAndResolve(CLAUDE_V4)
+    expect(onResume).not.toHaveBeenCalled()
+    expect(screen.getByRole('status')).toHaveTextContent(/could not be searched/i)
+    expect(screen.getByRole('button', { name: /retry/i })).toBeInTheDocument()
+    expect(screen.getByRole('list', { name: /matching sessions/i })).toBeInTheDocument()
+  })
+
+  it('cwd-less match with a BLANK working-directory field: confirm is blocked with an inline error, no resume', async () => {
+    mockResolve.mockResolvedValue(response({ matches: [{ ...match(), cwd: undefined }] }))
+    const { onResume } = renderDialog()
+    await pasteAndResolve(CLAUDE_V4)
+    fireEvent.change(screen.getByLabelText(/working directory/i), { target: { value: '   ' } })
+    fireEvent.click(screen.getByRole('button', { name: /resume claude session/i }))
+    expect(onResume).not.toHaveBeenCalled()
+    expect(screen.getByRole('alert')).toHaveTextContent(/working directory/i)
+  })
+
+  it('"Resume anyway" is DISABLED while the working-directory field is blank (never launch a cwd-less tuple)', async () => {
+    mockResolve.mockResolvedValue(response({ matches: [] }))
+    const { onResume } = renderDialog()
+    await pasteAndResolve(CLAUDE_V4)
+    fireEvent.change(screen.getByLabelText(/working directory/i), { target: { value: '  ' } })
+    const anyway = screen.getByRole('button', { name: /resume anyway/i })
+    expect(anyway).toBeDisabled()
+    fireEvent.click(anyway)
+    expect(onResume).not.toHaveBeenCalled()
+  })
 })
 ```
 
@@ -2259,14 +2463,22 @@ export default function ResumeSessionDialog({ open, onClose, onResume }: ResumeS
   }, [open, onClose])
 
   const finishResume = useCallback((m: ResumeResolveMatch) => {
+    // A match without a recorded cwd never auto-resumes (see runResolve);
+    // when the user confirms it from the match list, the editable
+    // working-directory field below supplies the concrete cwd (spec). A
+    // session must NEVER open without a concrete cwd — an empty/whitespace
+    // field blocks the confirm with an inline error instead of silently
+    // launching a cwd-less tuple.
+    const cwd = m.cwd ?? anywayCwd.trim()
+    if (!cwd) {
+      setErrorText('Enter a working directory to open this session.')
+      return
+    }
     onResume({
       provider: m.provider,
       sessionId: m.sessionId,
       sessionType: m.sessionType,
-      // A match without a recorded cwd never auto-resumes (see runResolve);
-      // when the user confirms it from the match list, the editable
-      // working-directory field below supplies the concrete cwd (spec).
-      cwd: m.cwd ?? (anywayCwd.trim() || undefined),
+      cwd,
       title: m.title,
       firstUserMessage: m.firstUserMessage,
     })
@@ -2307,7 +2519,12 @@ export default function ResumeSessionDialog({ open, onClose, onResume }: ResumeS
       setErrorText('No session id found in the pasted text.')
       return
     }
-    if (response.matches.length === 1 && response.matches[0].cwd) {
+    // Auto-resume ONLY on a fully-healthy response: a 'degraded' response
+    // means some provider FAILED, so a higher-priority exact match may have
+    // been missed — auto-opening the surviving match could open the WRONG
+    // session (hard requirement). Degraded matches render in the list below
+    // with the degraded notice + Retry instead.
+    if (response.matches.length === 1 && response.matches[0].cwd && response.indexState === 'ready') {
       finishResume(response.matches[0])
       return
     }
@@ -2327,24 +2544,31 @@ export default function ResumeSessionDialog({ open, onClose, onResume }: ResumeS
     // CURRENT input first: result is cleared on edit, but never act on a
     // stale token when the user has typed something new.
     const token = parseResumeInput(inputValue).candidates[0] ?? result?.tokens[0]
-    if (!token) return
-    onResume({ provider: picker, sessionId: token, sessionType: picker, cwd: anywayCwd || undefined })
+    // A concrete cwd is REQUIRED (spec: never open without one) — the button
+    // below is disabled when the field is blank; this guard is the backstop.
+    const cwd = anywayCwd.trim()
+    if (!token || !cwd) return
+    onResume({ provider: picker, sessionId: token, sessionType: picker, cwd })
     onClose()
   }, [anywayCwd, inputValue, onClose, onResume, picker, result])
 
   if (!open) return null
 
   // warming AND degraded are retry states — NEITHER is "not found" (spec:
-  // absence needs evidence; provider unavailable gets loading/retry).
-  const retryState = result !== null && result.tokens.length > 0 && result.matches.length === 0
+  // absence needs evidence; provider unavailable gets loading/retry). The
+  // retry notice shows for EVERY warming/degraded response — with OR without
+  // matches — because degraded matches may be incomplete/lower-priority.
+  const retryState = result !== null && result.tokens.length > 0
     && (result.indexState === 'warming' || result.indexState === 'degraded')
     ? result.indexState
     : null
   const matchesToShow = result?.matches ?? []
-  // >1 = disambiguation; ==1 without cwd = needs-working-directory confirmation
-  // (a lone match WITH cwd auto-resumed in runResolve and never reaches here).
+  // >1 = disambiguation; ==1 without cwd = needs-working-directory
+  // confirmation; ==1 on a DEGRADED response = manual confirmation required
+  // (a lone match WITH cwd on a READY response auto-resumed in runResolve
+  // and never reaches here).
   const showMatchList = matchesToShow.length > 1
-    || (matchesToShow.length === 1 && !matchesToShow[0].cwd)
+    || (matchesToShow.length === 1 && (!matchesToShow[0].cwd || result?.indexState === 'degraded'))
   const showResumeAnyway = errorText !== null && errorText.startsWith('No matching session')
   // Editable working directory: shown for resume-anyway AND for listed matches
   // lacking a recorded cwd (spec: never open without a concrete cwd).
@@ -2450,7 +2674,9 @@ export default function ResumeSessionDialog({ open, onClose, onResume }: ResumeS
             <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
             {retryState === 'warming'
               ? 'Session index is still warming — this is not a "not found".'
-              : 'Some agents could not be searched right now — this is not a "not found".'}
+              : matchesToShow.length > 0
+                ? 'Some agents could not be searched right now — the matches below may be incomplete. Confirm one manually or retry.'
+                : 'Some agents could not be searched right now — this is not a "not found".'}
             <button
               type="button"
               className="underline hover:text-foreground"
@@ -2501,8 +2727,9 @@ export default function ResumeSessionDialog({ open, onClose, onResume }: ResumeS
             {showResumeAnyway && (
               <button
                 type="button"
-                className="self-start rounded border border-border px-3 py-1.5 text-sm hover:bg-muted/50"
+                className="self-start rounded border border-border px-3 py-1.5 text-sm hover:bg-muted/50 disabled:opacity-50 disabled:cursor-not-allowed"
                 onClick={handleResumeAnyway}
+                disabled={!anywayCwd.trim()}
               >
                 Resume anyway with {PROVIDER_LABELS[picker]}
               </button>
@@ -2540,7 +2767,8 @@ Implementation notes for this step (facts verified during load-bearing validatio
 - `DEFAULT_ENABLED_CLI_PROVIDERS` is `readonly ['claude','codex','opencode','amplifier']` — the `.map` cast shown handles it.
 - Modal a11y is MANDATORY (repo a11y rule), not conditional: the component mirrors `src/components/ui/confirm-modal.tsx` exactly — `getFocusable` + Tab/Shift+Tab focus trap on the dialog, previous-focus capture and restore on close, `document.body.style.overflow` scroll lock while open, and a document-level Escape listener. The Step 1 tests cover each of these behaviors; do not remove any of them.
 - Stale-response guard is MANDATORY: `resolveSeqRef` invalidates in-flight resolves on every new resolve, on EVERY INPUT EDIT, and on close; a stale response (including a stale single-match auto-resume) must be ignored, and editing also clears `result`/`errorText`/`note` so stale "Resume anyway"/disambiguation actions cannot act on old tokens. The Step 1 reversed-ordering and editing-invalidation tests prove both.
-- Never auto-open without a concrete cwd: a single match WITHOUT `cwd` (exact-id fallback hit) renders in the match list with the editable working-directory field (prefilled from `homeDir`) instead of auto-resuming; `finishResume` fills `cwd` from that field for such matches. The Step 1 missing-cwd test proves it.
+- Never auto-open without a concrete cwd: a single match WITHOUT `cwd` (exact-id fallback hit) renders in the match list with the editable working-directory field (prefilled from `homeDir`) instead of auto-resuming; `finishResume` fills `cwd` from that field for such matches — and REFUSES (inline error, no `onResume`) when the field is blank/whitespace, while "Resume anyway" is disabled until the field is non-blank. No code path may call `onResume` with an undefined/empty `cwd`. The Step 1 missing-cwd, blank-cwd, and disabled-resume-anyway tests prove it.
+- Never auto-resume on a DEGRADED response: `runResolve` auto-resumes only when `indexState === 'ready'`; a degraded single match renders in the match list under the degraded notice + Retry (a failed provider means a higher-priority exact match may have been missed — auto-opening could resume the WRONG session). The Step 1 degraded-no-auto-resume test proves it.
 - Absence claims must name unsearched providers: when zero matches and `unsearchedProviders` is non-empty, the no-match message lists them (they are DISABLED in settings — the server never scanned them).
 
 - [ ] **Step 5: Run tests to verify they pass**
@@ -2857,10 +3085,18 @@ function renderApp() {
 }
 
 // The resumed TUPLE must be verified — not just tabs.length (an implementation
-// that always opened a claude pane would otherwise pass every flow).
+// that always opened a claude pane would otherwise pass every flow). The tuple
+// includes sessionType: dropping/replacing the resolved sessionType would make
+// openSessionTab create the wrong terminal runtime instead of a fresh-agent
+// pane (src/lib/session-type-utils.ts buildPaneInput), so every flow asserts
+// it. Verify the exact field placement against tabsSlice.openSessionTab
+// (~lines 585-615: `resolvedSessionType = sessionType || provider` flows into
+// the tab's session metadata and the pane content) and mirror how
+// test/e2e/sidebar-click-opens-pane.test.tsx asserts pane/tab shape — if the
+// sessionType lands on the PANE CONTENT rather than the tab, assert it there.
 function expectResumedTab(
   store: ReturnType<typeof makeStore>,
-  expected: { provider: string; sessionId: string; cwd?: string },
+  expected: { provider: string; sessionId: string; cwd?: string; sessionType?: string },
 ) {
   const tabs = store.getState().tabs.tabs
   expect(tabs).toHaveLength(1)
@@ -2870,6 +3106,18 @@ function expectResumedTab(
     ...(expected.cwd !== undefined ? { initialCwd: expected.cwd } : {}),
     sessionRef: { provider: expected.provider, sessionId: expected.sessionId },
   })
+  expectTabSessionType(store, expected.sessionType ?? expected.provider)
+}
+
+// Assert the resolved sessionType survived into the opened tab/pane content
+// (see comment above for where it lives — adjust the accessor, NOT the
+// expectation, if the store shape differs).
+function expectTabSessionType(store: ReturnType<typeof makeStore>, sessionType: string) {
+  const state = store.getState()
+  const tab = state.tabs.tabs[0]
+  const paneContentTypes = Object.values(state.panes?.panesByTab?.[tab.id]?.panes ?? {})
+    .map((p: any) => p?.content?.sessionType)
+  expect([tab.sessionType, ...paneContentTypes]).toContain(sessionType)
 }
 
 async function openDialogAndResolve(text: string) {
@@ -2959,6 +3207,38 @@ describe('resume button end-to-end flows (spec acceptance)', () => {
     expectResumedTab(store, { provider: 'amplifier', sessionId: AMPLIFIER_FULL, cwd: '/home/u/proj' })
   })
 
+  it('a FRESH-AGENT sessionType survives resume end to end: freshclaude match opens a freshclaude pane, not a bare claude terminal', async () => {
+    // Hard requirement: sessions opened via freshclaude/freshopencode/kilroy
+    // must reopen through that runtime. Every other flow has
+    // sessionType === provider, so ONLY this test would catch an
+    // implementation that drops or replaces the resolved sessionType
+    // (openSessionTab would then build the wrong pane runtime — see
+    // src/lib/session-type-utils.ts buildPaneInput).
+    mockResolve.mockResolvedValue(response({
+      matches: [{ ...claudeMatch(), sessionType: 'freshclaude' }],
+    }))
+    const { store } = renderApp()
+    await openDialogAndResolve(CLAUDE_V4)
+    expectResumedTab(store, {
+      provider: 'claude', sessionId: CLAUDE_V4, cwd: '/home/u/proj', sessionType: 'freshclaude',
+    })
+    // Belt-and-braces: the fresh-agent runtime, not a plain terminal pane.
+    expectTabSessionType(store, 'freshclaude')
+  })
+
+  it('DEGRADED response with a single full match: NO auto-resume, NO tab — match listed for manual confirmation', async () => {
+    // A failed provider means a higher-priority exact match may have been
+    // missed; auto-resuming the surviving match could open the WRONG session.
+    mockResolve.mockResolvedValue(response({
+      indexState: 'degraded', providerErrors: ['claude'], matches: [claudeMatch()],
+    }))
+    const { store } = renderApp()
+    await openDialogAndResolve(CLAUDE_V4)
+    expect(store.getState().tabs.tabs).toHaveLength(0)
+    expect(dialog().getByRole('status')).toHaveTextContent(/could not be searched/i)
+    expect(dialog().getByRole('list', { name: /matching sessions/i })).toBeInTheDocument()
+  })
+
   it('session already open in a pane → focuses it, no duplicate tab', async () => {
     mockResolve.mockResolvedValue(response({ matches: [claudeMatch()] }))
     const { store } = renderApp()
@@ -2999,10 +3279,12 @@ describe('resume button end-to-end flows (spec acceptance)', () => {
 
 - [ ] **Step 2: Run tests — expect them to pass (integration of finished parts) or reveal real wiring bugs**
 
+These flows are the plan's INTEGRATION GATES over units that were each built red-green in Tasks 2–8 (that is where this feature's TDD red phases live); a first-run failure here is not a broken test to rewrite — it is evidence of a real wiring bug to fix.
+
 ```bash
 npm run test:vitest -- --config config/vitest/vitest.config.ts test/e2e/resume-button-flow.test.tsx --run
 ```
-Expected: PASS. If the "already open" test fails because `openSessionTab` created a second tab, that is a REAL bug in the Task 8 wiring (e.g. sessionType mismatch in the dedup locator) — fix the wiring, not the test. If store setup fails to render, mirror the `createStore` helper from `test/e2e/sidebar-click-opens-pane.test.tsx` (lines 68–147) for the missing slices and re-run.
+Expected: PASS. If the "already open" test fails because `openSessionTab` created a second tab, that is a REAL bug in the Task 8 wiring (e.g. sessionType mismatch in the dedup locator) — fix the wiring, not the test. If the freshclaude flow fails on the store-shape accessor in `expectTabSessionType`, verify the actual field placement against `tabsSlice.openSessionTab` and fix the ACCESSOR (the expectation that `'freshclaude'` survives is non-negotiable). If store setup fails to render, mirror the `createStore` helper from `test/e2e/sidebar-click-opens-pane.test.tsx` (lines 68–147) for the missing slices and re-run.
 
 - [ ] **Step 3: Commit**
 
@@ -3058,11 +3340,13 @@ npm run lint
 npm run test:vitest -- --config config/vitest/vitest.config.ts test/unit/shared/resume-input-parser.test.ts test/unit/client/resume-session-dialog.test.tsx test/unit/client/sidebar-resume-footer.test.tsx test/e2e/resume-button-flow.test.tsx --run
 npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/session-resolver.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/coding-cli/claude-transcript-locator.test.ts test/unit/server/coding-cli/opencode-by-id-query.test.ts test/unit/server/coding-cli/opencode-by-id-runner.test.ts test/unit/server/coding-cli/resolve-fallbacks.test.ts test/unit/server/sessions-resolve-router.test.ts --run
 ```
-Expected: all PASS, no type or lint errors. Then, if `npm run test:status` reports the coordinator is free, run the standard suites for a regression sweep:
+Expected: all PASS, no type or lint errors. Then run the full regression sweep THROUGH THE COORDINATOR GATE — this sweep is MANDATORY, not conditional: per AGENTS.md, broad runs WAIT for the shared coordinator gate when another agent holds it (never skip the sweep, never kill a foreign holder). Do NOT use `npm run test:balanced` here — it launches Vitest directly (`scripts/run-standard-tests.ts`) without acquiring the coordinator gate, so it can race a concurrent holder even right after `test:status`. Use the coordinated workload commands, which acquire the gate (and block until it frees):
+
 ```bash
-npm run test:balanced
+FRESHELL_TEST_SUMMARY='resume-button final regression sweep' npm run test:unit
+FRESHELL_TEST_SUMMARY='resume-button final regression sweep' npm run test:integration
 ```
-Expected: green (matching the base-green baseline). SAFETY: none of these commands may target ports 3001/3002 or any process you did not spawn.
+Expected: green (matching the base-green baseline; `npm run test:status` earlier is advisory — it shows the current holder but is NOT the gate itself). SAFETY: none of these commands may target ports 3001/3002 or any process you did not spawn.
 
 - [ ] **Step 3: Commit**
 
