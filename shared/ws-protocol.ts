@@ -754,6 +754,7 @@ export type ErrorMessage = {
 }
 
 export type AgentRestartFailureCode =
+  | 'CAPABILITY_NOT_NEGOTIATED'
   | 'UNRESUMABLE'
   | 'RUNTIME_NOT_FOUND'
   | 'STALE_GENERATION'
