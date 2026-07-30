@@ -1435,6 +1435,17 @@ impl RestartCoordinator {
                     outcome.messages.insert(0, started);
                     return outcome;
                 } else {
+                    tracing::warn!(
+                        request_id = %request.request_id,
+                        provider = %request.provider,
+                        session_id = %request.session_id,
+                        runtime_id = %expected.runtime_id,
+                        generation = expected.generation,
+                        code = ?failure.code,
+                        retryable = failure.retryable,
+                        error = %failure.message,
+                        "agent.restart.replacement.failed"
+                    );
                     let terminal = self.failure_message(&request, expected.clone(), &failure);
                     let persisted = self.try_update_ownership(
                         "store_terminal_replacement_failure",

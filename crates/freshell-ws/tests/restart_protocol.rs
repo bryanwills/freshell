@@ -1,6 +1,6 @@
 mod common;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -17,6 +17,82 @@ use freshell_ws::restart::{
 };
 use futures_util::SinkExt;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tracing::field::{Field, Visit};
+use tracing::{Event, Subscriber};
+use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::Layer;
+
+#[derive(Debug, Clone, Default)]
+struct CapturedTraceEvent {
+    message: String,
+    fields: BTreeMap<String, String>,
+}
+
+#[derive(Default)]
+struct TraceFieldVisitor {
+    message: String,
+    fields: BTreeMap<String, String>,
+}
+
+impl Visit for TraceFieldVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        let rendered = format!("{value:?}");
+        if field.name() == "message" {
+            self.message = rendered;
+        } else {
+            self.fields.insert(field.name().to_string(), rendered);
+        }
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "message" {
+            self.message = value.to_string();
+        } else {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+}
+
+struct TraceCaptureLayer {
+    events: Arc<Mutex<Vec<CapturedTraceEvent>>>,
+}
+
+impl<S: Subscriber> Layer<S> for TraceCaptureLayer {
+    fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+        let mut visitor = TraceFieldVisitor::default();
+        event.record(&mut visitor);
+        self.events
+            .lock()
+            .expect("trace capture lock")
+            .push(CapturedTraceEvent {
+                message: visitor.message,
+                fields: visitor.fields,
+            });
+    }
+}
+
+fn capture_traces() -> (
+    Arc<Mutex<Vec<CapturedTraceEvent>>>,
+    tracing::subscriber::DefaultGuard,
+) {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(TraceCaptureLayer {
+        events: Arc::clone(&events),
+    });
+    let guard = tracing::subscriber::set_default(subscriber);
+    (events, guard)
+}
 
 struct FakeRuntime {
     events: Mutex<Vec<&'static str>>,
@@ -768,6 +844,96 @@ impl RestartRuntime for ReplacementFails {
             true,
         ))
     }
+}
+
+struct NonRetryableReplacementFails;
+
+#[async_trait::async_trait]
+impl RestartRuntime for NonRetryableReplacementFails {
+    type ResumePlan = ();
+
+    async fn preflight(&self, _request: &AgentRestart) -> Result<(), RestartFailure> {
+        Ok(())
+    }
+
+    async fn shutdown_for_restart(
+        &self,
+        _request: &AgentRestart,
+        _plan: &(),
+    ) -> Result<(), RestartFailure> {
+        Ok(())
+    }
+
+    async fn create_replacement(
+        &self,
+        _request: &AgentRestart,
+        _plan: (),
+    ) -> Result<String, RestartFailure> {
+        Err(RestartFailure::new(
+            AgentRestartFailureCode::ReplacementFailed,
+            "replacement cannot resume this durable session",
+            false,
+        ))
+    }
+}
+
+#[tokio::test]
+async fn non_retryable_replacement_failure_logs_its_terminal_restart_outcome() {
+    let coordinator = RestartCoordinator::new();
+    coordinator.register_initial(locator(), "term-1");
+    let (events, _trace_guard) = capture_traces();
+
+    let outcome = coordinator
+        .execute(
+            restart("terminal-failure-r1", "term-1", 1),
+            &NonRetryableReplacementFails,
+        )
+        .await;
+
+    assert!(matches!(
+        outcome.messages.as_slice(),
+        [ServerMessage::AgentRestartStarted(_), ServerMessage::AgentRestartFailed(message)]
+            if message.code == AgentRestartFailureCode::ReplacementFailed && !message.retryable
+    ));
+    let event = events
+        .lock()
+        .expect("trace capture lock")
+        .iter()
+        .find(|event| event.message == "agent.restart.replacement.failed")
+        .cloned()
+        .expect("non-retryable replacement failure must be logged");
+    assert_eq!(
+        event.fields.get("request_id").map(String::as_str),
+        Some("terminal-failure-r1")
+    );
+    assert_eq!(
+        event.fields.get("provider").map(String::as_str),
+        Some("claude")
+    );
+    assert_eq!(
+        event.fields.get("session_id").map(String::as_str),
+        Some("durable-1")
+    );
+    assert_eq!(
+        event.fields.get("runtime_id").map(String::as_str),
+        Some("term-1")
+    );
+    assert_eq!(
+        event.fields.get("generation").map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        event.fields.get("code").map(String::as_str),
+        Some("ReplacementFailed")
+    );
+    assert_eq!(
+        event.fields.get("retryable").map(String::as_str),
+        Some("false")
+    );
+    assert_eq!(
+        event.fields.get("error").map(String::as_str),
+        Some("replacement cannot resume this durable session")
+    );
 }
 
 #[tokio::test]
