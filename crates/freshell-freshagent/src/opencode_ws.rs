@@ -986,7 +986,7 @@ impl FreshOpencodeState {
             },
         };
 
-        let (status_session_id, running) = {
+        let (status_session_id, running, runtime) = {
             let mut session = session_arc.lock().await;
 
             // Ensure the serve-SSE bridge is running (restart it if it died) -- only
@@ -1018,13 +1018,14 @@ impl FreshOpencodeState {
                 .as_ref()
                 .map(|t| !t.is_finished())
                 .unwrap_or(false);
-            (status_session_id, running)
+            (status_session_id, running, session.runtime.clone())
         };
 
         let status = if running { "running" } else { "idle" };
-        self.broadcast(&event_frame(
+        self.broadcast(&runtime_event_frame(
             &status_session_id,
             snapshot_event(&status_session_id, status),
+            &runtime,
         ));
     }
 

@@ -2836,6 +2836,7 @@ mod tests {
             terminal_id: "T".to_string(),
             attach_request_id: None,
             source: Some(OutputSource::Live),
+            runtime: None,
         }
     }
 

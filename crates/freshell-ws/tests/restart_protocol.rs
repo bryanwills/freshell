@@ -738,6 +738,29 @@ fn negotiated_runtime_surface_without_an_authoritative_descriptor_is_not_forward
 }
 
 #[test]
+fn runtime_independent_fresh_agent_errors_are_forwarded_without_a_descriptor() {
+    let coordinator = RestartCoordinator::new();
+    let error = serde_json::to_string(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
+        event: serde_json::json!({
+            "type": "freshAgent.error",
+            "code": "INVALID_SESSION_ID",
+            "message": "session not found",
+        }),
+        provider: "claude".to_string(),
+        session_id: "unknown-runtime".to_string(),
+        session_type: "freshclaude".to_string(),
+        runtime: None,
+    }))
+    .unwrap();
+
+    assert_eq!(
+        coordinator.observe_serialized(&error),
+        Some(error),
+        "runtime-independent control errors must reach the client recovery path"
+    );
+}
+
+#[test]
 fn fresh_agent_replacement_uses_a_distinct_live_identity_and_fences_old_frames() {
     let coordinator = RestartCoordinator::new();
     let session_ref = SessionLocator {

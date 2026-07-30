@@ -1121,7 +1121,11 @@ impl RestartCoordinator {
             ServerMessage::TerminalExit(frame) => frame.runtime.is_some(),
             ServerMessage::TerminalSessionAssociated(frame) => frame.runtime.is_some(),
             ServerMessage::FreshAgentCreated(frame) => frame.runtime.is_some(),
-            ServerMessage::FreshAgentEvent(frame) => frame.runtime.is_some(),
+            ServerMessage::FreshAgentEvent(frame) => {
+                frame.runtime.is_some()
+                    || frame.event.get("type").and_then(serde_json::Value::as_str)
+                        == Some("freshAgent.error")
+            }
             ServerMessage::FreshAgentSessionMaterialized(frame) => frame.runtime.is_some(),
             ServerMessage::PaneReconcileResult(frame) => frame.verdicts.iter().all(|verdict| {
                 verdict.verdict != freshell_protocol::ReconcileVerdict::Attach

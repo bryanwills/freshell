@@ -237,6 +237,7 @@ mod tests {
             terminal_id: "term-1".to_string(),
             attach_request_id: Some("req-1".to_string()),
             source: None,
+            runtime: None,
         });
         let meta = output_frame_meta(&msg).expect("TerminalOutput is queueable");
         (msg, meta)
@@ -259,6 +260,7 @@ mod tests {
             stream_id: "s".to_string(),
             terminal_id: "t".to_string(),
             attach_request_id: None,
+            runtime: None,
         });
         assert!(
             output_frame_meta(&non_output).is_none(),
@@ -382,6 +384,7 @@ mod tests {
             terminal_id: "term-2".to_string(),
             attach_request_id: None,
             source: None,
+            runtime: None,
         });
         let meta_b = output_frame_meta(&msg_b).unwrap();
         q.push(msg_b.clone(), 100, meta_b); // evicts A's seq 1 (queue already at 100, +100 = 200 > 150)
