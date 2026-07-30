@@ -3850,6 +3850,66 @@ fn kill_and_broadcast(state: &WsState, terminal_id: &str) -> bool {
     false
 }
 
+pub(crate) fn shutdown_terminal_for_restart(state: &WsState, terminal_id: &str) -> bool {
+    kill_and_broadcast(state, terminal_id)
+}
+
+pub(crate) async fn create_terminal_replacement(
+    state: &WsState,
+    request: &freshell_protocol::AgentRestart,
+    cwd: Option<String>,
+) -> Result<String, String> {
+    let create = TerminalCreate {
+        request_id: format!(
+            "agent-restart:{}:{}",
+            request.request_id,
+            uuid::Uuid::new_v4()
+        ),
+        mode: request.provider.clone(),
+        shell: freshell_protocol::Shell::System,
+        codex_durability: None,
+        cwd,
+        live_terminal: None,
+        pane_id: None,
+        recovery_intent: None,
+        restore: Some(true),
+        resume_session_id: Some(request.session_id.clone()),
+        session_ref: Some(freshell_protocol::SessionLocator {
+            provider: request.provider.clone(),
+            session_id: request.session_id.clone(),
+        }),
+        tab_id: None,
+    };
+    let timeout = std::time::Duration::from_millis(state.create_protect.spawn_timeout_ms);
+    let (_cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+    let _permit = state
+        .spawn_gate
+        .acquire(timeout, &mut cancel_rx)
+        .await
+        .map_err(|error| {
+            let (_, message) = spawn_gate_error_parts(error);
+            message.to_string()
+        })?;
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+    let sink: freshell_terminal::FrameSink = std::sync::Arc::new(move |message| {
+        let _ = reply_tx.send(message);
+    });
+    let mut out = crate::create_gate::CreateOutput::Channel(&sink);
+    let mut limiter = crate::create_limit::CreateRateLimiter::new(
+        state.create_protect.rate_limit,
+        state.create_protect.rate_window_ms,
+    );
+    let _ = handle_create(create, &mut out, state, u64::MAX, true, &mut limiter).await;
+    while let Ok(message) = reply_rx.try_recv() {
+        match message {
+            ServerMessage::TerminalCreated(created) => return Ok(created.terminal_id),
+            ServerMessage::Error(error) => return Err(error.message),
+            _ => {}
+        }
+    }
+    Err("terminal replacement ended without a terminal.created result".to_string())
+}
+
 /// Whether a `freshAgent.interrupt`/`freshAgent.kill` frame should route to the codex
 /// handler. PR-1 scope: only `codex` is wired to `FreshCodexState`; other providers keep
 /// the prior swallow behavior until a later PR adds their handlers.

@@ -211,12 +211,16 @@ async fn main() -> ExitCode {
             Err(error) => {
                 tracing::error!(
                     error = %error,
-                    "agent.restart.persistence.load_failed: restart replay durability disabled"
+                    "agent.restart.persistence.load_failed: restart transactions disabled"
                 );
-                freshell_ws::restart::RestartCoordinator::new()
+                freshell_ws::restart::RestartCoordinator::disabled_for_persistence(format!(
+                    "restart state could not be loaded: {error}"
+                ))
             }
         },
-        None => freshell_ws::restart::RestartCoordinator::new(),
+        None => freshell_ws::restart::RestartCoordinator::disabled_for_persistence(
+            "restart state has no durable home directory",
+        ),
     };
 
     // The shared server→client broadcast bus (pre-serialized frames). REST handlers
@@ -656,6 +660,22 @@ async fn main() -> ExitCode {
         restart: restart.clone(),
         pane_ledger: std::sync::Arc::clone(&pane_ledger),
     };
+    let _restart_runtime_registration = restart.set_runtime(std::sync::Arc::new(
+        freshell_ws::restart::ProductionRestartRuntime::new(ws_state.clone()),
+    ));
+    {
+        let restart = restart.clone();
+        let broadcast_tx = Arc::clone(&broadcast_tx);
+        tokio::spawn(async move {
+            restart
+                .recover_pending_registered(|message| {
+                    if let Ok(frame) = serde_json::to_string(message) {
+                        let _ = broadcast_tx.send(frame);
+                    }
+                })
+                .await;
+        });
+    }
 
     // Lane D1 (Task 5): the auto-resume hub — consumes the crash events the
     // PTY exit hook sends and drives bounded respawns. A boot-time background

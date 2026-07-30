@@ -138,6 +138,22 @@ fn restart(request_id: &str, live_id: &str, generation: u64) -> AgentRestart {
     }
 }
 
+struct PresentSessions;
+
+impl freshell_ws::existence::SessionExistenceProbe for PresentSessions {
+    fn exists(
+        &self,
+        _provider: &str,
+        _session_id: &str,
+    ) -> freshell_ws::existence::SessionExistence {
+        freshell_ws::existence::SessionExistence::Present
+    }
+
+    fn ever_observed(&self, _provider: &str, _session_id: &str) -> bool {
+        true
+    }
+}
+
 #[tokio::test]
 async fn restart_preflights_before_stopping_the_selected_runtime() {
     let coordinator = RestartCoordinator::new();
@@ -630,6 +646,168 @@ async fn retryable_post_shutdown_failure_is_durable_without_claiming_old_runtime
     assert_eq!(reopened.pending_recoveries()[0].request_id, "pending-r1");
 }
 
+struct RecoveringReplacement {
+    attempts: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl RestartRuntime for RecoveringReplacement {
+    type ResumePlan = ();
+
+    async fn preflight(&self, _request: &AgentRestart) -> Result<(), RestartFailure> {
+        Ok(())
+    }
+
+    async fn shutdown_for_restart(
+        &self,
+        _request: &AgentRestart,
+        _plan: &(),
+    ) -> Result<(), RestartFailure> {
+        panic!("a pending post-shutdown recovery must not tear down the old runtime twice")
+    }
+
+    async fn create_replacement(
+        &self,
+        _request: &AgentRestart,
+        _plan: (),
+    ) -> Result<String, RestartFailure> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        Ok("term-recovered".to_string())
+    }
+}
+
+#[tokio::test]
+async fn identical_retry_resumes_a_persisted_post_shutdown_replacement() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("restart-state.json");
+    let request = restart("pending-r1", "term-1", 1);
+    let coordinator = RestartCoordinator::new_persistent(path.clone()).unwrap();
+    coordinator.register_initial(locator(), "term-1");
+    coordinator
+        .execute(request.clone(), &ReplacementFails)
+        .await;
+    drop(coordinator);
+
+    let reopened = RestartCoordinator::new_persistent(path).unwrap();
+    let runtime = RecoveringReplacement {
+        attempts: AtomicUsize::new(0),
+    };
+    let recovered = reopened.execute(request.clone(), &runtime).await;
+
+    assert!(!recovered.replayed);
+    assert!(matches!(
+        recovered.messages.last(),
+        Some(ServerMessage::AgentRestartReplaced(message))
+            if message.runtime.runtime_id == "term-recovered"
+    ));
+    assert_eq!(runtime.attempts.load(Ordering::SeqCst), 1);
+    assert!(reopened.pending_recoveries().is_empty());
+
+    let replay = reopened.execute(request, &runtime).await;
+    assert!(replay.replayed);
+    assert_eq!(runtime.attempts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn persistence_failure_before_shutdown_fails_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("restart-state.json");
+    let coordinator = RestartCoordinator::new_persistent(path.clone()).unwrap();
+    coordinator.register_initial(locator(), "term-1");
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    let runtime = FakeRuntime::resumable("must-not-start");
+
+    let outcome = coordinator
+        .execute(restart("persistence-r1", "term-1", 1), &runtime)
+        .await;
+
+    assert_eq!(runtime.shutdowns.load(Ordering::SeqCst), 0);
+    assert!(runtime.running.load(Ordering::SeqCst));
+    assert!(matches!(
+        outcome.messages.as_slice(),
+        [ServerMessage::AgentRestartFailed(message)]
+            if message.retryable
+                && message.code == AgentRestartFailureCode::PreflightFailed
+    ));
+}
+
+#[tokio::test]
+async fn reopened_late_terminal_association_advances_persisted_generation() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("restart-state.json");
+    let coordinator = RestartCoordinator::new_persistent(path.clone()).unwrap();
+    coordinator.register_initial(locator(), "term-1");
+    coordinator
+        .execute(
+            restart("generation-r1", "term-1", 1),
+            &FakeRuntime::resumable("term-2"),
+        )
+        .await;
+    drop(coordinator);
+
+    let reopened = RestartCoordinator::new_persistent(path).unwrap();
+    reopened.register_live(AgentRuntimeKind::Terminal, "term-late");
+    let mut associated = ServerMessage::TerminalSessionAssociated(TerminalSessionAssociated {
+        terminal_id: "term-late".to_string(),
+        session_ref: SessionLocator {
+            provider: "claude".to_string(),
+            session_id: "durable-1".to_string(),
+        },
+        previous_session_id: None,
+        runtime: None,
+    });
+    reopened.observe_server_message(&mut associated);
+
+    let ServerMessage::TerminalSessionAssociated(associated) = associated else {
+        unreachable!()
+    };
+    assert_eq!(
+        associated.runtime,
+        Some(RuntimeDescriptor {
+            runtime_id: "term-late".to_string(),
+            generation: 3,
+        })
+    );
+}
+
+#[tokio::test]
+async fn coordinator_bounds_result_and_lock_retention() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("bounded-restart-state.json");
+    let coordinator = RestartCoordinator::new_persistent_with_limits(path.clone(), 2, 2).unwrap();
+    for index in 0..3 {
+        let locator = RuntimeLocator::new(
+            AgentRuntimeKind::Terminal,
+            "claude",
+            format!("durable-{index}"),
+        );
+        let live = format!("term-{index}");
+        coordinator.register_initial(locator, &live);
+        coordinator
+            .execute(
+                AgentRestart {
+                    request_id: format!("bounded-r{index}"),
+                    provider: "claude".to_string(),
+                    session_id: format!("durable-{index}"),
+                    kind: AgentRuntimeKind::Terminal,
+                    live_id: live,
+                    expected_generation: 1,
+                },
+                &FakeRuntime::resumable("replacement"),
+            )
+            .await;
+    }
+
+    assert_eq!(coordinator.retained_result_count(), 2);
+    assert!(coordinator.retained_lock_counts().0 <= 2);
+    assert!(coordinator.retained_lock_counts().1 <= 2);
+    drop(coordinator);
+
+    let reopened = RestartCoordinator::new_persistent_with_limits(path, 2, 2).unwrap();
+    assert_eq!(reopened.retained_result_count(), 2);
+}
+
 struct ConcurrentRuntime {
     entered: Arc<tokio::sync::Barrier>,
     replacement: &'static str,
@@ -698,7 +876,7 @@ async fn unrelated_provider_runtimes_restart_concurrently() {
 #[tokio::test]
 async fn connected_websocket_dispatches_restart_started_replaced_and_failed() {
     let (url, registry, state) = common::spawn_server_with_specs_and_state(vec![]).await;
-    state
+    let _runtime_registration = state
         .restart
         .set_runtime(Arc::new(FakeRuntime::resumable("term-ws-2")));
     state.restart.register_initial(locator(), "term-ws-1");
@@ -725,7 +903,7 @@ async fn connected_websocket_dispatches_restart_started_replaced_and_failed() {
     state
         .restart
         .register_initial(failed_locator, "term-ws-failed");
-    state
+    let _runtime_registration = state
         .restart
         .set_runtime(Arc::new(FakeRuntime::unresumable()));
     let failed_request = AgentRestart {
@@ -748,6 +926,92 @@ async fn connected_websocket_dispatches_restart_started_replaced_and_failed() {
     assert_eq!(failed["code"], "UNRESUMABLE");
 
     registry.kill_all();
+}
+
+#[tokio::test]
+async fn production_terminal_adapter_uses_the_builtin_restore_path() {
+    let (url, registry, mut state) =
+        common::spawn_server_with_specs_and_state(vec![common::sleeper_cli_spec("amplifier")])
+            .await;
+    state.session_existence = Arc::new(PresentSessions);
+    let _runtime_registration = state.restart.set_runtime(Arc::new(
+        freshell_ws::restart::ProductionRestartRuntime::new(state.clone()),
+    ));
+    let (mut ws, _) = common::connect_and_capture_inventory(&url).await;
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "terminal.create",
+            "requestId": "production-adapter-create",
+            "mode": "amplifier",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let created = common::next_frame_of_type(&mut ws, "terminal.created").await;
+    let terminal_id = created["terminalId"].as_str().unwrap().to_string();
+    let session_id = created["sessionRef"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let generation = created["runtime"]["generation"].as_u64().unwrap();
+
+    ws.send(WsMessage::Text(
+        serde_json::to_string(&ClientMessage::AgentRestart(AgentRestart {
+            request_id: "production-adapter-restart".to_string(),
+            provider: "amplifier".to_string(),
+            session_id,
+            kind: AgentRuntimeKind::Terminal,
+            live_id: terminal_id.clone(),
+            expected_generation: generation,
+        }))
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    common::next_frame_of_type(&mut ws, "agent.restart.started").await;
+    let replaced = common::next_frame_of_type(&mut ws, "agent.restart.replaced").await;
+    let replacement_id = replaced["runtimeId"].as_str().unwrap();
+
+    assert_ne!(replacement_id, terminal_id);
+    assert!(!registry.is_live(&terminal_id));
+    assert!(registry.is_live(replacement_id));
+    registry.kill_all();
+}
+
+#[tokio::test]
+async fn boot_recovery_runs_through_the_registered_adapter_and_persists_result() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("restart-state.json");
+    let request = restart("boot-pending-r1", "term-1", 1);
+    let coordinator = RestartCoordinator::new_persistent(path.clone()).unwrap();
+    coordinator.register_initial(locator(), "term-1");
+    coordinator
+        .execute(request.clone(), &ReplacementFails)
+        .await;
+    drop(coordinator);
+
+    let reopened = RestartCoordinator::new_persistent(path).unwrap();
+    let runtime = Arc::new(RecoveringReplacement {
+        attempts: AtomicUsize::new(0),
+    });
+    let _runtime_registration = reopened.set_runtime(runtime.clone());
+    let emitted = Mutex::new(Vec::new());
+    reopened
+        .recover_pending_registered(|message| emitted.lock().unwrap().push(message.clone()))
+        .await;
+
+    assert_eq!(runtime.attempts.load(Ordering::SeqCst), 1);
+    assert!(reopened.pending_recoveries().is_empty());
+    assert!(matches!(
+        emitted.lock().unwrap().last(),
+        Some(ServerMessage::AgentRestartReplaced(_))
+    ));
+    let replay = reopened.execute_registered(request, |_| {}).await;
+    assert!(replay.replayed);
 }
 
 #[tokio::test]
