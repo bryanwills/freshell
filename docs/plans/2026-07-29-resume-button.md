@@ -1081,6 +1081,7 @@ EOF
 **Files:**
 - Create: `server/coding-cli/resolve-fallbacks.ts`
 - Modify: `server/sessions-router.ts` (extend `SessionsRouterDeps` ~line 39; add route inside `createSessionsRouter` after the existing `router.post('/session-metadata', …)` handler ~line 239)
+- Modify: `server/coding-cli/providers/opencode.ts` (one-word visibility change: `getDatabasePath()` is declared `private` at ~line 78 — remove the `private` keyword so `buildResolveFallbacks` can call it; verified during load-bearing validation)
 - Test: `test/unit/server/sessions-resolve-router.test.ts`
 
 **Interfaces:**
@@ -1279,7 +1280,7 @@ export function buildResolveFallbacks(providers: CodingCliProvider[]): ResolveFa
 }
 ```
 
-Note: `OpencodeProvider.getDatabasePath()` exists and is public (TS-default) — see `server/coding-cli/providers/opencode.ts` (`return path.join(this.homeDir, 'opencode.db')`). If it turns out to be declared `private`, change its declaration to public in that file (no other change).
+Note (VERIFIED during load-bearing validation): `getDatabasePath()` exists at `server/coding-cli/providers/opencode.ts:78-79` (`return path.join(this.homeDir, 'opencode.db')`) but is declared **`private`**. As part of this step, remove the `private` keyword (make it public — no other change to that file) so `buildResolveFallbacks` compiles. Alternative considered and rejected: `getSessionRoots()[0]` also returns the DB path (opencode.ts:332-333), but an explicit public getter is clearer than an indexed root.
 
 - [ ] **Step 4: Add the route to `server/sessions-router.ts`**
 
@@ -1367,7 +1368,7 @@ Expected: PASS (no regressions from the deps change).
 - [ ] **Step 7: Commit**
 
 ```bash
-git add server/sessions-router.ts server/coding-cli/resolve-fallbacks.ts test/unit/server/sessions-resolve-router.test.ts
+git add server/sessions-router.ts server/coding-cli/resolve-fallbacks.ts server/coding-cli/providers/opencode.ts test/unit/server/sessions-resolve-router.test.ts
 git commit -m "$(cat <<'EOF'
 feat(server): POST /api/sessions/resolve scanning all providers with exact-id fallbacks
 
@@ -1618,7 +1619,23 @@ import { OVERLAY_Z } from '@/components/ui/overlay'
 import { resolveResumeInput, type ResumeResolveMatch, type ResumeResolveResponse } from '@/lib/api'
 import { parseResumeInput, type ResumeProviderName } from '@shared/resume-input-parser'
 import { DEFAULT_ENABLED_CLI_PROVIDERS } from '@shared/coding-cli-defaults'
-import { formatRelativeTime } from '@/lib/utils'
+
+// Local copy of Sidebar.tsx's module-private formatRelativeTime (verified NOT
+// exported anywhere; importing from Sidebar would create a circular import
+// since Sidebar renders this dialog).
+function formatRelativeTime(timestamp: number): string {
+  const now = Date.now()
+  const diff = now - timestamp
+  const minutes = Math.floor(diff / 60000)
+  const hours = Math.floor(diff / 3600000)
+  const days = Math.floor(diff / 86400000)
+
+  if (minutes < 1) return 'now'
+  if (minutes < 60) return `${minutes}m`
+  if (hours < 24) return `${hours}h`
+  if (days < 7) return `${days}d`
+  return new Date(timestamp).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+}
 
 export type ResumeSessionDialogProps = {
   open: boolean
@@ -1725,8 +1742,7 @@ export default function ResumeSessionDialog({ open, onClose, onResume }: ResumeS
 
   return createPortal(
     <div
-      className="fixed inset-0 bg-black/50 flex items-center justify-center p-4"
-      style={{ zIndex: OVERLAY_Z }}
+      className={`fixed inset-0 bg-black/50 flex items-center justify-center p-4 ${OVERLAY_Z.modal}`}
       onMouseDown={(e) => { if (e.target === e.currentTarget) onClose() }}
     >
       <div
@@ -1872,8 +1888,9 @@ export default function ResumeSessionDialog({ open, onClose, onResume }: ResumeS
 }
 ```
 
-Implementation notes for this step:
-- If `formatRelativeTime` is not exported from `@/lib/utils`, find its actual home with `grep -rn "export function formatRelativeTime" src/` and import from there (Sidebar.tsx uses it — copy Sidebar's import).
+Implementation notes for this step (facts verified during load-bearing validation):
+- `formatRelativeTime` is a module-LOCAL (non-exported) function in `src/components/Sidebar.tsx` (~line 107) and exists nowhere else — that is why the dialog defines its own local copy above. Do NOT import it from Sidebar.tsx (Sidebar renders this dialog; that import would be circular) and do NOT add it to `@/lib/utils` (keeps this change's blast radius to new files).
+- `OVERLAY_Z` (`src/components/ui/overlay.ts`) is a map of Tailwind z-index classes `{ tooltip: 'z-40', menu: 'z-50', modal: 'z-[60]' }`, NOT a number — hence `${OVERLAY_Z.modal}` appended to the overlay `className` (never `style={{ zIndex: … }}`).
 - `DEFAULT_ENABLED_CLI_PROVIDERS` is `readonly ['claude','codex','opencode','amplifier']` — the `.map` cast shown handles it.
 - Keep the focus behavior: initial focus lands on the paste field (`inputRef`), Escape closes. If the repo's a11y tests demand a full focus trap, mirror the `getFocusable`/Tab-cycling logic from `src/components/ui/confirm-modal.tsx` inside this component.
 
