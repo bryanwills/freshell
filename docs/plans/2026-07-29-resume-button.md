@@ -3363,3 +3363,8 @@ EOF
 ```
 
 Do NOT open a PR — prepare the branch and stop (explicit user approval required per AGENTS.md).
+
+## Verification log
+
+- Target backend confirmed (Task 1): `npm run dev` → `tsx watch server/index.ts`; `npm run start` → `node dist/server/index.js`. The Node server (`server/index.ts`) serves the sidebar in the default dev/start path; the feature's API is implemented there per spec.
+- Deployment gap recorded (Task 1): the canonical self-hosted production is the RUST server (AGENTS.md, `scripts/launch-rust.sh`, port 3002) serving the same `dist/client`; it has no `/api/sessions/resolve`. The client degrades gracefully on resolve 404 (explicit "this server build does not support resume-by-id" message — implemented and tested in Task 7). FOLLOW-UP: Rust-server `/api/sessions/resolve` parity is required before the Resume button is fully functional on the canonical production deployment.
