@@ -117,6 +117,34 @@ describe('freshAgentSlice agent restart replacement', () => {
     expect(next.sessions[key].lastErrorCode).toBeUndefined()
   })
 
+  it('preserves live ephemera for an idempotent reconcile adoption of the identical runtime', () => {
+    const state = stateWithStaleRuntimeEphemera()
+    const next = reducer(state, adoptReconcileRuntime({
+      provider: 'codex',
+      sessionIds: ['s1'],
+      runtime: oldRuntime,
+    }))
+
+    expect(next).toBe(state)
+    expect(next.sessions[key]).toMatchObject({
+      runtimeId: oldRuntime.runtimeId,
+      runtimeGeneration: oldRuntime.generation,
+      status: 'running',
+      latestTurnId: 'turn-1',
+      streamingText: 'partial',
+      streamingActive: true,
+      lastError: 'old runtime failed',
+      lastErrorCode: 'OLD_RUNTIME_ERROR',
+    })
+
+    const afterEvent = reducer(next, setSessionStatus({
+      ...locator,
+      status: 'idle',
+      runtime: oldRuntime,
+    }))
+    expect(afterEvent.sessions[key].status).toBe('idle')
+  })
+
   it('clears stale runtime ephemera when reconcile clears a runtime for recreation', () => {
     const next = reducer(stateWithStaleRuntimeEphemera(), clearReconcileRuntime({
       provider: 'codex',

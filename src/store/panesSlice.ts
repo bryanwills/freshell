@@ -50,6 +50,15 @@ type FreshAgentSessionMaterializedPayload = {
   sessionRef?: SessionLocator
 }
 
+export type RestartFreshAgentCreatePayload = {
+  tabId: string
+  paneId: string
+  content?: FreshAgentPaneContent
+  sessionIds?: string[]
+  sessionType?: FreshAgentPaneContent['sessionType']
+  provider?: FreshAgentPaneContent['provider']
+}
+
 function buildPreservedSessionRef(
   localContent: Extract<PaneContent, { kind: 'terminal' | 'fresh-agent' }>,
   _preservedResumeSessionId?: string,
@@ -1633,7 +1642,7 @@ export const panesSlice = createSlice({
 
     restartFreshAgentCreate: (
       state,
-      action: PayloadAction<{ tabId: string; paneId: string }>
+      action: PayloadAction<RestartFreshAgentCreatePayload>
     ) => {
       const { tabId, paneId } = action.payload
       const root = state.layouts[tabId]
@@ -1644,16 +1653,19 @@ export const panesSlice = createSlice({
           if (node.id !== paneId || node.content.kind !== 'fresh-agent') {
             return node
           }
+          const replacement = action.payload.content ?? {
+            ...node.content,
+            sessionId: undefined,
+            createRequestId: nanoid(),
+            status: 'creating',
+            createError: undefined,
+          }
           return {
             ...node,
             content: normalizePaneContent({
-              ...node.content,
-              sessionId: undefined,
+              ...replacement,
               runtimeId: undefined,
               runtimeGeneration: undefined,
-              createRequestId: nanoid(),
-              status: 'creating',
-              createError: undefined,
             }, node.content),
           }
         }

@@ -15,7 +15,13 @@ import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { getWsClient, RECONCILE_VERDICT_WAIT_MS } from '@/lib/ws-client'
 import { createLogger } from '@/lib/client-logger'
 import { api, getFreshAgentThreadSnapshot, setSessionMetadata } from '@/lib/api'
-import { clearReconcilePendingPane, consumePaneRefreshRequest, mergePaneContent, updatePaneContent } from '@/store/panesSlice'
+import {
+  clearReconcilePendingPane,
+  consumePaneRefreshRequest,
+  mergePaneContent,
+  restartFreshAgentCreate,
+  updatePaneContent,
+} from '@/store/panesSlice'
 import { clearPendingCreateFailure, clearSessionLost, setSessionStatus } from '@/store/freshAgentSlice'
 import { buildReconcileRequestForPanes, foldVerdicts, isFreshAgentReconcileActive } from '@/lib/pane-reconcile'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
@@ -1036,6 +1042,28 @@ export function FreshAgentView({
     } as const
   }, [providerDefaults, tabRestoreSource])
 
+  const restartPaneForIntentionalCreate = useCallback((
+    current: FreshAgentPaneContent,
+    content: FreshAgentPaneContent,
+  ) => {
+    const sessionIds = new Set<string>()
+    if (current.sessionId) sessionIds.add(current.sessionId)
+    if (current.sessionRef?.provider === current.provider) sessionIds.add(current.sessionRef.sessionId)
+    if (current.resumeSessionId) sessionIds.add(current.resumeSessionId)
+    dispatch(restartFreshAgentCreate({
+      tabId,
+      paneId,
+      content: {
+        ...content,
+        runtimeId: undefined,
+        runtimeGeneration: undefined,
+      },
+      sessionIds: [...sessionIds],
+      sessionType: current.sessionType,
+      provider: current.provider,
+    }))
+  }, [dispatch, paneId, tabId])
+
   const startNewConversation = useCallback(() => {
     const current = paneContentRef.current
     if (current.sessionId) {
@@ -1054,24 +1082,20 @@ export function FreshAgentView({
     setLocalEcho(null)
     alwaysAllowToolsRef.current.clear()
     pendingAutoTitleBySessionIdRef.current.clear()
-    dispatch(updatePaneContent({
-      tabId,
-      paneId,
-      content: {
-        ...current,
-        createRequestId: nanoid(),
-        sessionId: undefined,
-        runtimeId: undefined,
-        runtimeGeneration: undefined,
-        sessionRef: undefined,
-        resumeSessionId: undefined,
-        restoreError: undefined,
-        createError: undefined,
-        status: 'creating',
-        pendingLocalEcho: undefined,
-      },
-    }))
-  }, [commitSnapshot, dispatch, paneId, sendFreshAgentMessage, setLocalEcho, tabId])
+    restartPaneForIntentionalCreate(current, {
+      ...current,
+      createRequestId: nanoid(),
+      sessionId: undefined,
+      runtimeId: undefined,
+      runtimeGeneration: undefined,
+      sessionRef: undefined,
+      resumeSessionId: undefined,
+      restoreError: undefined,
+      createError: undefined,
+      status: 'creating',
+      pendingLocalEcho: undefined,
+    })
+  }, [commitSnapshot, restartPaneForIntentionalCreate, sendFreshAgentMessage, setLocalEcho])
 
   const sendFork = useCallback((atTurnId?: string) => {
     const current = paneContentRef.current
@@ -1163,38 +1187,30 @@ export function FreshAgentView({
       const hadLegacyRestoreTarget = current.provider === 'codex'
         ? Boolean(current.resumeSessionId)
         : Boolean(getPreferredResumeSessionId(claudeSession) || current.resumeSessionId)
-      dispatch(updatePaneContent({
-        tabId,
-        paneId,
-        content: {
-          ...current,
-          sessionId: undefined,
-          resumeSessionId: undefined,
-          sessionRef: undefined,
-          restoreError: buildRestoreError(hadLegacyRestoreTarget ? 'invalid_legacy_restore_target' : 'dead_live_handle'),
-          createRequestId: nextRequestId,
-          status: 'idle',
-          createError: undefined,
-        },
-      }))
+      restartPaneForIntentionalCreate(current, {
+        ...current,
+        sessionId: undefined,
+        resumeSessionId: undefined,
+        sessionRef: undefined,
+        restoreError: buildRestoreError(hadLegacyRestoreTarget ? 'invalid_legacy_restore_target' : 'dead_live_handle'),
+        createRequestId: nextRequestId,
+        status: 'idle',
+        createError: undefined,
+      })
       return
     }
 
-    dispatch(updatePaneContent({
-      tabId,
-      paneId,
-      content: {
-        ...current,
-        sessionId: undefined,
-        resumeSessionId: canonicalResumeSessionId,
-        sessionRef: { provider: current.provider, sessionId: canonicalResumeSessionId },
-        restoreError: undefined,
-        createRequestId: nextRequestId,
-        status: 'creating',
-        createError: undefined,
-      },
-    }))
-  }, [claudeSession, dispatch, paneId, tabId])
+    restartPaneForIntentionalCreate(current, {
+      ...current,
+      sessionId: undefined,
+      resumeSessionId: canonicalResumeSessionId,
+      sessionRef: { provider: current.provider, sessionId: canonicalResumeSessionId },
+      restoreError: undefined,
+      createRequestId: nextRequestId,
+      status: 'creating',
+      createError: undefined,
+    })
+  }, [claudeSession, restartPaneForIntentionalCreate])
 
   // Capability-gated .lost resolution (paneReconcileFreshAgentV1): a lost
   // session asks the SERVER for the pane's true state via a single-pane
@@ -1923,43 +1939,31 @@ export function FreshAgentView({
         const fresh = paneContentRef.current
         setLoadError(null)
         commitSnapshot(null)
-        dispatch(updatePaneContent({
-          tabId,
-          paneId,
-          content: {
-            ...fresh,
-            sessionId: undefined,
-            runtimeId: undefined,
-            runtimeGeneration: undefined,
-            sessionRef: undefined,
-            createRequestId: nanoid(),
-            status: 'idle',
-            createError: undefined,
-            restoreError: buildRestoreError('durable_artifact_missing'),
-          },
-        }))
+        restartPaneForIntentionalCreate(fresh, {
+          ...fresh,
+          sessionId: undefined,
+          sessionRef: undefined,
+          createRequestId: nanoid(),
+          status: 'idle',
+          createError: undefined,
+          restoreError: buildRestoreError('durable_artifact_missing'),
+        })
         return
       }
       if (paneContent.provider === 'opencode' && isLostFreshOpencodeThreadError(error)) {
         const fresh = paneContentRef.current
         setLoadError(null)
         commitSnapshot(null)
-        dispatch(updatePaneContent({
-          tabId,
-          paneId,
-          content: {
-            ...fresh,
-            sessionId: undefined,
-            runtimeId: undefined,
-            runtimeGeneration: undefined,
-            sessionRef: undefined,
-            resumeSessionId: undefined,
-            createRequestId: nanoid(),
-            status: 'idle',
-            createError: undefined,
-            restoreError: buildRestoreError('durable_artifact_missing'),
-          },
-        }))
+        restartPaneForIntentionalCreate(fresh, {
+          ...fresh,
+          sessionId: undefined,
+          sessionRef: undefined,
+          resumeSessionId: undefined,
+          createRequestId: nanoid(),
+          status: 'idle',
+          createError: undefined,
+          restoreError: buildRestoreError('durable_artifact_missing'),
+        })
         return
       }
       setLoadError(error instanceof Error ? error.message : 'Failed to load session')
@@ -2019,6 +2023,7 @@ export function FreshAgentView({
     commitSnapshot,
     migratePendingAutoTitle,
     requestSnapshotRefresh,
+    restartPaneForIntentionalCreate,
     setLocalEcho,
     snapshotThreadId,
     snapshotRefreshNonce,
@@ -2447,17 +2452,14 @@ export function FreshAgentView({
                       className="fresh-agent-error-action rounded border border-border/70 px-2 py-1"
                       onClick={() => {
                         const nextRequestId = nanoid()
-                        dispatch(updatePaneContent({
-                          tabId,
-                          paneId,
-                          content: {
-                            ...paneContentRef.current,
-                            sessionId: undefined,
-                            createRequestId: nextRequestId,
-                            status: 'creating',
-                            createError: undefined,
-                          },
-                        }))
+                        const current = paneContentRef.current
+                        restartPaneForIntentionalCreate(current, {
+                          ...current,
+                          sessionId: undefined,
+                          createRequestId: nextRequestId,
+                          status: 'creating',
+                          createError: undefined,
+                        })
                       }}
                     >
                       Retry
@@ -2627,6 +2629,7 @@ export function FreshAgentView({
     pendingCreateFailure,
     queuedMessages,
     rewindToTurn,
+    restartPaneForIntentionalCreate,
     runShellCommand,
     sessionEnded,
     sessionErrorMessage,

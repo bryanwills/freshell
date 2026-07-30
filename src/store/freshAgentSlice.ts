@@ -15,6 +15,7 @@ import type {
   FreshAgentState,
   PendingCreateFailure,
 } from './freshAgentTypes'
+import { restartFreshAgentCreate } from './panesSlice'
 
 type FreshAgentSessionPayload = {
   sessionId: string
@@ -268,6 +269,9 @@ const freshAgentSlice = createSlice({
         const currentGeneration = session.runtimeGeneration
         if (currentGeneration !== undefined) {
           const sameRuntime = session.runtimeId === runtime.runtimeId
+          if (sameRuntime && runtime.generation === currentGeneration) {
+            continue
+          }
           if (sameRuntime ? runtime.generation < currentGeneration : (
             !allowServerTransition && runtime.generation <= currentGeneration
           )) {
@@ -838,6 +842,35 @@ const freshAgentSlice = createSlice({
       if (!key) return
       writeSessionStatus(state.sessions[key], 'exited')
     },
+  },
+  extraReducers: (builder) => {
+    builder.addCase(
+      restartFreshAgentCreate,
+      (state, action) => {
+        if (!action.payload.provider || !action.payload.sessionType) return
+        const sessionIds = new Set(action.payload.sessionIds?.filter(Boolean) ?? [])
+        if (sessionIds.size === 0) return
+        state.retiredRuntimeGenerations ??= {}
+        for (const session of Object.values(state.sessions)) {
+          if (
+            session.provider !== action.payload.provider
+            || session.sessionType !== action.payload.sessionType
+            || !sessionIds.has(session.sessionId)
+          ) {
+            continue
+          }
+          if (session.runtimeId && session.runtimeGeneration !== undefined) {
+            state.retiredRuntimeGenerations[session.runtimeId] = Math.max(
+              state.retiredRuntimeGenerations[session.runtimeId] ?? -1,
+              session.runtimeGeneration,
+            )
+          }
+          session.runtimeId = undefined
+          session.runtimeGeneration = undefined
+          resetRuntimeEphemeralState(session, 'starting')
+        }
+      },
+    )
   },
 })
 
