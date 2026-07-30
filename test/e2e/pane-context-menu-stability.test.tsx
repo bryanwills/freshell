@@ -18,6 +18,9 @@ import type { PaneNode } from '@/store/paneTypes'
 const wsMocks = {
   send: vi.fn(),
   requestAgentRestart: vi.fn(),
+  retryAgentRestart: vi.fn(() => true),
+  isAgentRestartRetryExhausted: vi.fn(() => false),
+  isAgentRestartRecoveryPending: vi.fn(() => false),
   bindAgentRestartStore: vi.fn(),
   connect: vi.fn().mockResolvedValue(undefined),
   onMessage: vi.fn(() => vi.fn()),
@@ -343,6 +346,18 @@ describe('pane context menu stability (e2e)', () => {
     await user.click(screen.getByRole('menuitem', { name: 'Restart pane' }))
     const restart = wsMocks.requestAgentRestart.mock.calls.at(-1)?.[0]
 
+    wsMocks.isAgentRestartRecoveryPending.mockReturnValueOnce(true)
+    act(() => onMessage?.({
+      type: 'agent.restart.started',
+      requestId: restart.requestId,
+      provider: 'claude',
+      sessionId: 'durable-claude-1',
+      kind: 'terminal',
+      runtime: {
+        runtimeId: 'runtime-claude-1',
+        generation: 6,
+      },
+    }))
     act(() => onMessage?.({
       type: 'agent.restart.failed',
       requestId: restart.requestId,
@@ -369,6 +384,74 @@ describe('pane context menu stability (e2e)', () => {
       generation: 7,
     }))
     expect(screen.queryByText(/will retry this restart automatically/i)).not.toBeInTheDocument()
+  })
+
+  it('offers Retry now after automatic restart recovery is exhausted', async () => {
+    const store = createStore(createResumableTerminalLeaf())
+    const user = userEvent.setup()
+    const { container } = renderFlow(store)
+
+    const header = await waitFor(() => {
+      const node = container.querySelector('[data-pane-id="pane-1"] [role="banner"]')
+      expect(node).not.toBeNull()
+      return node as HTMLElement
+    })
+    await user.pointer({ target: header, keys: '[MouseRight]' })
+    await settleMenu()
+    await user.click(screen.getByRole('menuitem', { name: 'Restart pane' }))
+    const restart = wsMocks.requestAgentRestart.mock.calls.at(-1)?.[0]
+    const onMessage = wsMocks.onMessage.mock.calls.at(-1)?.[0]
+    wsMocks.isAgentRestartRecoveryPending.mockReturnValueOnce(true)
+    wsMocks.isAgentRestartRetryExhausted.mockReturnValueOnce(true)
+    act(() => onMessage?.({
+      type: 'agent.restart.failed',
+      requestId: restart.requestId,
+      provider: 'claude',
+      sessionId: 'durable-claude-1',
+      kind: 'terminal',
+      runtimeId: 'runtime-claude-1',
+      generation: 6,
+      code: 'REPLACEMENT_FAILED',
+      message: 'replacement is temporarily unavailable',
+      retryable: true,
+    }))
+
+    expect(screen.getByText(/automatic restart recovery retries are exhausted/i)).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Retry now' }))
+    expect(wsMocks.retryAgentRestart).toHaveBeenCalledWith(restart.requestId)
+  })
+
+  it('does not promise automatic recovery for a retryable preflight failure', async () => {
+    const store = createStore(createResumableTerminalLeaf())
+    const user = userEvent.setup()
+    const { container } = renderFlow(store)
+    const onMessage = wsMocks.onMessage.mock.calls.at(-1)?.[0]
+
+    const header = await waitFor(() => {
+      const node = container.querySelector('[data-pane-id="pane-1"] [role="banner"]')
+      expect(node).not.toBeNull()
+      return node as HTMLElement
+    })
+    await user.pointer({ target: header, keys: '[MouseRight]' })
+    await settleMenu()
+    await user.click(screen.getByRole('menuitem', { name: 'Restart pane' }))
+    const restart = wsMocks.requestAgentRestart.mock.calls.at(-1)?.[0]
+
+    act(() => onMessage?.({
+      type: 'agent.restart.failed',
+      requestId: restart.requestId,
+      provider: 'claude',
+      sessionId: 'durable-claude-1',
+      kind: 'terminal',
+      runtimeId: 'runtime-claude-1',
+      generation: 6,
+      code: 'PREFLIGHT_FAILED',
+      message: 'session index is still warming; retry restart shortly',
+      retryable: true,
+    }))
+
+    expect(screen.getByText(/session index is still warming/i)).toBeInTheDocument()
+    expect(screen.queryByText(/retry this restart automatically/i)).not.toBeInTheDocument()
   })
 
   it('keeps the terminal menu open when right-clicking inside an inactive terminal body', async () => {

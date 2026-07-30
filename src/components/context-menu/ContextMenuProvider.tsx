@@ -177,17 +177,29 @@ export function ContextMenuProvider({
     ) {
       return
     }
-    if (message.type === 'agent.restart.replaced' || !message.retryable) {
+    const recoveryPending = message.type === 'agent.restart.failed'
+      && message.retryable
+      && ws.isAgentRestartRecoveryPending(message.requestId)
+    if (message.type === 'agent.restart.replaced' || !recoveryPending) {
       requestedRestartsRef.current.delete(message.requestId)
     }
     if (message.type === 'agent.restart.failed') {
+      const retriesExhausted = recoveryPending
+        && ws.isAgentRestartRetryExhausted(message.requestId)
       setConfirmState({
         title: 'Pane restart failed',
-        body: message.retryable
-          ? `${message.message} Freshell will retry this restart automatically.`
-          : message.message,
-        confirmLabel: 'OK',
-        onConfirm: () => setConfirmState(null),
+        body: retriesExhausted
+          ? `${message.message} Automatic restart recovery retries are exhausted.`
+          : recoveryPending
+            ? `${message.message} Freshell will retry this restart automatically.`
+            : message.message,
+        confirmLabel: retriesExhausted ? 'Retry now' : 'OK',
+        onConfirm: () => {
+          if (retriesExhausted) {
+            ws.retryAgentRestart(message.requestId)
+          }
+          setConfirmState(null)
+        },
       })
     } else {
       setConfirmState(null)

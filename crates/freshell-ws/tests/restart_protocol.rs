@@ -1731,6 +1731,7 @@ async fn production_terminal_preflight_persists_non_system_shell_and_provider_se
             permission_mode: None,
             model: None,
             sandbox: None,
+            codex_managed: None,
         }),
         "ordinary create stamps the actual launch inputs from the server instance"
     );
@@ -1741,6 +1742,7 @@ async fn production_terminal_preflight_persists_non_system_shell_and_provider_se
             permission_mode: Some("plan".to_string()),
             model: Some("opus-terminal".to_string()),
             sandbox: Some("workspace-write".to_string()),
+            codex_managed: None,
         },
     );
 
@@ -1764,6 +1766,128 @@ async fn production_terminal_preflight_persists_non_system_shell_and_provider_se
     assert_eq!(context.terminal_permission_mode.as_deref(), Some("plan"));
     assert_eq!(context.terminal_sandbox.as_deref(), Some("workspace-write"));
     registry.kill_all();
+}
+
+#[tokio::test]
+async fn configured_plain_codex_restart_keeps_app_server_settings_off_cli_argv() {
+    let temp = tempfile::tempdir().unwrap();
+    let argv_path = temp.path().join("codex-argv.txt");
+    let script_path = temp.path().join("codex-sleeper.sh");
+    std::fs::write(
+        &script_path,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexec sleep 30\n",
+            argv_path.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions).unwrap();
+    }
+    let mut spec = common::sleeper_cli_spec("codex");
+    spec.default_cmd = script_path.to_string_lossy().to_string();
+    spec.model_args = Some(vec!["--model".to_string(), "{{model}}".to_string()]);
+    spec.permission_mode_args = Some(vec![
+        "--permission-mode".to_string(),
+        "{{permissionMode}}".to_string(),
+    ]);
+    spec.sandbox_args = Some(vec!["--sandbox".to_string(), "{{sandbox}}".to_string()]);
+
+    let (url, registry, mut state) = common::spawn_server_with_specs_and_state(vec![spec]).await;
+    let (mut ws, _) = common::connect_and_capture_inventory_with_capabilities(
+        &url,
+        Some(serde_json::json!({ "agentRestartV1": true })),
+    )
+    .await;
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "terminal.create",
+            "requestId": "plain-codex-create",
+            "mode": "codex",
+            "shell": "system",
+            "cwd": temp.path(),
+            "restore": true,
+            "resumeSessionId": "durable-codex",
+            "sessionRef": {
+                "provider": "codex",
+                "sessionId": "durable-codex"
+            }
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let created = common::next_frame_of_type(&mut ws, "terminal.created").await;
+    let terminal_id = created["terminalId"].as_str().unwrap().to_string();
+    let generation = created["runtime"]["generation"].as_u64().unwrap();
+    assert_eq!(
+        registry.probe(&terminal_id).unwrap().restart_launch,
+        Some(freshell_terminal::TerminalRestartLaunch {
+            shell: freshell_protocol::Shell::System,
+            permission_mode: None,
+            model: None,
+            sandbox: None,
+            codex_managed: Some(false),
+        }),
+        "plain Codex records the actual stripped CLI launch, not configured values"
+    );
+
+    let mut settings = common::test_settings_value();
+    settings["codingCli"]["providers"]["codex"] = serde_json::json!({
+        "model": "gpt-5.3-codex",
+        "permissionMode": "on-request",
+        "sandbox": "workspace-write"
+    });
+    state.settings = Arc::new(serde_json::from_value(settings).unwrap());
+    state.session_existence = Arc::new(PresentSessions);
+    let production = freshell_ws::restart::ProductionRestartRuntime::new(state.clone());
+    let outcome = state
+        .restart
+        .execute(
+            AgentRestart {
+                request_id: "plain-codex-restart".to_string(),
+                provider: "codex".to_string(),
+                session_id: "durable-codex".to_string(),
+                kind: AgentRuntimeKind::Terminal,
+                live_id: terminal_id,
+                expected_generation: generation,
+            },
+            &production,
+        )
+        .await;
+    assert!(matches!(
+        outcome.messages.last(),
+        Some(ServerMessage::AgentRestartReplaced(_))
+    ));
+
+    let argv = std::fs::read_to_string(&argv_path).unwrap();
+    assert!(argv.contains("--resume\ndurable-codex"));
+    assert!(!argv.contains("--model"), "{argv}");
+    assert!(!argv.contains("--sandbox"), "{argv}");
+    assert!(!argv.contains("--permission-mode"), "{argv}");
+    registry.kill_all();
+}
+
+#[test]
+fn managed_codex_terminal_plan_survives_boot_serialization_without_becoming_cli_settings() {
+    let context = RestartResumeContext {
+        terminal_cwd: Some("/workspace/codex".to_string()),
+        terminal_shell: Some(freshell_protocol::Shell::System),
+        terminal_permission_mode: Some("on-request".to_string()),
+        terminal_model: Some("gpt-5.3-codex".to_string()),
+        terminal_sandbox: Some("workspace-write".to_string()),
+        terminal_codex_managed: Some(true),
+        ..RestartResumeContext::default()
+    };
+
+    let encoded = serde_json::to_vec(&context).unwrap();
+    let recovered: RestartResumeContext = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(recovered, context);
+    assert_eq!(recovered.terminal_codex_managed, Some(true));
 }
 
 struct FaithfulFreshRuntime {

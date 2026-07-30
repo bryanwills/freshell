@@ -85,8 +85,10 @@ type InFlightAgentRestart = {
   message: AgentRestartClientMessage
   fingerprint: string
   lastResendEpoch: number
+  started: boolean
   retryAttempts: number
   retryTimer: number | null
+  retryExhausted: boolean
 }
 
 type AgentRestartStore = {
@@ -239,8 +241,11 @@ export class WsClient {
   private scheduleAgentRestartRetry(requestId: string, entry: InFlightAgentRestart): void {
     if (
       entry.retryTimer !== null
-      || entry.retryAttempts >= AGENT_RESTART_MAX_AUTOMATIC_RETRIES
     ) {
+      return
+    }
+    if (entry.retryAttempts >= AGENT_RESTART_MAX_AUTOMATIC_RETRIES) {
+      entry.retryExhausted = true
       return
     }
     const delay = Math.min(
@@ -329,9 +334,15 @@ export class WsClient {
   }
 
   private handleIncomingMessage(msg: ServerMessage): void {
+    if (msg.type === 'agent.restart.started') {
+      const inFlight = this.inFlightAgentRestarts.get(msg.requestId)
+      if (inFlight) {
+        inFlight.started = true
+      }
+    }
     if (msg.type === 'agent.restart.replaced' || msg.type === 'agent.restart.failed') {
       const inFlight = this.inFlightAgentRestarts.get(msg.requestId)
-      if (msg.type === 'agent.restart.failed' && msg.retryable) {
+      if (msg.type === 'agent.restart.failed' && msg.retryable && inFlight?.started) {
         if (inFlight) {
           this.scheduleAgentRestartRetry(msg.requestId, inFlight)
         }
@@ -854,8 +865,10 @@ export class WsClient {
         message: JSON.parse(fingerprint) as AgentRestartClientMessage,
         fingerprint,
         lastResendEpoch: -1,
+        started: false,
         retryAttempts: 0,
         retryTimer: null,
+        retryExhausted: false,
       }
       this.inFlightAgentRestarts.set(msg.requestId, entry)
       if (this._state === 'ready' && this.ws?.readyState === WebSocket.OPEN) {
@@ -959,6 +972,33 @@ export class WsClient {
       throw new Error('This server does not support agent runtime restart.')
     }
     this.send(message)
+  }
+
+  isAgentRestartRetryExhausted(requestId: string): boolean {
+    return this.inFlightAgentRestarts.get(requestId)?.retryExhausted === true
+  }
+
+  isAgentRestartRecoveryPending(requestId: string): boolean {
+    return this.inFlightAgentRestarts.get(requestId)?.started === true
+  }
+
+  retryAgentRestart(requestId: string): boolean {
+    const entry = this.inFlightAgentRestarts.get(requestId)
+    if (!entry || !entry.started) return false
+
+    this.clearAgentRestartRetryTimer(entry)
+    entry.retryAttempts = 0
+    entry.retryExhausted = false
+    entry.lastResendEpoch = -1
+    if (
+      this._state === 'ready'
+      && this.ws?.readyState === WebSocket.OPEN
+      && this.serverCapabilities.agentRestartV1 === true
+    ) {
+      this.sendAgentRestartEntry(entry)
+      entry.lastResendEpoch = this.reconnectEpoch
+    }
+    return true
   }
 
   /**

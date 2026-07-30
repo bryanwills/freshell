@@ -318,6 +318,9 @@ pub struct TerminalRestartLaunch {
     pub permission_mode: Option<String>,
     pub model: Option<String>,
     pub sandbox: Option<String>,
+    /// `None` for non-Codex/legacy records, `Some(false)` for plain Codex,
+    /// and `Some(true)` when settings were routed through the app-server plan.
+    pub codex_managed: Option<bool>,
 }
 
 /// One terminal's row for the REST terminal directory (`registry.list()` as consumed

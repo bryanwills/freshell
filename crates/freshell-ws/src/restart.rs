@@ -76,6 +76,8 @@ pub struct RestartResumeContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_sandbox: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_codex_managed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fresh_session_type: Option<freshell_protocol::SessionType>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fresh_cwd: Option<String>,
@@ -2323,6 +2325,7 @@ impl ProductionRestartRuntime {
                     permission_mode: plan.context.terminal_permission_mode.clone(),
                     model: plan.context.terminal_model.clone(),
                     sandbox: plan.context.terminal_sandbox.clone(),
+                    codex_managed: plan.context.terminal_codex_managed,
                 },
             )
             .await
@@ -2385,6 +2388,7 @@ impl RestartRuntime for ProductionRestartRuntime {
                     terminal_permission_mode: launch.permission_mode,
                     terminal_model: launch.model,
                     terminal_sandbox: launch.sandbox,
+                    terminal_codex_managed: launch.codex_managed,
                     ..RestartResumeContext::default()
                 }
             }

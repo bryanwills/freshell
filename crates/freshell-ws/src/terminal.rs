@@ -1144,8 +1144,63 @@ fn configured_provider_settings(
     (pick("permissionMode"), pick("model"), pick("sandbox"))
 }
 
+fn restart_cli_provider_settings(
+    mode: &str,
+    launch: &freshell_terminal::TerminalRestartLaunch,
+) -> (Option<String>, Option<String>, Option<String>) {
+    if mode == "codex" {
+        return (None, None, None);
+    }
+    (
+        launch.permission_mode.clone(),
+        launch.model.clone(),
+        launch.sandbox.clone(),
+    )
+}
+
+fn restart_uses_managed_codex_launch(
+    mode: &str,
+    flag_value: Option<&str>,
+    restart_launch: Option<&freshell_terminal::TerminalRestartLaunch>,
+) -> bool {
+    if mode != "codex" {
+        return false;
+    }
+    restart_launch
+        .and_then(|launch| launch.codex_managed)
+        .unwrap_or_else(|| codex_create_uses_managed_launch(mode, flag_value))
+}
+
+fn capture_terminal_restart_launch(
+    mode: &str,
+    shell: Shell,
+    cli_settings: (Option<String>, Option<String>, Option<String>),
+    codex_plan: Option<&freshell_codex::launch_plan::CodexLaunchPlan>,
+) -> freshell_terminal::TerminalRestartLaunch {
+    if mode == "codex" {
+        return freshell_terminal::TerminalRestartLaunch {
+            shell,
+            permission_mode: codex_plan.and_then(|plan| plan.approval_policy.clone()),
+            model: codex_plan.and_then(|plan| plan.model.clone()),
+            sandbox: codex_plan
+                .and_then(|plan| plan.sandbox)
+                .map(|sandbox| sandbox.as_str().to_string()),
+            codex_managed: Some(codex_plan.is_some()),
+        };
+    }
+    let (permission_mode, model, sandbox) = cli_settings;
+    freshell_terminal::TerminalRestartLaunch {
+        shell,
+        permission_mode,
+        model,
+        sandbox,
+        codex_managed: None,
+    }
+}
+
 /// codex `--remote <wsUrl>` planning (DEV-0006 S4, FLAG-GATED default OFF —
-/// council fence): with `FRESHELL_CODEX_MANAGED_LAUNCH=1`, plan the managed
+/// council fence): a normal create follows `FRESHELL_CODEX_MANAGED_LAUNCH`;
+/// a restart follows the route captured from the original runtime. When managed, plan the
 /// app-server launch (`planCodexLaunch`, ws:2442-2449: sidecar spawn + remote
 /// proxy, 5-attempt initial budget); the codex provider settings route through
 /// the PLAN, not argv (the `ws:2464-2465` strip). Flag OFF: `Ok(None)` —
@@ -1165,7 +1220,7 @@ async fn plan_codex_managed_launch(
 ) -> Result<Option<freshell_codex::launch_lifecycle::CodexTerminalLaunch>, String> {
     let managed_flag =
         std::env::var(freshell_codex::launch_plan::FRESHELL_CODEX_MANAGED_LAUNCH_ENV).ok();
-    if !codex_create_uses_managed_launch(mode, managed_flag.as_deref()) {
+    if !restart_uses_managed_codex_launch(mode, managed_flag.as_deref(), restart_launch) {
         return Ok(None);
     }
     let codex_provider = state.settings.coding_cli.providers.get("codex");
@@ -1677,16 +1732,6 @@ async fn handle_create_with_restart_launch(
             .unwrap_or(create.shell),
     );
     let mode = create.mode.clone();
-    let restart_launch_to_stamp = restart_launch.clone().unwrap_or_else(|| {
-        let (permission_mode, model, sandbox) = configured_provider_settings(state, &mode);
-        freshell_terminal::TerminalRestartLaunch {
-            shell: create.shell,
-            permission_mode,
-            model,
-            sandbox,
-        }
-    });
-
     // Reject modes that are neither 'shell' nor a registered coding CLI — the
     // reference throws `UnknownTerminalModeError` (`terminal-registry.ts:1073-1074`,
     // message `tr:160-165`), surfaced as an `error` frame with the generic
@@ -2080,13 +2125,7 @@ async fn handle_create_with_restart_launch(
     // (Task 4) via `cli_provider_settings`.
     let (permission_mode, model, sandbox) = restart_launch
         .as_ref()
-        .map(|launch| {
-            (
-                launch.permission_mode.clone(),
-                launch.model.clone(),
-                launch.sandbox.clone(),
-            )
-        })
+        .map(|launch| restart_cli_provider_settings(&mode, launch))
         .unwrap_or_else(|| cli_provider_settings(state, &mode));
 
     // opencode: allocate the loopback control endpoint BEFORE building the launch
@@ -2135,6 +2174,14 @@ async fn handle_create_with_restart_launch(
     };
     let codex_remote_ws_url: Option<String> =
         codex_launch.as_ref().map(|l| l.remote_ws_url.clone());
+    let restart_launch_to_stamp = restart_launch.clone().unwrap_or_else(|| {
+        capture_terminal_restart_launch(
+            &mode,
+            create.shell,
+            (permission_mode.clone(), model.clone(), sandbox.clone()),
+            codex_launch.as_ref().map(|launch| &launch.plan),
+        )
+    });
 
     // ProviderTarget + host-native mcp cwd (`tr:911-914,1153,1203,1236,1262`).
     let target = cli_provider_target(shell, host_os, is_wsl, resolved_cwd.as_deref(), &RealEnv);
@@ -4800,6 +4847,69 @@ mod cli_create_helper_tests {
         assert!(!codex_create_uses_managed_launch("shell", Some("1")));
         assert!(!codex_create_uses_managed_launch("claude", Some("1")));
         assert!(!codex_create_uses_managed_launch("opencode", Some("1")));
+    }
+
+    #[test]
+    fn plain_codex_restart_snapshot_preserves_the_cli_settings_strip() {
+        let configured = (
+            Some("on-request".to_string()),
+            Some("gpt-5.3-codex".to_string()),
+            Some("workspace-write".to_string()),
+        );
+        let snapshot = capture_terminal_restart_launch("codex", Shell::System, configured, None);
+
+        assert_eq!(snapshot.codex_managed, Some(false));
+        assert_eq!(
+            (
+                snapshot.permission_mode.as_deref(),
+                snapshot.model.as_deref(),
+                snapshot.sandbox.as_deref(),
+            ),
+            (None, None, None),
+            "configured Codex settings are not CLI argv inputs"
+        );
+        assert_eq!(
+            restart_cli_provider_settings("codex", &snapshot),
+            (None, None, None)
+        );
+        assert!(
+            !restart_uses_managed_codex_launch("codex", Some("1"), Some(&snapshot)),
+            "restart follows the captured plain route, not changed boot settings"
+        );
+    }
+
+    #[test]
+    fn managed_codex_restart_snapshot_routes_settings_only_to_the_app_server_plan() {
+        let plan = freshell_codex::launch_plan::plan_codex_launch(
+            &freshell_codex::launch_plan::CodexLaunchPlanInput {
+                cwd: Some("/workspace"),
+                resume_session_id: Some("durable-codex"),
+                model: Some("gpt-5.3-codex"),
+                sandbox: Some("workspace-write"),
+                approval_policy: Some("on-request"),
+            },
+        )
+        .unwrap();
+        let snapshot = capture_terminal_restart_launch(
+            "codex",
+            Shell::System,
+            (None, None, None),
+            Some(&plan),
+        );
+
+        assert_eq!(snapshot.codex_managed, Some(true));
+        assert_eq!(snapshot.model.as_deref(), Some("gpt-5.3-codex"));
+        assert_eq!(snapshot.sandbox.as_deref(), Some("workspace-write"));
+        assert_eq!(snapshot.permission_mode.as_deref(), Some("on-request"));
+        assert_eq!(
+            restart_cli_provider_settings("codex", &snapshot),
+            (None, None, None),
+            "managed Codex settings must not conflict with --remote on TUI argv"
+        );
+        assert!(
+            restart_uses_managed_codex_launch("codex", None, Some(&snapshot)),
+            "restart follows the captured managed route after a boot"
+        );
     }
 
     #[test]

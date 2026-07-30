@@ -104,6 +104,17 @@ const replaced = {
   runtimeId: 'terminal-new',
   generation: 8,
 }
+const started = {
+  type: 'agent.restart.started' as const,
+  requestId: 'restart-1',
+  provider: 'claude',
+  sessionId: 's1',
+  kind: 'terminal' as const,
+  runtime: {
+    runtimeId: 'terminal-old',
+    generation: 7,
+  },
+}
 const retryableFailed = {
   type: 'agent.restart.failed' as const,
   requestId: 'restart-1',
@@ -204,6 +215,7 @@ describe('WsClient restart transaction folding', () => {
     const firstWireRequest = socket.sent.find((frame) => JSON.parse(frame).type === 'agent.restart')
     expect(firstWireRequest).toBeDefined()
 
+    socket.message(started)
     socket.message(retryableFailed)
     await vi.advanceTimersByTimeAsync(499)
     expect(socket.sent.filter((frame) => JSON.parse(frame).type === 'agent.restart')).toHaveLength(1)
@@ -230,6 +242,7 @@ describe('WsClient restart transaction folding', () => {
 
     client.requestAgentRestart(request)
     const originalWireRequest = first.sent.find((frame) => JSON.parse(frame).type === 'agent.restart')
+    first.message(started)
     first.message(retryableFailed)
     first.drop()
 
@@ -243,6 +256,67 @@ describe('WsClient restart transaction folding', () => {
       originalWireRequest,
     ])
     second.message(replaced)
+  })
+
+  it('finalizes a retryable warming-index preflight failure that arrived before started', async () => {
+    const client = new WsClient('ws://example/ws')
+    const firstConnect = client.connect()
+    const first = MockWebSocket.instances[0]
+    first.onopen?.()
+    first.message({ type: 'ready', capabilities: { agentRestartV1: true } })
+    await firstConnect
+
+    client.requestAgentRestart(request)
+    first.message({
+      ...retryableFailed,
+      code: 'PREFLIGHT_FAILED' as const,
+      message: 'session index is still warming; retry restart shortly',
+    })
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(sent(first).filter((frame) => frame.type === 'agent.restart')).toEqual([request])
+    expect(client.isAgentRestartRecoveryPending(request.requestId)).toBe(false)
+
+    first.drop()
+    const reconnect = client.connect()
+    const second = MockWebSocket.instances[1]
+    second.onopen?.()
+    second.message({ type: 'ready', capabilities: { agentRestartV1: true } })
+    await reconnect
+
+    expect(sent(second).filter((frame) => frame.type === 'agent.restart')).toHaveLength(0)
+  })
+
+  it('surfaces automatic retry exhaustion and Retry now reuses the original bytes and request ID', async () => {
+    const client = new WsClient('ws://example/ws')
+    const promise = client.connect()
+    const socket = MockWebSocket.instances[0]
+    socket.onopen?.()
+    socket.message({ type: 'ready', capabilities: { agentRestartV1: true } })
+    await promise
+
+    client.requestAgentRestart(request)
+    const originalWireRequest = socket.sent.find((frame) => JSON.parse(frame).type === 'agent.restart')
+    expect(originalWireRequest).toBeDefined()
+    socket.message(started)
+
+    for (const delay of [500, 1_000, 2_000]) {
+      socket.message(retryableFailed)
+      await vi.advanceTimersByTimeAsync(delay)
+    }
+    socket.message(retryableFailed)
+
+    expect(client.isAgentRestartRecoveryPending(request.requestId)).toBe(true)
+    expect(client.isAgentRestartRetryExhausted(request.requestId)).toBe(true)
+    expect(client.retryAgentRestart(request.requestId)).toBe(true)
+    expect(client.isAgentRestartRetryExhausted(request.requestId)).toBe(false)
+    const restartFrames = socket.sent.filter((frame) => JSON.parse(frame).type === 'agent.restart')
+    expect(restartFrames).toEqual([
+      originalWireRequest,
+      originalWireRequest,
+      originalWireRequest,
+      originalWireRequest,
+      originalWireRequest,
+    ])
   })
 
   it('finalizes a nonretryable failure and never retries it', async () => {
