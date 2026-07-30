@@ -332,3 +332,24 @@ Expected: PASS.
 Run: `git diff --check origin/main...HEAD && git status --short && git add crates/freshell-protocol crates/freshell-ws crates/freshell-terminal crates/freshell-freshagent shared src test docs/index.html test/e2e-browser/specs/restart-resumable-pane-rust.spec.ts port/contract && git commit -m "test: verify Rust agent restart flow"`
 
 Expected: diff check is silent; commit only if verification changed one of those scoped feature files. Never use `git add -A` in this shared worktree.
+
+#### Final review iteration 1 — 2026-07-30
+
+- OpenCode restart teardown now aborts the durable session through the shared
+  serve manager before reporting success, fences predecessor completion, and
+  aborts and joins the local turn and SSE tasks before replacement.
+- Fresh-agent replacement correlation now uses one absolute 30-second deadline
+  for the full receive loop; unrelated broadcasts cannot extend it.
+- Red/green regression evidence:
+  - `cargo test -p freshell-freshagent restart_shutdown_aborts_active_remote_turn -- --nocapture`
+  - `cargo test -p freshell-ws --test restart_protocol fresh_replacement_result_uses_one_deadline -- --nocapture`
+- Broader verification:
+  - `cargo test -p freshell-freshagent --lib` — 327 passed.
+  - `cargo test -p freshell-ws` — all unit, integration, and doc tests passed;
+    one pre-existing host-gated test remained ignored as declared by the suite.
+  - `cargo fmt --all -- --check` — passed after formatting.
+  - `cargo clippy -p freshell-freshagent -p freshell-ws --all-targets -- -A clippy::too_many_arguments -D warnings`
+    — passed. The unmodified strict command is blocked by pre-existing
+    `too_many_arguments` findings in `claude.rs:1205` and `codex.rs:3365`.
+- No Node commands, external provider processes, or live-port operations were
+  used.

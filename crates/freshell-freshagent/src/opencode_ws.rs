@@ -848,27 +848,48 @@ impl FreshOpencodeState {
     }
 
     /// Restart-only teardown fenced to the exact runtime selected by the
-    /// coordinator. Both placeholder and durable aliases are removed while the
-    /// sessions map is locked, and only when they still point at that runtime.
+    /// coordinator. A materialized durable session is first aborted through the
+    /// shared serve manager, so no remote turn can keep writing while the
+    /// replacement resumes the same durable id. Both placeholder and durable
+    /// aliases are then removed while the sessions map is locked, and only when
+    /// they still point at that runtime.
     pub async fn shutdown_for_restart(&self, session_id: &str, expected_runtime_id: &str) -> bool {
-        let session_arc = {
-            let mut sessions = self.sessions.lock().await;
-            let Some(session_arc) = sessions.get(session_id).cloned() else {
-                return false;
-            };
-            if session_arc.lock().await.runtime.runtime_id != expected_runtime_id {
+        let mut sessions = self.sessions.lock().await;
+        let Some(session_arc) = sessions.get(session_id).cloned() else {
+            return false;
+        };
+        let mut session = session_arc.lock().await;
+        if session.runtime.runtime_id != expected_runtime_id {
+            return false;
+        }
+
+        if let Some(real_id) = session.real_session_id.clone() {
+            // Set the completion fence before the remote abort. The abort can
+            // synchronously produce an idle edge that lets `run_turn` return;
+            // such a predecessor completion must never chime while restart is
+            // preparing its replacement.
+            session.turn_aborted.store(true, Ordering::SeqCst);
+            let manager = self.fresh_agent.ensure_manager().await;
+            if let Err(error) = manager.abort(&real_id, &session.cwd).await {
+                session.turn_aborted.store(false, Ordering::SeqCst);
+                tracing::warn!(
+                    error = %error,
+                    session_id = %real_id,
+                    runtime_id = %expected_runtime_id,
+                    "freshagent.opencode.restart_abort_failed"
+                );
                 return false;
             }
-            sessions.retain(|_, candidate| !Arc::ptr_eq(candidate, &session_arc));
-            session_arc
-        };
+        }
 
-        let mut session = session_arc.lock().await;
+        sessions.retain(|_, candidate| !Arc::ptr_eq(candidate, &session_arc));
         if let Some(task) = session.turn_task.take() {
             task.abort();
+            let _ = task.await;
         }
         if let Some(bridge) = session.serve_bridge.take() {
             bridge.abort();
+            let _ = bridge.await;
         }
         if let Some(real) = session.real_session_id.as_deref() {
             self.leases.clear_binding(PROVIDER, real);
@@ -876,6 +897,7 @@ impl FreshOpencodeState {
         self.leases.clear_binding(PROVIDER, session_id);
         let placeholder = session.placeholder_id.clone();
         drop(session);
+        drop(sessions);
         self.create_dedup
             .clear_for_session(|record| record.placeholder_id == placeholder)
             .await;
@@ -1534,6 +1556,60 @@ mod tests {
                 } else {
                     b"{}".to_vec()
                 }
+            } else {
+                b"{}".to_vec()
+            };
+            Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) })
+        }
+    }
+
+    /// Models a durable OpenCode turn that remains active remotely until the
+    /// per-session abort endpoint is called. Restart must quiesce this remote
+    /// writer before a replacement is allowed to resume the same durable id.
+    struct RestartActiveTurnHttp {
+        aborts: AtomicUsize,
+        prompt_started: AtomicBool,
+        remote_busy: AtomicBool,
+    }
+    impl RestartActiveTurnHttp {
+        fn new() -> Self {
+            Self {
+                aborts: AtomicUsize::new(0),
+                prompt_started: AtomicBool::new(false),
+                remote_busy: AtomicBool::new(false),
+            }
+        }
+    }
+    impl ServeHttp for RestartActiveTurnHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+        > {
+            let is_create = matches!(req.method, freshell_opencode::serve::HttpMethod::Post)
+                && (req.url.ends_with("/session") || req.url.contains("/session?"));
+            let body = if is_create {
+                serde_json::to_vec(&json!({ "id": "ses_restart_active", "directory": null }))
+                    .unwrap()
+            } else if req.url.contains("/prompt_async") {
+                self.prompt_started.store(true, Ordering::SeqCst);
+                self.remote_busy.store(true, Ordering::SeqCst);
+                b"{}".to_vec()
+            } else if req.url.contains("/abort") {
+                self.aborts.fetch_add(1, Ordering::SeqCst);
+                self.remote_busy.store(false, Ordering::SeqCst);
+                b"{}".to_vec()
+            } else if req.url.contains("/session/status") {
+                if self.remote_busy.load(Ordering::SeqCst) {
+                    serde_json::to_vec(&json!({ "ses_restart_active": { "type": "busy" } }))
+                        .unwrap()
+                } else {
+                    b"{}".to_vec()
+                }
+            } else if req.url.contains("/session/ses_restart_active") {
+                serde_json::to_vec(&json!({ "id": "ses_restart_active", "directory": null }))
+                    .unwrap()
             } else {
                 b"{}".to_vec()
             };
@@ -2394,6 +2470,89 @@ mod tests {
             !killed.load(Ordering::SeqCst),
             "per-session restart must preserve the shared serve sidecar"
         );
+    }
+
+    #[tokio::test]
+    async fn restart_shutdown_aborts_active_remote_turn_before_replacement_can_resume() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let http = Arc::new(RestartActiveTurnHttp::new());
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(AtomicBool::new(false)),
+            }),
+            http: http.clone(),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(
+            deps,
+            ServeConfig {
+                idle_poll_interval: Duration::from_millis(20),
+                ..ServeConfig::default()
+            },
+        );
+        manager.ensure_started().await.unwrap();
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-restart-active")).await;
+        let placeholder = "freshopencode-req-restart-active";
+        st.handle_send(send_msg(placeholder, "keep working")).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !http.prompt_started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the old durable turn starts remotely");
+
+        let (durable_id, old_runtime_id) = {
+            let sessions = st.sessions.lock().await;
+            let session = sessions.get(placeholder).unwrap().lock().await;
+            (
+                session.real_session_id.clone().unwrap(),
+                session.runtime.runtime_id.clone(),
+            )
+        };
+        while rx.try_recv().is_ok() {}
+
+        assert!(st.shutdown_for_restart(&durable_id, &old_runtime_id).await);
+        assert_eq!(
+            http.aborts.load(Ordering::SeqCst),
+            1,
+            "successful restart shutdown must call the durable session abort endpoint"
+        );
+        assert!(
+            !http.remote_busy.load(Ordering::SeqCst),
+            "the predecessor's remote turn must be quiescent before replacement"
+        );
+        while let Ok(raw) = rx.try_recv() {
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert!(
+                frame["event"]["type"] != "freshAgent.turn.complete",
+                "restart shutdown must suppress predecessor completion: {frame}"
+            );
+        }
+
+        let mut replacement = create_msg("req-restart-replacement");
+        replacement.resume_session_id = Some(durable_id.clone());
+        st.handle_create(replacement).await;
+        let replacement_runtime_id = {
+            let sessions = st.sessions.lock().await;
+            let session = sessions.get(&durable_id).unwrap().lock().await;
+            session.runtime.runtime_id.clone()
+        };
+        assert_ne!(replacement_runtime_id, old_runtime_id);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert!(
+                frame["runtime"]["runtimeId"] != old_runtime_id,
+                "the quiesced predecessor must not re-emit under its replacement: {frame}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -1690,6 +1690,46 @@ fn provider_name(provider: freshell_protocol::AgentProvider) -> &'static str {
     }
 }
 
+struct UnrelatedTrafficFreshRuntime {
+    broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
+}
+
+#[async_trait::async_trait]
+impl ProductionFreshRuntime for UnrelatedTrafficFreshRuntime {
+    async fn has_live_session(
+        &self,
+        _provider: freshell_protocol::AgentProvider,
+        _session_id: &str,
+    ) -> bool {
+        true
+    }
+
+    async fn shutdown_for_restart(
+        &self,
+        _provider: freshell_protocol::AgentProvider,
+        _session_id: &str,
+        _expected_runtime_id: &str,
+    ) -> bool {
+        true
+    }
+
+    async fn handle_create(
+        &self,
+        _provider: freshell_protocol::AgentProvider,
+        _create: freshell_protocol::FreshAgentCreate,
+    ) {
+        let broadcast_tx = Arc::clone(&self.broadcast_tx);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                if broadcast_tx.send("{}".to_string()).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+}
+
 #[async_trait::async_trait]
 impl ProductionFreshRuntime for FaithfulFreshRuntime {
     async fn has_live_session(
@@ -1835,6 +1875,47 @@ async fn production_fresh_adapters_preflight_exact_teardown_and_resume_all_provi
         );
         registry.kill_all();
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn fresh_replacement_result_uses_one_deadline_despite_unrelated_broadcasts() {
+    let (_url, registry, state) = common::spawn_server_with_specs_and_state(vec![]).await;
+    let fresh_runtime = Arc::new(UnrelatedTrafficFreshRuntime {
+        broadcast_tx: Arc::clone(&state.broadcast_tx),
+    });
+    let production =
+        freshell_ws::restart::ProductionRestartRuntime::with_fresh_runtime(state, fresh_runtime);
+    let request = AgentRestart {
+        request_id: "deadline-r1".to_string(),
+        provider: "claude".to_string(),
+        session_id: "durable-deadline".to_string(),
+        kind: AgentRuntimeKind::FreshAgent,
+        live_id: "fresh-old".to_string(),
+        expected_generation: 1,
+    };
+
+    let waiter =
+        tokio::spawn(
+            async move { RestartRuntime::create_replacement(&production, &request, ()).await },
+        );
+    tokio::task::yield_now().await;
+    for _ in 0..31 {
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+    }
+
+    assert!(
+        waiter.is_finished(),
+        "unrelated broadcast traffic must not restart the 30-second result timeout"
+    );
+    let failure = waiter.await.unwrap().unwrap_err();
+    assert_eq!(failure.code, AgentRestartFailureCode::ReplacementFailed);
+    assert!(failure.retryable);
+    assert_eq!(
+        failure.message,
+        "fresh-agent replacement did not report a result"
+    );
+    registry.kill_all();
 }
 
 #[tokio::test]

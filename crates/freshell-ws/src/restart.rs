@@ -2134,8 +2134,9 @@ impl ProductionRestartRuntime {
             }),
         };
         self.fresh_runtime.handle_create(provider, create).await;
+        let result_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
-            let frame = tokio::time::timeout(std::time::Duration::from_secs(30), receiver.recv())
+            let frame = tokio::time::timeout_at(result_deadline, receiver.recv())
                 .await
                 .map_err(|_| {
                     RestartFailure::new(
