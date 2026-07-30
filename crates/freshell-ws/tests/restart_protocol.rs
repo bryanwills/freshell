@@ -5,15 +5,15 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use freshell_protocol::{
-    AgentRestart, AgentRestartFailureCode, AgentRuntimeKind, ClientMessage, FreshAgentCreated,
-    FreshAgentEvent, FreshAgentSessionMaterialized, InventoryTerminal, PaneReconcileResult,
-    PaneVerdict, ReconcileVerdict, RuntimeDescriptor, ServerMessage, SessionLocator,
-    TerminalAttachReady, TerminalCreated, TerminalExit, TerminalInventory, TerminalOutput,
-    TerminalRunStatus, TerminalSessionAssociated,
+    AgentRestart, AgentRestartFailureCode, AgentRuntimeKind, ClientMessage, FreshAgentCreateFailed,
+    FreshAgentCreated, FreshAgentEvent, FreshAgentSessionMaterialized, InventoryTerminal,
+    PaneReconcileResult, PaneVerdict, ReconcileVerdict, RuntimeDescriptor, ServerMessage,
+    SessionLocator, TerminalAttachReady, TerminalCreated, TerminalExit, TerminalInventory,
+    TerminalOutput, TerminalRunStatus, TerminalSessionAssociated,
 };
 use freshell_ws::restart::{
-    ProductionFreshRuntime, RestartCoordinator, RestartFailure, RestartResumeContext,
-    RestartRuntime, RuntimeLocator,
+    ProductionFreshResumePlan, ProductionFreshRuntime, RestartCoordinator, RestartFailure,
+    RestartResumeContext, RestartRuntime, RuntimeLocator,
 };
 use futures_util::SinkExt;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -1384,6 +1384,7 @@ impl RestartRuntime for ContextRecoveryRuntime {
     ) -> Option<RestartResumeContext> {
         Some(RestartResumeContext {
             terminal_cwd: Some(self.expected_cwd.clone()),
+            ..RestartResumeContext::default()
         })
     }
 
@@ -1674,11 +1675,105 @@ async fn production_terminal_adapter_uses_the_builtin_restore_path() {
     registry.kill_all();
 }
 
+#[tokio::test]
+async fn production_terminal_preflight_persists_non_system_shell_and_provider_settings() {
+    let mut spec = common::sleeper_cli_spec("claude");
+    spec.model_args = Some(vec!["--model".to_string(), "{{model}}".to_string()]);
+    spec.permission_mode_args = Some(vec![
+        "--permission-mode".to_string(),
+        "{{permissionMode}}".to_string(),
+    ]);
+    spec.sandbox_args = Some(vec!["--sandbox".to_string(), "{{sandbox}}".to_string()]);
+    let (url, registry, mut state) = common::spawn_server_with_specs_and_state(vec![spec]).await;
+    state.session_existence = Arc::new(PresentSessions);
+    let mut settings = common::test_settings_value();
+    settings["codingCli"]["providers"]["claude"] = serde_json::json!({
+        "model": "opus-terminal",
+        "permissionMode": "plan",
+        "sandbox": "workspace-write"
+    });
+    state.settings = Arc::new(serde_json::from_value(settings).unwrap());
+    let production = freshell_ws::restart::ProductionRestartRuntime::new(state.clone());
+    let (mut ws, _) = common::connect_and_capture_inventory_with_capabilities(
+        &url,
+        Some(serde_json::json!({ "agentRestartV1": true })),
+    )
+    .await;
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "terminal.create",
+            "requestId": "production-adapter-create",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "restore": true,
+            "resumeSessionId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "sessionRef": {
+                "provider": "claude",
+                "sessionId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+            }
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let created = common::next_frame_of_type(&mut ws, "terminal.created").await;
+    let terminal_id = created["terminalId"].as_str().unwrap().to_string();
+    let session_id = created["sessionRef"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let generation = created["runtime"]["generation"].as_u64().unwrap();
+    assert_eq!(
+        registry.probe(&terminal_id).unwrap().restart_launch,
+        Some(freshell_terminal::TerminalRestartLaunch {
+            shell: freshell_protocol::Shell::System,
+            permission_mode: None,
+            model: None,
+            sandbox: None,
+        }),
+        "ordinary create stamps the actual launch inputs from the server instance"
+    );
+    registry.set_restart_launch(
+        &terminal_id,
+        freshell_terminal::TerminalRestartLaunch {
+            shell: freshell_protocol::Shell::Wsl,
+            permission_mode: Some("plan".to_string()),
+            model: Some("opus-terminal".to_string()),
+            sandbox: Some("workspace-write".to_string()),
+        },
+    );
+
+    let request = AgentRestart {
+        request_id: "production-adapter-restart".to_string(),
+        provider: "claude".to_string(),
+        session_id,
+        kind: AgentRuntimeKind::Terminal,
+        live_id: terminal_id,
+        expected_generation: generation,
+    };
+    RestartRuntime::preflight(&production, &request)
+        .await
+        .expect("terminal preflight");
+    let context = RestartRuntime::persisted_resume_context(&production, &request, &())
+        .expect("persisted terminal plan");
+    let context: RestartResumeContext =
+        serde_json::from_slice(&serde_json::to_vec(&context).unwrap()).unwrap();
+    assert_eq!(context.terminal_shell, Some(freshell_protocol::Shell::Wsl));
+    assert_eq!(context.terminal_model.as_deref(), Some("opus-terminal"));
+    assert_eq!(context.terminal_permission_mode.as_deref(), Some("plan"));
+    assert_eq!(context.terminal_sandbox.as_deref(), Some("workspace-write"));
+    registry.kill_all();
+}
+
 struct FaithfulFreshRuntime {
     coordinator: RestartCoordinator,
     broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
     live: Mutex<HashMap<(String, String), String>>,
     events: Mutex<Vec<String>>,
+    plans: Mutex<HashMap<(String, String), ProductionFreshResumePlan>>,
+    creates: Mutex<Vec<freshell_protocol::FreshAgentCreate>>,
+    fail_next_create: AtomicBool,
 }
 
 fn provider_name(provider: freshell_protocol::AgentProvider) -> &'static str {
@@ -1711,6 +1806,32 @@ impl ProductionFreshRuntime for UnrelatedTrafficFreshRuntime {
         _expected_runtime_id: &str,
     ) -> bool {
         true
+    }
+
+    async fn capture_resume_plan(
+        &self,
+        provider: freshell_protocol::AgentProvider,
+        _session_id: &str,
+    ) -> Option<ProductionFreshResumePlan> {
+        Some(ProductionFreshResumePlan {
+            session_type: match provider {
+                freshell_protocol::AgentProvider::Claude => {
+                    freshell_protocol::SessionType::Freshclaude
+                }
+                freshell_protocol::AgentProvider::Codex => {
+                    freshell_protocol::SessionType::Freshcodex
+                }
+                freshell_protocol::AgentProvider::Opencode => {
+                    freshell_protocol::SessionType::Freshopencode
+                }
+                freshell_protocol::AgentProvider::Amplifier => return None,
+            },
+            cwd: None,
+            model: None,
+            effort: None,
+            permission_mode: None,
+            sandbox: None,
+        })
     }
 
     async fn handle_create(
@@ -1767,12 +1888,42 @@ impl ProductionFreshRuntime for FaithfulFreshRuntime {
         true
     }
 
+    async fn capture_resume_plan(
+        &self,
+        provider: freshell_protocol::AgentProvider,
+        session_id: &str,
+    ) -> Option<ProductionFreshResumePlan> {
+        let provider = provider_name(provider).to_string();
+        self.plans
+            .lock()
+            .unwrap()
+            .get(&(provider, session_id.to_string()))
+            .cloned()
+    }
+
     async fn handle_create(
         &self,
         provider: freshell_protocol::AgentProvider,
         create: freshell_protocol::FreshAgentCreate,
     ) {
         let provider = provider_name(provider);
+        self.creates.lock().unwrap().push(create.clone());
+        if self.fail_next_create.swap(false, Ordering::SeqCst) {
+            self.broadcast_tx
+                .send(
+                    serde_json::to_string(&ServerMessage::FreshAgentCreateFailed(
+                        FreshAgentCreateFailed {
+                            code: "TEMPORARY_FAILURE".to_string(),
+                            message: "retry after server restart".to_string(),
+                            request_id: create.request_id,
+                            retryable: Some(true),
+                        },
+                    ))
+                    .unwrap(),
+                )
+                .unwrap();
+            return;
+        }
         let durable_id = create
             .resume_session_id
             .as_deref()
@@ -1795,11 +1946,11 @@ impl ProductionFreshRuntime for FaithfulFreshRuntime {
             request_id: create.request_id,
             runtime_provider: provider.to_string(),
             session_id: durable_id.to_string(),
-            session_type: match provider {
-                "claude" => "freshclaude",
-                "codex" => "freshcodex",
-                "opencode" => "freshopencode",
-                _ => unreachable!(),
+            session_type: match create.session_type {
+                freshell_protocol::SessionType::Freshclaude => "freshclaude",
+                freshell_protocol::SessionType::Kilroy => "kilroy",
+                freshell_protocol::SessionType::Freshcodex => "freshcodex",
+                freshell_protocol::SessionType::Freshopencode => "freshopencode",
             }
             .to_string(),
             session_ref: create.session_ref,
@@ -1831,6 +1982,24 @@ async fn production_fresh_adapters_preflight_exact_teardown_and_resume_all_provi
                 old_runtime_id.clone(),
             )])),
             events: Mutex::new(Vec::new()),
+            plans: Mutex::new(HashMap::from([(
+                (provider.to_string(), durable_id.clone()),
+                ProductionFreshResumePlan {
+                    session_type: match provider {
+                        "claude" => freshell_protocol::SessionType::Freshclaude,
+                        "codex" => freshell_protocol::SessionType::Freshcodex,
+                        "opencode" => freshell_protocol::SessionType::Freshopencode,
+                        _ => unreachable!(),
+                    },
+                    cwd: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    sandbox: None,
+                },
+            )])),
+            creates: Mutex::new(Vec::new()),
+            fail_next_create: AtomicBool::new(false),
         });
         let production = freshell_ws::restart::ProductionRestartRuntime::with_fresh_runtime(
             state.clone(),
@@ -1877,9 +2046,168 @@ async fn production_fresh_adapters_preflight_exact_teardown_and_resume_all_provi
     }
 }
 
+#[tokio::test]
+async fn production_fresh_restart_and_recovery_preserve_kilroy_and_claude_settings() {
+    let (_url, registry, mut state) = common::spawn_server_with_specs_and_state(vec![]).await;
+    state.session_existence = Arc::new(PresentSessions);
+    let durable_id = "durable-kilroy".to_string();
+    let old_runtime_id = "fresh-kilroy-old".to_string();
+    let old = state.restart.register_initial(
+        RuntimeLocator::new(AgentRuntimeKind::FreshAgent, "claude", durable_id.clone()),
+        &old_runtime_id,
+    );
+    let faithful = Arc::new(FaithfulFreshRuntime {
+        coordinator: state.restart.clone(),
+        broadcast_tx: Arc::clone(&state.broadcast_tx),
+        live: Mutex::new(HashMap::from([(
+            ("claude".to_string(), durable_id.clone()),
+            old_runtime_id.clone(),
+        )])),
+        events: Mutex::new(Vec::new()),
+        plans: Mutex::new(HashMap::from([(
+            ("claude".to_string(), durable_id.clone()),
+            ProductionFreshResumePlan {
+                session_type: freshell_protocol::SessionType::Kilroy,
+                cwd: Some("/workspace/kilroy".to_string()),
+                model: Some("claude-opus-4-1".to_string()),
+                effort: Some("high".to_string()),
+                permission_mode: Some("plan".to_string()),
+                sandbox: Some(freshell_protocol::Sandbox::WorkspaceWrite),
+            },
+        )])),
+        creates: Mutex::new(Vec::new()),
+        fail_next_create: AtomicBool::new(false),
+    });
+    let production = freshell_ws::restart::ProductionRestartRuntime::with_fresh_runtime(
+        state.clone(),
+        faithful.clone(),
+    );
+    let request = AgentRestart {
+        request_id: "production-kilroy-restart".to_string(),
+        provider: "claude".to_string(),
+        session_id: durable_id,
+        kind: AgentRuntimeKind::FreshAgent,
+        live_id: old_runtime_id,
+        expected_generation: old.generation,
+    };
+
+    RestartRuntime::preflight(&production, &request)
+        .await
+        .expect("kilroy preflight");
+    let persisted = RestartRuntime::persisted_resume_context(&production, &request, &())
+        .expect("resume context");
+    let persisted: RestartResumeContext =
+        serde_json::from_slice(&serde_json::to_vec(&persisted).unwrap()).unwrap();
+    RestartRuntime::recover_replacement(&production, &request, Some(&persisted))
+        .await
+        .expect("boot-style recovery");
+
+    let creates = faithful.creates.lock().unwrap();
+    let create = creates.last().expect("one recovered create");
+    assert_eq!(create.session_type, freshell_protocol::SessionType::Kilroy);
+    assert_eq!(create.cwd.as_deref(), Some("/workspace/kilroy"));
+    assert_eq!(create.model.as_deref(), Some("claude-opus-4-1"));
+    assert_eq!(create.effort.as_deref(), Some("high"));
+    assert_eq!(create.permission_mode.as_deref(), Some("plan"));
+    assert_eq!(
+        create.sandbox,
+        Some(freshell_protocol::Sandbox::WorkspaceWrite)
+    );
+    registry.kill_all();
+}
+
+#[tokio::test]
+async fn production_fresh_boot_recovery_reuses_the_persisted_kilroy_plan() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("restart-state.json");
+    let (_url, registry, mut state) = common::spawn_server_with_specs_and_state(vec![]).await;
+    state.session_existence = Arc::new(PresentSessions);
+    state.restart = RestartCoordinator::new_persistent(path.clone()).unwrap();
+    let durable_id = "durable-kilroy-boot".to_string();
+    let old_runtime_id = "fresh-kilroy-boot-old".to_string();
+    let old = state.restart.register_initial(
+        RuntimeLocator::new(AgentRuntimeKind::FreshAgent, "claude", durable_id.clone()),
+        &old_runtime_id,
+    );
+    let exact_plan = ProductionFreshResumePlan {
+        session_type: freshell_protocol::SessionType::Kilroy,
+        cwd: Some("/workspace/kilroy-boot".to_string()),
+        model: Some("claude-opus-boot".to_string()),
+        effort: Some("max".to_string()),
+        permission_mode: Some("acceptEdits".to_string()),
+        sandbox: Some(freshell_protocol::Sandbox::ReadOnly),
+    };
+    let failing = Arc::new(FaithfulFreshRuntime {
+        coordinator: state.restart.clone(),
+        broadcast_tx: Arc::clone(&state.broadcast_tx),
+        live: Mutex::new(HashMap::from([(
+            ("claude".to_string(), durable_id.clone()),
+            old_runtime_id.clone(),
+        )])),
+        events: Mutex::new(Vec::new()),
+        plans: Mutex::new(HashMap::from([(
+            ("claude".to_string(), durable_id.clone()),
+            exact_plan,
+        )])),
+        creates: Mutex::new(Vec::new()),
+        fail_next_create: AtomicBool::new(true),
+    });
+    let production =
+        freshell_ws::restart::ProductionRestartRuntime::with_fresh_runtime(state.clone(), failing);
+    let request = AgentRestart {
+        request_id: "production-kilroy-boot-r1".to_string(),
+        provider: "claude".to_string(),
+        session_id: durable_id.clone(),
+        kind: AgentRuntimeKind::FreshAgent,
+        live_id: old_runtime_id,
+        expected_generation: old.generation,
+    };
+    let first = state.restart.execute(request.clone(), &production).await;
+    assert!(matches!(
+        first.messages.last(),
+        Some(ServerMessage::AgentRestartFailed(failed)) if failed.retryable
+    ));
+
+    let reopened = RestartCoordinator::new_persistent(path).unwrap();
+    let (_url, recovery_registry, mut recovery_state) =
+        common::spawn_server_with_specs_and_state(vec![]).await;
+    recovery_state.session_existence = Arc::new(PresentSessions);
+    recovery_state.restart = reopened.clone();
+    let recovering = Arc::new(FaithfulFreshRuntime {
+        coordinator: reopened.clone(),
+        broadcast_tx: Arc::clone(&recovery_state.broadcast_tx),
+        live: Mutex::new(HashMap::new()),
+        events: Mutex::new(Vec::new()),
+        plans: Mutex::new(HashMap::new()),
+        creates: Mutex::new(Vec::new()),
+        fail_next_create: AtomicBool::new(false),
+    });
+    let production = Arc::new(
+        freshell_ws::restart::ProductionRestartRuntime::with_fresh_runtime(
+            recovery_state,
+            recovering.clone(),
+        ),
+    );
+    let _registration = reopened.set_runtime(production);
+    reopened.recover_pending_registered(|_| {}).await;
+
+    let creates = recovering.creates.lock().unwrap();
+    let create = creates.last().expect("boot recovery create");
+    assert_eq!(create.session_type, freshell_protocol::SessionType::Kilroy);
+    assert_eq!(create.cwd.as_deref(), Some("/workspace/kilroy-boot"));
+    assert_eq!(create.model.as_deref(), Some("claude-opus-boot"));
+    assert_eq!(create.effort.as_deref(), Some("max"));
+    assert_eq!(create.permission_mode.as_deref(), Some("acceptEdits"));
+    assert_eq!(create.sandbox, Some(freshell_protocol::Sandbox::ReadOnly));
+    assert!(reopened.pending_recoveries().is_empty());
+    registry.kill_all();
+    recovery_registry.kill_all();
+}
+
 #[tokio::test(start_paused = true)]
 async fn fresh_replacement_result_uses_one_deadline_despite_unrelated_broadcasts() {
-    let (_url, registry, state) = common::spawn_server_with_specs_and_state(vec![]).await;
+    let (_url, registry, mut state) = common::spawn_server_with_specs_and_state(vec![]).await;
+    state.session_existence = Arc::new(PresentSessions);
     let fresh_runtime = Arc::new(UnrelatedTrafficFreshRuntime {
         broadcast_tx: Arc::clone(&state.broadcast_tx),
     });
@@ -1893,6 +2221,9 @@ async fn fresh_replacement_result_uses_one_deadline_despite_unrelated_broadcasts
         live_id: "fresh-old".to_string(),
         expected_generation: 1,
     };
+    RestartRuntime::preflight(&production, &request)
+        .await
+        .expect("deadline test preflight");
 
     let waiter =
         tokio::spawn(

@@ -353,3 +353,38 @@ Expected: diff check is silent; commit only if verification changed one of those
     `too_many_arguments` findings in `claude.rs:1205` and `codex.rs:3365`.
 - No Node commands, external provider processes, or live-port operations were
   used.
+
+#### Final review iteration 2 — 2026-07-30
+
+- Production restart preflight now captures and durably persists the exact
+  runtime resume inputs before teardown:
+  - fresh Claude flavour (`freshclaude` or `kilroy`) from the live runtime,
+    plus cwd/model/effort/permission/sandbox from the durable identity record;
+  - terminal cwd, shell, and provider model/permission/sandbox values stamped
+    on the running PTY at creation.
+- Ordinary replacement and boot recovery both consume that persisted plan.
+  New transactions no longer force `freshclaude`, blank fresh-agent settings,
+  or `Shell::System`; legacy terminal recovery records without the new fields
+  retain the prior system-shell migration fallback.
+- Retryable post-shutdown `agent.restart.failed` frames now keep the original
+  serialized request in flight. The client retries the same bytes with bounded
+  exponential backoff, retains the request across reconnect, and finalizes it
+  only on `agent.restart.replaced` or a nonretryable failure.
+- Red/green regression coverage includes Kilroy with nondefault Claude
+  settings, serialized boot-style recovery, non-system terminal-shell/provider
+  plan persistence, byte-identical retry, reconnect recovery, nonretryable
+  finalization, and context-menu recovery feedback.
+- Verification:
+  - `cargo test -p freshell-ws --test restart_protocol` — 40 passed.
+  - `cargo test -p freshell-terminal --lib` — 165 passed.
+  - `cargo test -p freshell-freshagent --lib` — 327 passed.
+  - `npm run test:vitest -- run test/unit/client/restart-runtime-ws.test.ts test/e2e/pane-context-menu-stability.test.tsx --config config/vitest/vitest.config.ts`
+    — 16 passed.
+  - `npm run typecheck` — passed.
+  - `npm run lint` — zero errors; eight pre-existing hook warnings outside the
+    changed lines.
+  - `cargo fmt --all -- --check` — passed.
+  - `cargo clippy -p freshell-terminal -p freshell-freshagent -p freshell-ws --all-targets -- -A clippy::too_many_arguments -D warnings`
+    — passed.
+- No Node backend changes, external provider processes, or live-port
+  operations were used.

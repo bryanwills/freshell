@@ -173,17 +173,24 @@ export function ContextMenuProvider({
   useEffect(() => ws.onMessage((message) => {
     if (
       (message.type !== 'agent.restart.replaced' && message.type !== 'agent.restart.failed')
-      || !requestedRestartsRef.current.delete(message.requestId)
+      || !requestedRestartsRef.current.has(message.requestId)
     ) {
       return
+    }
+    if (message.type === 'agent.restart.replaced' || !message.retryable) {
+      requestedRestartsRef.current.delete(message.requestId)
     }
     if (message.type === 'agent.restart.failed') {
       setConfirmState({
         title: 'Pane restart failed',
-        body: message.message,
+        body: message.retryable
+          ? `${message.message} Freshell will retry this restart automatically.`
+          : message.message,
         confirmLabel: 'OK',
         onConfirm: () => setConfirmState(null),
       })
+    } else {
+      setConfirmState(null)
     }
   }), [ws])
 

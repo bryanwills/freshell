@@ -1130,6 +1130,13 @@ fn cli_provider_settings(
     if mode == "shell" || mode == "codex" {
         return (None, None, None);
     }
+    configured_provider_settings(state, mode)
+}
+
+fn configured_provider_settings(
+    state: &WsState,
+    mode: &str,
+) -> (Option<String>, Option<String>, Option<String>) {
     let Some(p) = state.settings.coding_cli.providers.get(mode) else {
         return (None, None, None);
     };
@@ -1154,6 +1161,7 @@ async fn plan_codex_managed_launch(
     mode: &str,
     raw_cwd: Option<&str>,
     resume_session_id: Option<&str>,
+    restart_launch: Option<&freshell_terminal::TerminalRestartLaunch>,
 ) -> Result<Option<freshell_codex::launch_lifecycle::CodexTerminalLaunch>, String> {
     let managed_flag =
         std::env::var(freshell_codex::launch_plan::FRESHELL_CODEX_MANAGED_LAUNCH_ENV).ok();
@@ -1162,6 +1170,14 @@ async fn plan_codex_managed_launch(
     }
     let codex_provider = state.settings.coding_cli.providers.get("codex");
     let provider_str = |key: &str| {
+        if let Some(launch) = restart_launch {
+            return match key {
+                "model" => launch.model.clone(),
+                "sandbox" => launch.sandbox.clone(),
+                "permissionMode" => launch.permission_mode.clone(),
+                _ => None,
+            };
+        }
         codex_provider
             .and_then(|p| p.get(key))
             .and_then(|v| v.as_str())
@@ -1467,6 +1483,28 @@ pub(crate) async fn handle_create(
     pane_reconcile_v1: bool,
     create_limiter: &mut crate::create_limit::CreateRateLimiter,
 ) -> bool {
+    handle_create_with_restart_launch(
+        create,
+        out,
+        state,
+        conn_id,
+        pane_reconcile_v1,
+        create_limiter,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_create_with_restart_launch(
+    create: TerminalCreate,
+    out: &mut crate::create_gate::CreateOutput<'_>,
+    state: &WsState,
+    conn_id: u64,
+    pane_reconcile_v1: bool,
+    create_limiter: &mut crate::create_limit::CreateRateLimiter,
+    restart_launch: Option<freshell_terminal::TerminalRestartLaunch>,
+) -> bool {
     // Single-flight create-dedupe (reconciliation design §5.4, the council's
     // two-tab double-respawn blocker): on `paneReconcileV1` connections ONLY,
     // a create whose `createRequestId` already has a live terminal ADOPTS it —
@@ -1632,8 +1670,22 @@ pub(crate) async fn handle_create(
 
     let host_os = host_os_live();
     let is_wsl = is_wsl_env_live();
-    let shell = map_shell(create.shell);
+    let shell = map_shell(
+        restart_launch
+            .as_ref()
+            .map(|launch| launch.shell)
+            .unwrap_or(create.shell),
+    );
     let mode = create.mode.clone();
+    let restart_launch_to_stamp = restart_launch.clone().unwrap_or_else(|| {
+        let (permission_mode, model, sandbox) = configured_provider_settings(state, &mode);
+        freshell_terminal::TerminalRestartLaunch {
+            shell: create.shell,
+            permission_mode,
+            model,
+            sandbox,
+        }
+    });
 
     // Reject modes that are neither 'shell' nor a registered coding CLI — the
     // reference throws `UnknownTerminalModeError` (`terminal-registry.ts:1073-1074`,
@@ -2026,7 +2078,16 @@ pub(crate) async fn handle_create(
     // app-server plan instead). Boot-snapshot settings (same documented caveat
     // as `defaultCwd` above). Shared with the auto-resume respawn seam
     // (Task 4) via `cli_provider_settings`.
-    let (permission_mode, model, sandbox) = cli_provider_settings(state, &mode);
+    let (permission_mode, model, sandbox) = restart_launch
+        .as_ref()
+        .map(|launch| {
+            (
+                launch.permission_mode.clone(),
+                launch.model.clone(),
+                launch.sandbox.clone(),
+            )
+        })
+        .unwrap_or_else(|| cli_provider_settings(state, &mode));
 
     // opencode: allocate the loopback control endpoint BEFORE building the launch
     // (`ws:2471-2473`; `local-port.ts:13-41`), via the freshell-opencode
@@ -2060,6 +2121,7 @@ pub(crate) async fn handle_create(
         &mode,
         create.cwd.as_deref(),
         resume_session_id.as_deref(),
+        restart_launch.as_ref(),
     )
     .await
     {
@@ -2331,6 +2393,9 @@ pub(crate) async fn handle_create(
         return send_create_error(out, ErrorCode::PtySpawnFailed, message, &create.request_id)
             .await;
     }
+    state
+        .registry
+        .set_restart_launch(&terminal_id, restart_launch_to_stamp);
 
     // D8: arm the lease's TTL kill path — record the just-spawned child's pid
     // on the winner's lease immediately (its presence decides ExpiredNeedsKill
@@ -2720,6 +2785,7 @@ pub async fn respawn_agent_terminal(
         &mode,
         req.cwd.as_deref(),
         resume_session_id.as_deref(),
+        None,
     )
     .await
     {
@@ -3895,6 +3961,7 @@ pub(crate) async fn create_terminal_replacement(
     state: &WsState,
     request: &freshell_protocol::AgentRestart,
     cwd: Option<String>,
+    launch: freshell_terminal::TerminalRestartLaunch,
 ) -> Result<String, String> {
     let create = TerminalCreate {
         request_id: format!(
@@ -3903,7 +3970,7 @@ pub(crate) async fn create_terminal_replacement(
             uuid::Uuid::new_v4()
         ),
         mode: request.provider.clone(),
-        shell: freshell_protocol::Shell::System,
+        shell: launch.shell,
         codex_durability: None,
         cwd,
         live_terminal: None,
@@ -3936,7 +4003,16 @@ pub(crate) async fn create_terminal_replacement(
         state.create_protect.rate_limit,
         state.create_protect.rate_window_ms,
     );
-    let _ = handle_create(create, &mut out, state, u64::MAX, true, &mut limiter).await;
+    let _ = handle_create_with_restart_launch(
+        create,
+        &mut out,
+        state,
+        u64::MAX,
+        true,
+        &mut limiter,
+        Some(launch),
+    )
+    .await;
     while let Ok(message) = reply_rx.try_recv() {
         match message {
             ServerMessage::TerminalCreated(created) => return Ok(created.terminal_id),

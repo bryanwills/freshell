@@ -83,7 +83,10 @@ type AgentRestartClientMessage = Extract<ClientMessage, { type: 'agent.restart' 
 
 type InFlightAgentRestart = {
   message: AgentRestartClientMessage
+  fingerprint: string
   lastResendEpoch: number
+  retryAttempts: number
+  retryTimer: number | null
 }
 
 type AgentRestartStore = {
@@ -95,6 +98,9 @@ type AgentRestartStore = {
 }
 
 const CONNECTION_TIMEOUT_MS = 10_000
+const AGENT_RESTART_RETRY_BASE_MS = 500
+const AGENT_RESTART_RETRY_MAX_MS = 4_000
+const AGENT_RESTART_MAX_AUTOMATIC_RETRIES = 3
 
 // Bounded pre-verdict create hold: when the server acks paneReconcileV1, pane
 // creates are held until their pane's reconcile verdict folds — or this
@@ -206,8 +212,55 @@ export class WsClient {
   private clearQueuedMessagesAfterProtocolMismatch(): void {
     this.pendingMessages = []
     this.inFlightCreates.clear()
+    this.clearAllAgentRestartRetryTimers()
+    this.inFlightAgentRestarts.clear()
     this.preReadyCreateQueue.clear()
     this.resetReconcileHold({ requeueHeld: false })
+  }
+
+  private clearAgentRestartRetryTimer(entry: InFlightAgentRestart): void {
+    if (entry.retryTimer !== null) {
+      window.clearTimeout(entry.retryTimer)
+      entry.retryTimer = null
+    }
+  }
+
+  private clearAllAgentRestartRetryTimers(): void {
+    for (const entry of this.inFlightAgentRestarts.values()) {
+      this.clearAgentRestartRetryTimer(entry)
+    }
+  }
+
+  private sendAgentRestartEntry(entry: InFlightAgentRestart): void {
+    this.ws?.send(entry.fingerprint)
+    this.outboundMessageObserver?.(entry.message)
+  }
+
+  private scheduleAgentRestartRetry(requestId: string, entry: InFlightAgentRestart): void {
+    if (
+      entry.retryTimer !== null
+      || entry.retryAttempts >= AGENT_RESTART_MAX_AUTOMATIC_RETRIES
+    ) {
+      return
+    }
+    const delay = Math.min(
+      AGENT_RESTART_RETRY_BASE_MS * (2 ** entry.retryAttempts),
+      AGENT_RESTART_RETRY_MAX_MS,
+    )
+    entry.retryAttempts += 1
+    entry.retryTimer = window.setTimeout(() => {
+      entry.retryTimer = null
+      if (
+        this.inFlightAgentRestarts.get(requestId) !== entry
+        || this._state !== 'ready'
+        || this.ws?.readyState !== WebSocket.OPEN
+        || this.serverCapabilities.agentRestartV1 !== true
+      ) {
+        return
+      }
+      this.sendAgentRestartEntry(entry)
+      entry.lastResendEpoch = this.reconnectEpoch
+    }, delay)
   }
 
   cancelCreate(requestId: string): void {
@@ -277,16 +330,26 @@ export class WsClient {
 
   private handleIncomingMessage(msg: ServerMessage): void {
     if (msg.type === 'agent.restart.replaced' || msg.type === 'agent.restart.failed') {
-      const fingerprint = JSON.stringify(msg)
-      if (this.completedAgentRestartResults.get(msg.requestId) === fingerprint) {
-        return
+      const inFlight = this.inFlightAgentRestarts.get(msg.requestId)
+      if (msg.type === 'agent.restart.failed' && msg.retryable) {
+        if (inFlight) {
+          this.scheduleAgentRestartRetry(msg.requestId, inFlight)
+        }
+      } else {
+        const fingerprint = JSON.stringify(msg)
+        if (this.completedAgentRestartResults.get(msg.requestId) === fingerprint) {
+          return
+        }
+        this.completedAgentRestartResults.set(msg.requestId, fingerprint)
+        if (this.completedAgentRestartResults.size > 1_000) {
+          const oldest = this.completedAgentRestartResults.keys().next().value
+          if (typeof oldest === 'string') this.completedAgentRestartResults.delete(oldest)
+        }
+        if (inFlight) {
+          this.clearAgentRestartRetryTimer(inFlight)
+          this.inFlightAgentRestarts.delete(msg.requestId)
+        }
       }
-      this.completedAgentRestartResults.set(msg.requestId, fingerprint)
-      if (this.completedAgentRestartResults.size > 1_000) {
-        const oldest = this.completedAgentRestartResults.keys().next().value
-        if (typeof oldest === 'string') this.completedAgentRestartResults.delete(oldest)
-      }
-      this.inFlightAgentRestarts.delete(msg.requestId)
 
       if (msg.type === 'agent.restart.replaced') {
         this.retiredRuntimeGenerations.set(
@@ -328,7 +391,8 @@ export class WsClient {
       if (this.serverCapabilities.agentRestartV1 === true) {
         for (const entry of this.inFlightAgentRestarts.values()) {
           if (entry.lastResendEpoch === this.reconnectEpoch) continue
-          this.sendNow(entry.message)
+          this.clearAgentRestartRetryTimer(entry)
+          this.sendAgentRestartEntry(entry)
           entry.lastResendEpoch = this.reconnectEpoch
         }
       }
@@ -745,6 +809,7 @@ export class WsClient {
     this._state = 'disconnected'
     this.pendingMessages = []
     this.inFlightCreates.clear()
+    this.clearAllAgentRestartRetryTimers()
     this.inFlightAgentRestarts.clear()
     this.completedAgentRestartResults.clear()
     this.retiredRuntimeGenerations.clear()
@@ -780,14 +845,22 @@ export class WsClient {
     if (this.intentionalClose) return
 
     if (isAgentRestartMessage(msg)) {
+      const fingerprint = JSON.stringify(msg)
       const current = this.inFlightAgentRestarts.get(msg.requestId)
-      if (current && JSON.stringify(current.message) !== JSON.stringify(msg)) {
+      if (current && current.fingerprint !== fingerprint) {
         throw new Error(`agent.restart requestId ${msg.requestId} was reused with a different request`)
       }
-      const entry = current ?? { message: msg, lastResendEpoch: -1 }
+      const entry = current ?? {
+        message: JSON.parse(fingerprint) as AgentRestartClientMessage,
+        fingerprint,
+        lastResendEpoch: -1,
+        retryAttempts: 0,
+        retryTimer: null,
+      }
       this.inFlightAgentRestarts.set(msg.requestId, entry)
       if (this._state === 'ready' && this.ws?.readyState === WebSocket.OPEN) {
-        this.sendNow(entry.message)
+        this.clearAgentRestartRetryTimer(entry)
+        this.sendAgentRestartEntry(entry)
         entry.lastResendEpoch = this.reconnectEpoch
       }
       return

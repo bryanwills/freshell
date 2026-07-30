@@ -67,6 +67,26 @@ pub struct PendingRestartRecovery {
 pub struct RestartResumeContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_shell: Option<freshell_protocol::Shell>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_permission_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_sandbox: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_session_type: Option<freshell_protocol::SessionType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_permission_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_sandbox: Option<freshell_protocol::Sandbox>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1898,7 +1918,21 @@ impl RestartCoordinator {
 
 #[derive(Clone)]
 struct ProductionResumePlan {
-    cwd: Option<String>,
+    context: RestartResumeContext,
+}
+
+/// Exact fresh-agent creation inputs captured while the selected runtime is
+/// still live. The production implementation joins the live manager's flavour
+/// with the durable pane-ledger settings; test adapters provide the same
+/// contract without launching external providers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductionFreshResumePlan {
+    pub session_type: freshell_protocol::SessionType,
+    pub cwd: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub permission_mode: Option<String>,
+    pub sandbox: Option<freshell_protocol::Sandbox>,
 }
 
 /// Narrow production seam over the three fresh-agent runtime managers.
@@ -1921,6 +1955,12 @@ pub trait ProductionFreshRuntime: Send + Sync {
         expected_runtime_id: &str,
     ) -> bool;
 
+    async fn capture_resume_plan(
+        &self,
+        provider: freshell_protocol::AgentProvider,
+        session_id: &str,
+    ) -> Option<ProductionFreshResumePlan>;
+
     async fn handle_create(
         &self,
         provider: freshell_protocol::AgentProvider,
@@ -1930,6 +1970,15 @@ pub trait ProductionFreshRuntime: Send + Sync {
 
 struct WsStateFreshRuntime {
     state: crate::WsState,
+}
+
+fn provider_name(provider: freshell_protocol::AgentProvider) -> &'static str {
+    match provider {
+        freshell_protocol::AgentProvider::Claude => "claude",
+        freshell_protocol::AgentProvider::Codex => "codex",
+        freshell_protocol::AgentProvider::Opencode => "opencode",
+        freshell_protocol::AgentProvider::Amplifier => "amplifier",
+    }
 }
 
 #[async_trait::async_trait]
@@ -1980,6 +2029,61 @@ impl ProductionFreshRuntime for WsStateFreshRuntime {
             }
             freshell_protocol::AgentProvider::Amplifier => false,
         }
+    }
+
+    async fn capture_resume_plan(
+        &self,
+        provider: freshell_protocol::AgentProvider,
+        session_id: &str,
+    ) -> Option<ProductionFreshResumePlan> {
+        let session_type = match provider {
+            freshell_protocol::AgentProvider::Claude => {
+                self.state
+                    .fresh_claude
+                    .live_session_type(session_id)
+                    .await?
+            }
+            freshell_protocol::AgentProvider::Codex => self
+                .state
+                .fresh_codex
+                .has_live_session(session_id)
+                .await
+                .then_some(freshell_protocol::SessionType::Freshcodex)?,
+            freshell_protocol::AgentProvider::Opencode => self
+                .state
+                .fresh_opencode
+                .has_live_session(session_id)
+                .await
+                .then_some(freshell_protocol::SessionType::Freshopencode)?,
+            freshell_protocol::AgentProvider::Amplifier => return None,
+        };
+        let binding = self
+            .state
+            .pane_ledger
+            .load_binding(provider_name(provider), session_id);
+        let sandbox = match binding.as_ref().and_then(|row| row.sandbox.as_deref()) {
+            None => None,
+            Some("read-only") => Some(freshell_protocol::Sandbox::ReadOnly),
+            Some("workspace-write") => Some(freshell_protocol::Sandbox::WorkspaceWrite),
+            Some("danger-full-access") => Some(freshell_protocol::Sandbox::DangerFullAccess),
+            Some(value) => {
+                tracing::error!(
+                    provider = provider_name(provider),
+                    session_id,
+                    sandbox = value,
+                    "agent.restart.preflight.invalid_fresh_sandbox"
+                );
+                return None;
+            }
+        };
+        Some(ProductionFreshResumePlan {
+            session_type,
+            cwd: binding.as_ref().and_then(|row| row.cwd.clone()),
+            model: binding.as_ref().and_then(|row| row.model.clone()),
+            effort: binding.as_ref().and_then(|row| row.effort.clone()),
+            permission_mode: binding.as_ref().and_then(|row| row.permission_mode.clone()),
+            sandbox,
+        })
     }
 
     async fn handle_create(
@@ -2107,7 +2211,7 @@ impl ProductionRestartRuntime {
         &self,
         request: &AgentRestart,
         provider: freshell_protocol::AgentProvider,
-        session_type: freshell_protocol::SessionType,
+        plan: &RestartResumeContext,
     ) -> Result<String, RestartFailure> {
         let create_request_id = format!(
             "agent-restart:{}:{}",
@@ -2117,17 +2221,23 @@ impl ProductionRestartRuntime {
         let mut receiver = self.state.broadcast_tx.subscribe();
         let create = freshell_protocol::FreshAgentCreate {
             request_id: create_request_id.clone(),
-            session_type,
-            cwd: None,
-            effort: None,
+            session_type: plan.fresh_session_type.ok_or_else(|| {
+                RestartFailure::new(
+                    AgentRestartFailureCode::ReplacementFailed,
+                    "fresh-agent restart plan omitted its runtime flavour",
+                    false,
+                )
+            })?,
+            cwd: plan.fresh_cwd.clone(),
+            effort: plan.fresh_effort.clone(),
             legacy_restore_context: None,
-            model: None,
+            model: plan.fresh_model.clone(),
             model_selection: None,
-            permission_mode: None,
+            permission_mode: plan.fresh_permission_mode.clone(),
             plugins: None,
             provider: Some(provider),
             resume_session_id: Some(request.session_id.clone()),
-            sandbox: None,
+            sandbox: plan.fresh_sandbox,
             session_ref: Some(freshell_protocol::SessionLocator {
                 provider: request.provider.clone(),
                 session_id: request.session_id.clone(),
@@ -2199,21 +2309,28 @@ impl ProductionRestartRuntime {
         request: &AgentRestart,
         plan: ProductionResumePlan,
     ) -> Result<String, RestartFailure> {
-        let (provider, session_type) = Self::provider(request)?;
+        let (provider, _) = Self::provider(request)?;
         match request.kind {
-            AgentRuntimeKind::Terminal => {
-                crate::terminal::create_terminal_replacement(&self.state, request, plan.cwd)
-                    .await
-                    .map_err(|message| {
-                        RestartFailure::new(
-                            AgentRestartFailureCode::ReplacementFailed,
-                            message,
-                            true,
-                        )
-                    })
-            }
+            AgentRuntimeKind::Terminal => crate::terminal::create_terminal_replacement(
+                &self.state,
+                request,
+                plan.context.terminal_cwd.clone(),
+                freshell_terminal::TerminalRestartLaunch {
+                    shell: plan
+                        .context
+                        .terminal_shell
+                        .unwrap_or(freshell_protocol::Shell::System),
+                    permission_mode: plan.context.terminal_permission_mode.clone(),
+                    model: plan.context.terminal_model.clone(),
+                    sandbox: plan.context.terminal_sandbox.clone(),
+                },
+            )
+            .await
+            .map_err(|message| {
+                RestartFailure::new(AgentRestartFailureCode::ReplacementFailed, message, true)
+            }),
             AgentRuntimeKind::FreshAgent => {
-                self.create_fresh_replacement(request, provider, session_type)
+                self.create_fresh_replacement(request, provider, &plan.context)
                     .await
             }
         }
@@ -2227,7 +2344,7 @@ impl RestartRuntime for ProductionRestartRuntime {
     async fn preflight(&self, request: &AgentRestart) -> Result<(), RestartFailure> {
         let (provider, _) = Self::provider(request)?;
         self.validate_durable(request)?;
-        let cwd = match request.kind {
+        let context = match request.kind {
             AgentRuntimeKind::Terminal => {
                 let probe = self.state.registry.probe(&request.live_id).ok_or_else(|| {
                     RestartFailure::new(
@@ -2255,7 +2372,21 @@ impl RestartRuntime for ProductionRestartRuntime {
                         false,
                     ));
                 }
-                probe.cwd
+                let launch = probe.restart_launch.ok_or_else(|| {
+                    RestartFailure::new(
+                        AgentRestartFailureCode::PreflightFailed,
+                        "selected terminal is missing its authoritative restart settings",
+                        false,
+                    )
+                })?;
+                RestartResumeContext {
+                    terminal_cwd: probe.cwd,
+                    terminal_shell: Some(launch.shell),
+                    terminal_permission_mode: launch.permission_mode,
+                    terminal_model: launch.model,
+                    terminal_sandbox: launch.sandbox,
+                    ..RestartResumeContext::default()
+                }
             }
             AgentRuntimeKind::FreshAgent => {
                 if !self.fresh_is_live(provider, &request.session_id).await {
@@ -2265,7 +2396,26 @@ impl RestartRuntime for ProductionRestartRuntime {
                         false,
                     ));
                 }
-                None
+                let plan = self
+                    .fresh_runtime
+                    .capture_resume_plan(provider, &request.session_id)
+                    .await
+                    .ok_or_else(|| {
+                        RestartFailure::new(
+                            AgentRestartFailureCode::PreflightFailed,
+                            "selected fresh-agent runtime settings are unavailable",
+                            false,
+                        )
+                    })?;
+                RestartResumeContext {
+                    fresh_session_type: Some(plan.session_type),
+                    fresh_cwd: plan.cwd,
+                    fresh_model: plan.model,
+                    fresh_effort: plan.effort,
+                    fresh_permission_mode: plan.permission_mode,
+                    fresh_sandbox: plan.sandbox,
+                    ..RestartResumeContext::default()
+                }
             }
         };
         let mut plans = self.plans.lock().expect("production restart plans");
@@ -2274,7 +2424,7 @@ impl RestartRuntime for ProductionRestartRuntime {
                 plans.remove(&oldest);
             }
         }
-        plans.insert(request.request_id.clone(), ProductionResumePlan { cwd });
+        plans.insert(request.request_id.clone(), ProductionResumePlan { context });
         Ok(())
     }
 
@@ -2321,7 +2471,13 @@ impl RestartRuntime for ProductionRestartRuntime {
             .lock()
             .expect("production restart plans")
             .remove(&request.request_id)
-            .unwrap_or(ProductionResumePlan { cwd: None });
+            .ok_or_else(|| {
+                RestartFailure::new(
+                    AgentRestartFailureCode::ReplacementFailed,
+                    "restart resume plan disappeared before replacement",
+                    true,
+                )
+            })?;
         self.create_from_builtin_path(request, plan).await
     }
 
@@ -2334,9 +2490,7 @@ impl RestartRuntime for ProductionRestartRuntime {
             .lock()
             .expect("production restart plans")
             .get(&request.request_id)
-            .map(|plan| RestartResumeContext {
-                terminal_cwd: plan.cwd.clone(),
-            })
+            .map(|plan| plan.context.clone())
     }
 
     async fn recover_replacement(
@@ -2349,7 +2503,13 @@ impl RestartRuntime for ProductionRestartRuntime {
         self.create_from_builtin_path(
             request,
             ProductionResumePlan {
-                cwd: context.and_then(|context| context.terminal_cwd.clone()),
+                context: context.cloned().ok_or_else(|| {
+                    RestartFailure::new(
+                        AgentRestartFailureCode::ReplacementFailed,
+                        "persisted restart resume plan is unavailable",
+                        false,
+                    )
+                })?,
             },
         )
         .await

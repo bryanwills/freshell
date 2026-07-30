@@ -132,6 +132,9 @@ struct ClaudeCreateRecord {
 /// One live freshclaude session: the Node sidecar it drives + its stdout consumer.
 struct ClaudeSession {
     runtime: freshell_protocol::RuntimeDescriptor,
+    /// Authoritative launch flavour for restart/recovery (`freshclaude` vs
+    /// `kilroy`). Provider alone cannot reconstruct this value.
+    session_type: SessionType,
     /// stdin of the Node sidecar (write `create`/`send`/`shutdown` requests).
     stdin: ChildStdin,
     /// The owned Node sidecar child (SIGKILL backstop; `kill_on_drop`).
@@ -465,6 +468,7 @@ impl FreshClaudeState {
             created.clone(),
             ClaudeSession {
                 runtime: runtime.clone(),
+                session_type: msg.session_type,
                 stdin,
                 child,
                 ownership_id: ownership_id.clone(),
@@ -801,6 +805,18 @@ impl FreshClaudeState {
         self.sessions.lock().await.contains_key(&key)
     }
 
+    /// The exact Claude runtime flavour currently owning a durable session.
+    /// Restart preflight captures this before teardown so it never silently
+    /// converts a Kilroy pane into freshclaude.
+    pub async fn live_session_type(&self, session_id: &str) -> Option<SessionType> {
+        let key = self.resolve_session_key(session_id).await?;
+        self.sessions
+            .lock()
+            .await
+            .get(&key)
+            .map(|session| session.session_type)
+    }
+
     /// Resolve a client-addressed session id to the sessions-map key (Task 10b): the id
     /// itself when tracked, else through [`Self::cli_index`] (durable UUID -> map key).
     /// The map is never re-keyed (in-flight consumers hold the placeholder key);
@@ -1126,6 +1142,7 @@ impl FreshClaudeState {
             msg.session_id.clone(),
             ClaudeSession {
                 runtime: runtime.clone(),
+                session_type: msg.session_type,
                 stdin,
                 child,
                 ownership_id,
@@ -1724,6 +1741,7 @@ pub(crate) mod tests {
                     runtime_id: format!("fresh-runtime-test-{session_id}"),
                     generation: 1,
                 },
+                session_type: SessionType::Freshclaude,
                 stdin,
                 child,
                 ownership_id: format!("test-{session_id}"),
@@ -2625,6 +2643,13 @@ rl.on('line', (line) => {
         .await
         .expect("freshAgent.session.init consumed within budget");
 
+        assert_eq!(
+            state
+                .live_session_type("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+                .await,
+            Some(SessionType::Kilroy),
+            "the live runtime retains its authoritative Claude flavour"
+        );
         let bindings = fake.bindings.lock().unwrap();
         let b = bindings.last().expect("binding at sdk.session.init");
         assert_eq!(b.provider, "claude");

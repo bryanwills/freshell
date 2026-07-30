@@ -104,6 +104,18 @@ const replaced = {
   runtimeId: 'terminal-new',
   generation: 8,
 }
+const retryableFailed = {
+  type: 'agent.restart.failed' as const,
+  requestId: 'restart-1',
+  provider: 'claude',
+  sessionId: 's1',
+  kind: 'terminal' as const,
+  runtimeId: 'terminal-old',
+  generation: 7,
+  code: 'REPLACEMENT_FAILED' as const,
+  message: 'replacement is temporarily unavailable',
+  retryable: true,
+}
 
 describe('WsClient restart transaction folding', () => {
   beforeEach(() => {
@@ -178,6 +190,74 @@ describe('WsClient restart transaction folding', () => {
     const content = store.getState().panes.layouts.tab1
     if (content.type !== 'leaf' || content.content.kind !== 'terminal') throw new Error('expected terminal')
     expect(content.content.runtimeGeneration).toBe(8)
+  })
+
+  it('retains and retries the byte-identical request after a retryable post-shutdown failure', async () => {
+    const client = new WsClient('ws://example/ws')
+    const promise = client.connect()
+    const socket = MockWebSocket.instances[0]
+    socket.onopen?.()
+    socket.message({ type: 'ready', capabilities: { agentRestartV1: true } })
+    await promise
+
+    client.requestAgentRestart(request)
+    const firstWireRequest = socket.sent.find((frame) => JSON.parse(frame).type === 'agent.restart')
+    expect(firstWireRequest).toBeDefined()
+
+    socket.message(retryableFailed)
+    await vi.advanceTimersByTimeAsync(499)
+    expect(socket.sent.filter((frame) => JSON.parse(frame).type === 'agent.restart')).toHaveLength(1)
+    await vi.advanceTimersByTimeAsync(1)
+
+    const restartFrames = socket.sent.filter((frame) => JSON.parse(frame).type === 'agent.restart')
+    expect(restartFrames).toEqual([firstWireRequest, firstWireRequest])
+
+    socket.message(replaced)
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(socket.sent.filter((frame) => JSON.parse(frame).type === 'agent.restart')).toEqual([
+      firstWireRequest,
+      firstWireRequest,
+    ])
+  })
+
+  it('keeps a post-shutdown retry pending across reconnect and resends the original request', async () => {
+    const client = new WsClient('ws://example/ws')
+    const firstConnect = client.connect()
+    const first = MockWebSocket.instances[0]
+    first.onopen?.()
+    first.message({ type: 'ready', capabilities: { agentRestartV1: true } })
+    await firstConnect
+
+    client.requestAgentRestart(request)
+    const originalWireRequest = first.sent.find((frame) => JSON.parse(frame).type === 'agent.restart')
+    first.message(retryableFailed)
+    first.drop()
+
+    const reconnect = client.connect()
+    const second = MockWebSocket.instances[1]
+    second.onopen?.()
+    second.message({ type: 'ready', capabilities: { agentRestartV1: true } })
+    await reconnect
+
+    expect(second.sent.filter((frame) => JSON.parse(frame).type === 'agent.restart')).toEqual([
+      originalWireRequest,
+    ])
+    second.message(replaced)
+  })
+
+  it('finalizes a nonretryable failure and never retries it', async () => {
+    const client = new WsClient('ws://example/ws')
+    const promise = client.connect()
+    const socket = MockWebSocket.instances[0]
+    socket.onopen?.()
+    socket.message({ type: 'ready', capabilities: { agentRestartV1: true } })
+    await promise
+
+    client.requestAgentRestart(request)
+    socket.message({ ...retryableFailed, retryable: false, code: 'UNRESUMABLE' as const })
+    await vi.advanceTimersByTimeAsync(10_000)
+
+    expect(sent(socket).filter((frame) => frame.type === 'agent.restart')).toEqual([request])
   })
 
   it('does not replay a restart to a reconnected server that omitted the capability', async () => {

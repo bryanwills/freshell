@@ -720,6 +720,7 @@ mod tests {
             created_at,
             resume_session_id: None,
             cwd: None,
+            restart_launch: None,
         }
     }
 

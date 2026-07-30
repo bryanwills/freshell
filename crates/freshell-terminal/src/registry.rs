@@ -50,7 +50,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use freshell_platform::SpawnSpec;
 use freshell_protocol::{
-    GeometryAuthority, InventoryTerminal, OutputSource, ServerMessage, SessionLocator,
+    GeometryAuthority, InventoryTerminal, OutputSource, ServerMessage, SessionLocator, Shell,
     TerminalAttachIntent, TerminalAttachReady, TerminalExit, TerminalOutput, TerminalRunStatus,
 };
 
@@ -247,6 +247,10 @@ struct TerminalShared {
     /// handshake design §5.1). `None` for creates that carried no key (e.g.
     /// REST ingress, which mints none — design §5.5 precondition 2).
     create_request_id: Option<String>,
+    /// Exact launch inputs needed to recreate this terminal after a
+    /// restart-specific teardown. Captured from the values that built the
+    /// running PTY rather than re-reading mutable server defaults later.
+    restart_launch: Option<TerminalRestartLaunch>,
     /// Attached connections, keyed by connection id (multi-client fan-out, `§7.3`).
     subscribers: HashMap<u64, Subscriber>,
 }
@@ -304,6 +308,16 @@ pub struct IdentityProbeRow {
     /// The terminal's working directory — carried so the §5.4 adopt branch can
     /// echo the EXISTING terminal's cwd on its `terminal.created` frame.
     pub cwd: Option<String>,
+    pub restart_launch: Option<TerminalRestartLaunch>,
+}
+
+/// Runtime-authoritative terminal launch values retained for exact restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalRestartLaunch {
+    pub shell: Shell,
+    pub permission_mode: Option<String>,
+    pub model: Option<String>,
+    pub sandbox: Option<String>,
 }
 
 /// One terminal's row for the REST terminal directory (`registry.list()` as consumed
@@ -922,6 +936,7 @@ impl TerminalRegistry {
             mode: mode.to_string(),
             resume_session_id: resume_session_id.map(str::to_string),
             create_request_id: create_request_id.map(str::to_string),
+            restart_launch: None,
             subscribers: HashMap::new(),
         }));
 
@@ -1619,6 +1634,7 @@ impl TerminalRegistry {
                     created_at: s.created_at,
                     resume_session_id: s.resume_session_id.clone(),
                     cwd: s.cwd.clone(),
+                    restart_launch: s.restart_launch.clone(),
                 }
             })
             .collect()
@@ -1745,6 +1761,7 @@ impl TerminalRegistry {
             mode,
             resume_session_id: opts.resume_session_id,
             create_request_id,
+            restart_launch: None,
             subscribers: HashMap::new(),
         }));
         {
@@ -1852,8 +1869,26 @@ impl TerminalRegistry {
                 created_at: s.created_at,
                 resume_session_id: s.resume_session_id.clone(),
                 cwd: s.cwd.clone(),
+                restart_launch: s.restart_launch.clone(),
             }
         })
+    }
+
+    /// Stamp the exact provider/shell inputs used for a newly-created PTY.
+    /// Called before the corresponding `terminal.created` frame is exposed.
+    pub fn set_restart_launch(&self, terminal_id: &str, launch: TerminalRestartLaunch) -> bool {
+        let shared = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner
+                .terminals
+                .get(terminal_id)
+                .map(|handle| Arc::clone(&handle.shared))
+        };
+        let Some(shared) = shared else {
+            return false;
+        };
+        shared.lock().expect("terminal lock").restart_launch = Some(launch);
+        true
     }
 
     /// A terminal's stamped `createRequestId`, if any.
@@ -4959,6 +4994,7 @@ mod tests {
             created_at: 0,
             resume_session_id: resume_session_id.map(str::to_string),
             cwd: None,
+            restart_launch: None,
         }
     }
 

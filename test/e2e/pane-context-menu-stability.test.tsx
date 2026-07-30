@@ -326,6 +326,51 @@ describe('pane context menu stability (e2e)', () => {
     }))
   })
 
+  it('keeps a retryable post-shutdown restart active until its replacement arrives', async () => {
+    const store = createStore(createResumableTerminalLeaf())
+    const user = userEvent.setup()
+    const { container } = renderFlow(store)
+    const onMessage = wsMocks.onMessage.mock.calls.at(-1)?.[0]
+    expect(onMessage).toBeTypeOf('function')
+
+    const header = await waitFor(() => {
+      const node = container.querySelector('[data-pane-id="pane-1"] [role="banner"]')
+      expect(node).not.toBeNull()
+      return node as HTMLElement
+    })
+    await user.pointer({ target: header, keys: '[MouseRight]' })
+    await settleMenu()
+    await user.click(screen.getByRole('menuitem', { name: 'Restart pane' }))
+    const restart = wsMocks.requestAgentRestart.mock.calls.at(-1)?.[0]
+
+    act(() => onMessage?.({
+      type: 'agent.restart.failed',
+      requestId: restart.requestId,
+      provider: 'claude',
+      sessionId: 'durable-claude-1',
+      kind: 'terminal',
+      runtimeId: 'runtime-claude-1',
+      generation: 6,
+      code: 'REPLACEMENT_FAILED',
+      message: 'replacement is temporarily unavailable',
+      retryable: true,
+    }))
+    expect(screen.getByText(/will retry this restart automatically/i)).toBeInTheDocument()
+
+    act(() => onMessage?.({
+      type: 'agent.restart.replaced',
+      requestId: restart.requestId,
+      provider: 'claude',
+      sessionId: 'durable-claude-1',
+      kind: 'terminal',
+      oldRuntimeId: 'runtime-claude-1',
+      oldGeneration: 6,
+      runtimeId: 'runtime-claude-2',
+      generation: 7,
+    }))
+    expect(screen.queryByText(/will retry this restart automatically/i)).not.toBeInTheDocument()
+  })
+
   it('keeps the terminal menu open when right-clicking inside an inactive terminal body', async () => {
     const store = createStore(createTwoPaneLayout())
     const user = userEvent.setup()
