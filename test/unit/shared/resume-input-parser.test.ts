@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { parseResumeInput } from '@shared/resume-input-parser'
+import { parseResumeInput, MAX_RESUME_CANDIDATES } from '@shared/resume-input-parser'
 
 const V4 = 'ed2afda6-a340-443e-ba60-024a1b3554b4'
 const V7 = '019fac27-69d7-78a0-b972-b339d551042e'
@@ -56,6 +56,25 @@ describe('parseResumeInput — candidate extraction', () => {
 
   it('caps hex tokens at 32 chars (git shas do not match)', () => {
     expect(parseResumeInput('a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2').candidates).toEqual([])
+  })
+
+  it('rejects arbitrary snake_case identifiers (only known xxx_ id families match)', () => {
+    expect(parseResumeInput('my_function123 snake_casedword9').candidates).toEqual([])
+  })
+
+  it('accepts other known xxx_ id families (thread_)', () => {
+    expect(parseResumeInput('thread_abc123456').candidates).toEqual([
+      { token: 'thread_abc123456', kind: 'prefixed-id' },
+    ])
+  })
+
+  it('caps candidates at MAX_RESUME_CANDIDATES (server work budget)', () => {
+    const tokens = Array.from(
+      { length: MAX_RESUME_CANDIDATES + 4 },
+      (_, i) => `417e83450a${String(i).padStart(2, '0')}`,
+    )
+    const { candidates } = parseResumeInput(tokens.join(' '))
+    expect(candidates).toHaveLength(MAX_RESUME_CANDIDATES)
   })
 })
 

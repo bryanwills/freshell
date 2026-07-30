@@ -17,17 +17,24 @@ export interface ResumeHint {
 }
 
 export interface ResumeInputParse {
-  /** Candidate tokens in resolution-priority order. */
+  /** Candidate tokens in resolution-priority order, capped at MAX_RESUME_CANDIDATES. */
   candidates: ResumeCandidate[]
   hint: ResumeHint | null
 }
 
+/**
+ * Work budget: candidates are capped so one pasted blob can never trigger
+ * unbounded server-side scans/DB lookups in the resolve endpoint.
+ */
+export const MAX_RESUME_CANDIDATES = 8
+
 const ANSI_ESCAPE_RE = /\u001b\[[0-9;?]*[0-9A-Za-z]/g
 const UUID_RE =
   /[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/g
-// ses_ + 26 base62 is the first-class shape; the generic form also accepts
-// other known xxx_-prefixed id families.
-const PREFIXED_ID_RE = /\b[a-z]{2,10}_[0-9A-Za-z]{8,40}\b/g
+// Known xxx_-prefixed id families only (ses_ + 26 base62 is opencode's,
+// first-class). Arbitrary snake_case identifiers must NOT match: they would
+// rank FIRST and waste resolver passes on non-ids.
+const PREFIXED_ID_RE = /\b(?:ses|sess|session|thread|thr|run|msg|task|amp)_[0-9A-Za-z]{8,64}\b/g
 // >=8 hex chars, <=32; must contain a digit (filters decade/facade/deadbeef).
 const HEX_PREFIX_RE = /\b[0-9a-fA-F]{8,32}\b/g
 
@@ -118,5 +125,7 @@ export function parseResumeInput(text: string): ResumeInputParse {
   for (const token of uuids) push(token, 'uuid')
   for (const token of hexTokens) push(token, 'hex-prefix')
 
-  return { candidates, hint: deriveHint(sanitized, candidates) }
+  // Cap = work budget: bounds resolver scans + exact-id fallback lookups per request.
+  const capped = candidates.slice(0, MAX_RESUME_CANDIDATES)
+  return { candidates: capped, hint: deriveHint(sanitized, capped) }
 }
