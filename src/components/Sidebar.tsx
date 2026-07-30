@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Terminal, Folder, Settings, LayoutGrid, Search, Loader2, X, Archive, PanelLeftClose, AlertCircle } from 'lucide-react'
+import { Terminal, Folder, Settings, LayoutGrid, Search, Loader2, X, Archive, PanelLeftClose, AlertCircle, RotateCcw } from 'lucide-react'
+import ResumeSessionDialog from '@/components/ResumeSessionDialog'
 import NetworkQuickAccess from '@/components/NetworkQuickAccess'
 import { cn } from '@/lib/utils'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
@@ -252,6 +253,33 @@ export default function Sidebar({
     const id = window.setInterval(() => setTimestampTick((t) => t + 1), 15_000)
     return () => window.clearInterval(id)
   }, [])
+
+  const [resumeDialogOpen, setResumeDialogOpen] = useState(false)
+
+  const handleResumeResolved = useCallback((opts: {
+    provider: CodingCliProviderName
+    sessionId: string
+    sessionType: string
+    cwd?: string
+    title?: string
+    firstUserMessage?: string
+  }) => {
+    // openSessionTab dedupes against already-open panes internally and focuses
+    // the existing pane instead of spawning a duplicate (sidebar convention).
+    void dispatch(openSessionTab({
+      sessionId: opts.sessionId,
+      provider: opts.provider,
+      sessionType: opts.sessionType,
+      cwd: opts.cwd,
+      title: opts.title,
+      firstUserMessage: opts.firstUserMessage,
+      hasTitle: Boolean(opts.title),
+    }))
+    // Sidebar convention — every session-open path in this file calls
+    // onNavigate('terminal') so the opened tab is actually VISIBLE even when the
+    // user was on the Tabs/Panes/etc. view.
+    onNavigate('terminal')
+  }, [dispatch, onNavigate])
 
   useEffect(() => {
     setFilter(requestedQueryValue)
@@ -898,6 +926,26 @@ export default function Sidebar({
         </div>
       </div>
 
+      {/* Pinned footer — spec: sibling AFTER the scroll wrapper, visible at every
+          scroll position and in fullWidth mode. Never move inside the list. */}
+      <div data-testid="sidebar-footer" className="flex-shrink-0 border-t border-border px-2 py-2">
+        <button
+          type="button"
+          data-testid="sidebar-resume-button"
+          aria-label="Resume a session by ID"
+          aria-haspopup="dialog"
+          onClick={() => setResumeDialogOpen(true)}
+          className="w-full flex items-center justify-center gap-1.5 rounded px-2 py-1.5 text-sm text-muted-foreground hover:text-foreground hover:bg-muted/50"
+        >
+          <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
+          Resume
+        </button>
+      </div>
+      <ResumeSessionDialog
+        open={resumeDialogOpen}
+        onClose={() => setResumeDialogOpen(false)}
+        onResume={handleResumeResolved}
+      />
     </div>
   )
 }
