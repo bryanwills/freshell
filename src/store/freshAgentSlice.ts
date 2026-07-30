@@ -171,6 +171,22 @@ function resetHydratedHistoryState(session: FreshAgentSessionState): void {
   session.streamingActive = false
 }
 
+function resetRuntimeEphemeralState(
+  session: FreshAgentSessionState,
+  status: FreshAgentSessionStatus,
+): void {
+  session.snapshot = undefined
+  session.latestTurnId = undefined
+  session.streamingText = ''
+  session.streamingActive = false
+  session.pendingPermissions = {}
+  session.pendingQuestions = {}
+  session.lastError = undefined
+  session.lastErrorCode = undefined
+  session.lost = false
+  writeSessionStatus(session, status)
+}
+
 function requestRestoreHydrationRestart(session: FreshAgentSessionState): void {
   session.restoreHydrationRequestId = (session.restoreHydrationRequestId ?? 0) + 1
 }
@@ -267,6 +283,7 @@ const freshAgentSlice = createSlice({
         }
         session.runtimeId = runtime.runtimeId
         session.runtimeGeneration = runtime.generation
+        resetRuntimeEphemeralState(session, 'starting')
       }
     },
 
@@ -286,6 +303,7 @@ const freshAgentSlice = createSlice({
         }
         session.runtimeId = undefined
         session.runtimeGeneration = undefined
+        resetRuntimeEphemeralState(session, 'starting')
       }
     },
 
@@ -320,16 +338,7 @@ const freshAgentSlice = createSlice({
         session.sessionId = replacement.sessionId
         session.sessionKey = nextKey
         session.threadId = replacement.sessionId
-        session.snapshot = undefined
-        session.latestTurnId = undefined
-        session.streamingText = ''
-        session.streamingActive = false
-        session.pendingPermissions = {}
-        session.pendingQuestions = {}
-        session.lastError = undefined
-        session.lastErrorCode = undefined
-        session.lost = false
-        writeSessionStatus(session, 'starting')
+        resetRuntimeEphemeralState(session, 'starting')
         if (nextKey !== oldKey) {
           state.sessions[nextKey] = session
           delete state.sessions[oldKey]
@@ -389,6 +398,7 @@ const freshAgentSlice = createSlice({
         return
       }
       const session = ensureSession(state, locator, 'connected')
+      let establishedRuntime = false
       if (action.payload.runtime) {
         if (
           session.runtimeGeneration !== undefined
@@ -399,10 +409,16 @@ const freshAgentSlice = createSlice({
         ) {
           return
         }
+        establishedRuntime = (
+          session.runtimeId !== action.payload.runtime.runtimeId
+          || session.runtimeGeneration !== action.payload.runtime.generation
+        )
         session.runtimeId = action.payload.runtime.runtimeId
         session.runtimeGeneration = action.payload.runtime.generation
       }
-      if (session.status === 'starting' || session.status === 'creating') {
+      if (establishedRuntime) {
+        resetRuntimeEphemeralState(session, 'connected')
+      } else if (session.status === 'starting' || session.status === 'creating') {
         writeSessionStatus(session, 'connected')
       } else {
         writeSessionStatus(session, session.status)

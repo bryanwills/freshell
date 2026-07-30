@@ -3193,6 +3193,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         terminalId: undefined,
         serverInstanceId: undefined,
         streamId: undefined,
+        runtimeId: undefined,
+        runtimeGeneration: undefined,
         createRequestId: pending.requestId,
         status: 'creating',
         restoreError: undefined,
@@ -4894,6 +4896,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
                 terminalId: undefined,
                 serverInstanceId: undefined,
                 streamId: undefined,
+                runtimeId: undefined,
+                runtimeGeneration: undefined,
                 createRequestId: newRequestId,
                 status: 'creating',
                 // Codex panes keep a breadcrumb instead of silently clearing
@@ -4956,6 +4960,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               terminalId: undefined,
               serverInstanceId: undefined,
               streamId: undefined,
+              runtimeId: undefined,
+              runtimeGeneration: undefined,
               createRequestId: newRequestId,
               status: 'creating',
             })

@@ -1326,6 +1326,11 @@ describe('FreshAgentView', () => {
 
   it('clears a restored Freshopencode placeholder when history reports FRESH_AGENT_LOST_SESSION', async () => {
     const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler) => {
+      onMessage = handler
+      return () => {}
+    })
     apiMock.getFreshAgentThreadSnapshot.mockRejectedValueOnce({
       status: 404,
       message: 'OpenCode fresh-agent placeholder freshopencode-restored is not restorable.',
@@ -1345,6 +1350,8 @@ describe('FreshAgentView', () => {
         sessionRef: { provider: 'opencode', sessionId: 'freshopencode-restored' },
         resumeSessionId: 'freshopencode-restored',
         status: 'connected',
+        runtimeId: 'freshopencode-runtime-old',
+        runtimeGeneration: 4,
       },
     }))
 
@@ -1360,6 +1367,8 @@ describe('FreshAgentView', () => {
       expect(content.sessionRef).toBeUndefined()
       expect(content.resumeSessionId).toBeUndefined()
       expect(content.status).toBe('idle')
+      expect(content.runtimeId).toBeUndefined()
+      expect(content.runtimeGeneration).toBeUndefined()
       expect(content.restoreError).toEqual({
         code: 'RESTORE_UNAVAILABLE',
         reason: 'durable_artifact_missing',
@@ -1367,6 +1376,24 @@ describe('FreshAgentView', () => {
     })
     expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
     expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1)
+    const replacementRequestId = getFreshAgentPaneContent(store).createRequestId
+    act(() => {
+      onMessage?.({
+        type: 'freshAgent.created',
+        requestId: replacementRequestId,
+        sessionId: 'ses_opencode_recreated',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        runtime: { runtimeId: 'freshopencode-runtime-new', generation: 5 },
+      })
+    })
+    await waitFor(() => {
+      expect(getFreshAgentPaneContent(store)).toMatchObject({
+        sessionId: 'ses_opencode_recreated',
+        runtimeId: 'freshopencode-runtime-new',
+        runtimeGeneration: 5,
+      })
+    })
   })
 
   it('attaches materialized FreshOpenCode panes with durable route metadata on mount and reconnect', async () => {
@@ -3715,6 +3742,11 @@ describe('FreshAgentView', () => {
 
   it('routes FreshOpenCode new-conversation kill through the pane cwd', async () => {
     const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler) => {
+      onMessage = handler
+      return () => {}
+    })
     store.dispatch(initLayout({
       tabId: 'tab-1',
       paneId: 'pane-1',
@@ -3726,6 +3758,8 @@ describe('FreshAgentView', () => {
         sessionId: 'ses_new_route',
         initialCwd: '/repo/route-aware',
         status: 'idle',
+        runtimeId: 'runtime-before-new',
+        runtimeGeneration: 10,
       },
     }))
 
@@ -3749,6 +3783,28 @@ describe('FreshAgentView', () => {
       sessionType: 'freshopencode',
       provider: 'opencode',
       cwd: '/repo/route-aware',
+    })
+    await waitFor(() => {
+      expect(getFreshAgentPaneContent(store).runtimeId).toBeUndefined()
+      expect(getFreshAgentPaneContent(store).runtimeGeneration).toBeUndefined()
+    })
+    const replacementRequestId = getFreshAgentPaneContent(store).createRequestId
+    act(() => {
+      onMessage?.({
+        type: 'freshAgent.created',
+        requestId: replacementRequestId,
+        sessionId: 'ses_after_new',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        runtime: { runtimeId: 'runtime-after-new', generation: 11 },
+      })
+    })
+    await waitFor(() => {
+      expect(getFreshAgentPaneContent(store)).toMatchObject({
+        sessionId: 'ses_after_new',
+        runtimeId: 'runtime-after-new',
+        runtimeGeneration: 11,
+      })
     })
   })
 
@@ -5572,6 +5628,11 @@ describe('FreshAgentView', () => {
 
   it('surfaces a missing Freshcodex rollout as a restore error instead of replacing the thread', async () => {
     const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler) => {
+      onMessage = handler
+      return () => {}
+    })
     apiMock.getFreshAgentThreadSnapshot.mockRejectedValueOnce(new Error('no rollout found for thread id codex-thread-missing'))
     store.dispatch(initLayout({
       tabId: 'tab-1',
@@ -5585,6 +5646,8 @@ describe('FreshAgentView', () => {
         sessionId: 'codex-thread-missing',
         resumeSessionId: 'codex-thread-missing',
         sessionRef: { provider: 'codex', sessionId: 'codex-thread-missing' },
+        runtimeId: 'freshcodex-runtime-old',
+        runtimeGeneration: 6,
       },
     }))
 
@@ -5602,7 +5665,27 @@ describe('FreshAgentView', () => {
         expect(leaf.content.resumeSessionId).toBe('codex-thread-missing')
         expect(leaf.content.sessionRef).toBeUndefined()
         expect(leaf.content.status).toBe('idle')
+        expect(leaf.content.runtimeId).toBeUndefined()
+        expect(leaf.content.runtimeGeneration).toBeUndefined()
       }
+    })
+    const replacementRequestId = getFreshAgentPaneContent(store).createRequestId
+    act(() => {
+      onMessage?.({
+        type: 'freshAgent.created',
+        requestId: replacementRequestId,
+        sessionId: 'codex-thread-recreated',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        runtime: { runtimeId: 'freshcodex-runtime-new', generation: 7 },
+      })
+    })
+    await waitFor(() => {
+      expect(getFreshAgentPaneContent(store)).toMatchObject({
+        sessionId: 'codex-thread-recreated',
+        runtimeId: 'freshcodex-runtime-new',
+        runtimeGeneration: 7,
+      })
     })
     expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({
       type: 'freshAgent.create',

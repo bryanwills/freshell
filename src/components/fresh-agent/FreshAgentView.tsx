@@ -1061,6 +1061,8 @@ export function FreshAgentView({
         ...current,
         createRequestId: nanoid(),
         sessionId: undefined,
+        runtimeId: undefined,
+        runtimeGeneration: undefined,
         sessionRef: undefined,
         resumeSessionId: undefined,
         restoreError: undefined,
@@ -1927,6 +1929,8 @@ export function FreshAgentView({
           content: {
             ...fresh,
             sessionId: undefined,
+            runtimeId: undefined,
+            runtimeGeneration: undefined,
             sessionRef: undefined,
             createRequestId: nanoid(),
             status: 'idle',
@@ -1946,6 +1950,8 @@ export function FreshAgentView({
           content: {
             ...fresh,
             sessionId: undefined,
+            runtimeId: undefined,
+            runtimeGeneration: undefined,
             sessionRef: undefined,
             resumeSessionId: undefined,
             createRequestId: nanoid(),

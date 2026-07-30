@@ -3,7 +3,11 @@ import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import reducer, {
   addPermissionRequest,
   addQuestionRequest,
+  adoptReconcileRuntime,
   applyAgentRestartReplaced,
+  clearReconcileRuntime,
+  registerPendingCreate,
+  sessionCreated,
   sessionSnapshotReceived,
   setSessionStatus,
   setStreaming,
@@ -46,9 +50,21 @@ function activeState() {
   return state
 }
 
+function stateWithStaleRuntimeEphemera() {
+  const state = structuredClone(activeState())
+  state.sessions[key].snapshot = {
+    threadId: 's1',
+    sessionType: 'freshcodex',
+    provider: 'codex',
+  } as never
+  state.sessions[key].lastError = 'old runtime failed'
+  state.sessions[key].lastErrorCode = 'OLD_RUNTIME_ERROR'
+  return state
+}
+
 describe('freshAgentSlice agent restart replacement', () => {
   it('clears stale snapshot, approval, question, stream, and activity state before accepting the replacement generation', () => {
-    const state = activeState()
+    const state = stateWithStaleRuntimeEphemera()
     const next = reducer(state, applyAgentRestartReplaced({
       type: 'agent.restart.replaced',
       requestId: 'restart-1',
@@ -75,6 +91,85 @@ describe('freshAgentSlice agent restart replacement', () => {
     })
     expect(next.sessions[key].snapshot).toBeUndefined()
     expect(next.sessions[key].latestTurnId).toBeUndefined()
+    expect(next.sessions[key].lastError).toBeUndefined()
+    expect(next.sessions[key].lastErrorCode).toBeUndefined()
+  })
+
+  it('clears stale runtime ephemera when reconcile adopts a replacement runtime', () => {
+    const next = reducer(stateWithStaleRuntimeEphemera(), adoptReconcileRuntime({
+      provider: 'codex',
+      sessionIds: ['s1'],
+      runtime: { runtimeId: 'fresh-new', generation: 8 },
+    }))
+
+    expect(next.sessions[key]).toMatchObject({
+      runtimeId: 'fresh-new',
+      runtimeGeneration: 8,
+      status: 'starting',
+      streamingText: '',
+      streamingActive: false,
+      pendingPermissions: {},
+      pendingQuestions: {},
+    })
+    expect(next.sessions[key].snapshot).toBeUndefined()
+    expect(next.sessions[key].latestTurnId).toBeUndefined()
+    expect(next.sessions[key].lastError).toBeUndefined()
+    expect(next.sessions[key].lastErrorCode).toBeUndefined()
+  })
+
+  it('clears stale runtime ephemera when reconcile clears a runtime for recreation', () => {
+    const next = reducer(stateWithStaleRuntimeEphemera(), clearReconcileRuntime({
+      provider: 'codex',
+      sessionIds: ['s1'],
+    }))
+
+    expect(next.sessions[key]).toMatchObject({
+      status: 'starting',
+      streamingText: '',
+      streamingActive: false,
+      pendingPermissions: {},
+      pendingQuestions: {},
+    })
+    expect(next.sessions[key].runtimeId).toBeUndefined()
+    expect(next.sessions[key].runtimeGeneration).toBeUndefined()
+    expect(next.sessions[key].snapshot).toBeUndefined()
+    expect(next.sessions[key].latestTurnId).toBeUndefined()
+    expect(next.sessions[key].lastError).toBeUndefined()
+    expect(next.sessions[key].lastErrorCode).toBeUndefined()
+  })
+
+  it('clears stale runtime ephemera when a correlated create establishes the new runtime', () => {
+    let state = stateWithStaleRuntimeEphemera()
+    delete state.sessions[key].runtimeId
+    delete state.sessions[key].runtimeGeneration
+    state = reducer(state, registerPendingCreate({
+      requestId: 'create-new',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      expectsHistoryHydration: false,
+    }))
+
+    const next = reducer(state, sessionCreated({
+      requestId: 'create-new',
+      sessionId: 's1',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      runtime: { runtimeId: 'fresh-new', generation: 8 },
+    }))
+
+    expect(next.sessions[key]).toMatchObject({
+      runtimeId: 'fresh-new',
+      runtimeGeneration: 8,
+      status: 'connected',
+      streamingText: '',
+      streamingActive: false,
+      pendingPermissions: {},
+      pendingQuestions: {},
+    })
+    expect(next.sessions[key].snapshot).toBeUndefined()
+    expect(next.sessions[key].latestTurnId).toBeUndefined()
+    expect(next.sessions[key].lastError).toBeUndefined()
+    expect(next.sessions[key].lastErrorCode).toBeUndefined()
   })
 
   it('rejects old-runtime transport events after replacement but accepts the replacement generation', () => {
