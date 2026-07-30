@@ -1474,6 +1474,15 @@ export function FreshAgentView({
     const unsubscribe = ws.onMessage((message) => {
       const currentRuntimeGeneration = paneContentRef.current.runtimeGeneration
       const messageRuntime = 'runtime' in message ? message.runtime : undefined
+      const isFreshAgentFrame = message.type.startsWith('freshAgent.')
+      // Once a pane has accepted a server-owned runtime fence, every
+      // fresh-agent lifecycle/event frame must prove which runtime emitted it.
+      // Legacy untagged frames are only safe for unfenced panes; otherwise a
+      // delayed pre-restart response can repopulate state the replacement
+      // deliberately cleared.
+      if (currentRuntimeGeneration !== undefined && isFreshAgentFrame && !messageRuntime) {
+        return
+      }
       if (
         currentRuntimeGeneration !== undefined
         && messageRuntime
@@ -1751,11 +1760,15 @@ export function FreshAgentView({
     const provider = paneContent.provider
     const requestSessionType = paneContent.sessionType
     const requestCreateRequestId = paneContent.createRequestId
+    const requestRuntimeId = paneContent.runtimeId
+    const requestRuntimeGeneration = paneContent.runtimeGeneration
     const isStaleSnapshotRequest = () => (
       paneContentRef.current.createRequestId !== requestCreateRequestId
       || paneContentRef.current.provider !== provider
       || paneContentRef.current.sessionType !== requestSessionType
       || snapshotThreadIdRef.current !== sessionId
+      || paneContentRef.current.runtimeId !== requestRuntimeId
+      || paneContentRef.current.runtimeGeneration !== requestRuntimeGeneration
     )
     // A1: resolve the cwd ONCE (route cwd falls through initialCwd -> session
     // cwd) and use the SAME value for both the scheduler key and the request,
@@ -1989,6 +2002,8 @@ export function FreshAgentView({
     dispatch,
     paneContent.provider,
     paneContent.createRequestId,
+    paneContent.runtimeGeneration,
+    paneContent.runtimeId,
     paneContent.sessionId,
     paneContent.sessionType,
     paneId,

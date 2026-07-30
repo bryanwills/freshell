@@ -6168,4 +6168,99 @@ describe('snapshot scheduler integration (zrrj)', () => {
     const options = apiMock.getFreshAgentThreadSnapshot.mock.calls[0][3]
     expect(options?.signal).toBeUndefined()
   })
+
+  it('does not apply a pre-replacement snapshot after the pane runtime fence changes', async () => {
+    const store = createStore()
+    const oldSnapshot = createDeferred<ReturnType<typeof freshopencodeSnapshot>>()
+    const newSnapshot = createDeferred<ReturnType<typeof freshopencodeSnapshot>>()
+    apiMock.getFreshAgentThreadSnapshot
+      .mockReturnValueOnce(oldSnapshot.promise)
+      .mockReturnValueOnce(newSnapshot.promise)
+
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        ...schedulerPaneContent('req-runtime-snapshot'),
+        runtimeId: 'runtime-before-restart',
+        runtimeGeneration: 4,
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+
+    act(() => {
+      store.dispatch(updatePaneContent({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          ...getFreshAgentPaneContent(store),
+          runtimeId: 'runtime-after-restart',
+          runtimeGeneration: 5,
+        },
+      }))
+    })
+    oldSnapshot.resolve(freshopencodeSnapshot('pre-restart transcript', 1))
+
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
+    expect(screen.queryByText('pre-restart transcript')).not.toBeInTheDocument()
+
+    newSnapshot.resolve(freshopencodeSnapshot('post-restart transcript', 2))
+    await screen.findByText('post-restart transcript')
+  })
+
+  it('rejects untagged and mismatched fresh-agent frames after the pane has a runtime fence', async () => {
+    const store = createStore()
+    let wsHandler: ((message: any) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler) => {
+      wsHandler = handler
+      return () => {}
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-runtime-frame',
+        sessionId: 'ses_fenced',
+        status: 'connected',
+        runtimeId: 'runtime-current',
+        runtimeGeneration: 8,
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+    apiMock.getFreshAgentThreadSnapshot.mockClear()
+
+    act(() => {
+      wsHandler?.({
+        type: 'freshAgent.event',
+        sessionId: 'ses_fenced',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        event: { type: 'freshAgent.session.snapshot' },
+      })
+      wsHandler?.({
+        type: 'freshAgent.event',
+        sessionId: 'ses_fenced',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        event: { type: 'freshAgent.session.snapshot' },
+        runtime: { runtimeId: 'runtime-old', generation: 7 },
+      })
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 350))
+    expect(apiMock.getFreshAgentThreadSnapshot).not.toHaveBeenCalled()
+  })
 })
