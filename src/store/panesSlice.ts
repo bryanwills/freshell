@@ -1964,6 +1964,7 @@ export const panesSlice = createSlice({
         terminalId: string
         serverInstanceId?: string
         sessionRef?: SessionLocator
+        runtime?: { runtimeId: string, generation: number }
         corrected?: boolean
         duplicate?: boolean
       }>
@@ -1977,6 +1978,10 @@ export const panesSlice = createSlice({
       content.serverInstanceId = serverInstanceId
       content.streamId = undefined
       content.status = 'running'
+      if (action.payload.runtime) {
+        content.runtimeId = action.payload.runtime.runtimeId
+        content.runtimeGeneration = action.payload.runtime.generation
+      }
       content.restoreError = undefined
       const sessionRef = sanitizeSessionRef(action.payload.sessionRef)
       if (sessionRef) {
@@ -2021,6 +2026,8 @@ export const panesSlice = createSlice({
       content.terminalId = undefined
       content.serverInstanceId = undefined
       content.streamId = undefined
+      content.runtimeId = undefined
+      content.runtimeGeneration = undefined
       content.status = 'creating'
       content.restoreError = undefined
 
@@ -2074,6 +2081,7 @@ export const panesSlice = createSlice({
         paneId: string
         sessionRef?: SessionLocator
         serverInstanceId?: string
+        runtime?: { runtimeId: string, generation: number }
         corrected?: boolean
         duplicate?: boolean
       }>
@@ -2087,6 +2095,10 @@ export const panesSlice = createSlice({
       content.resumeSessionId = sessionRef.sessionId
       content.status = 'connected'
       content.serverInstanceId = serverInstanceId
+      if (action.payload.runtime) {
+        content.runtimeId = action.payload.runtime.runtimeId
+        content.runtimeGeneration = action.payload.runtime.generation
+      }
       content.restoreError = undefined
       content.createError = undefined
       content.pendingReconcile = undefined
@@ -2127,6 +2139,8 @@ export const panesSlice = createSlice({
       }
       content.sessionId = undefined
       content.serverInstanceId = undefined
+      content.runtimeId = undefined
+      content.runtimeGeneration = undefined
       content.status = 'creating'
       content.restoreError = undefined
       content.createError = undefined

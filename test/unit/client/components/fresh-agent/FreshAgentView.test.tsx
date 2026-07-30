@@ -1441,6 +1441,8 @@ describe('FreshAgentView', () => {
         createRequestId: 'req-2',
         sessionId: 'thread-1',
         status: 'idle',
+        runtimeId: 'runtime-current',
+        runtimeGeneration: 8,
         initialCwd: '/repo',
         model: 'gpt-5.3-codex-spark',
       },

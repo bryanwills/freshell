@@ -265,6 +265,21 @@ describe('applyFreshAgentReconcileAttach', () => {
     }))
     expect(next).toEqual(state)
   })
+
+  it('adopts attach runtime and clears it before a respawn create', () => {
+    let state = stateWithFreshAgentPane({ runtimeId: 'fresh-old', runtimeGeneration: 7 })
+    state = panesReducer(state, applyFreshAgentReconcileAttach({
+      tabId, paneId,
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+      runtime: { runtimeId: 'fresh-new', generation: 8 },
+    }))
+    expect(leafContent(state, tabId)).toMatchObject({ runtimeId: 'fresh-new', runtimeGeneration: 8 })
+    state = panesReducer(state, resetFreshAgentPaneForReconcileCreate({
+      tabId, paneId, intent: 'respawn', sessionRef: { provider: 'claude', sessionId: DURABLE },
+    }))
+    expect(leafContent(state, tabId).runtimeId).toBeUndefined()
+    expect(leafContent(state, tabId).runtimeGeneration).toBeUndefined()
+  })
 })
 
 describe('resetFreshAgentPaneForReconcileCreate', () => {

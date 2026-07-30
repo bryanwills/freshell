@@ -280,6 +280,7 @@ function foldFreshAgentVerdict(
         paneId,
         sessionRef: verdict.sessionRef,
         serverInstanceId: result.serverInstanceId,
+        runtime: verdict.runtime,
         corrected: verdict.corrected,
         duplicate: verdict.duplicate ? true : undefined,
       }))
@@ -431,6 +432,7 @@ export function foldVerdicts(
           terminalId: verdict.terminalId,
           serverInstanceId: result.serverInstanceId,
           sessionRef: verdict.sessionRef,
+          runtime: verdict.runtime,
           corrected: verdict.corrected,
           duplicate: verdict.duplicate ? true : undefined,
         }))

@@ -1474,17 +1474,20 @@ export function FreshAgentView({
     const unsubscribe = ws.onMessage((message) => {
       const currentRuntimeGeneration = paneContentRef.current.runtimeGeneration
       const messageRuntime = 'runtime' in message ? message.runtime : undefined
-      const isFreshAgentFrame = message.type.startsWith('freshAgent.')
+      const isRuntimeBearingFreshAgentFrame = message.type === 'freshAgent.created'
+        || message.type === 'freshAgent.session.materialized'
+        || message.type === 'freshAgent.event'
       // Once a pane has accepted a server-owned runtime fence, every
       // fresh-agent lifecycle/event frame must prove which runtime emitted it.
       // Legacy untagged frames are only safe for unfenced panes; otherwise a
       // delayed pre-restart response can repopulate state the replacement
       // deliberately cleared.
-      if (currentRuntimeGeneration !== undefined && isFreshAgentFrame && !messageRuntime) {
+      if (currentRuntimeGeneration !== undefined && isRuntimeBearingFreshAgentFrame && !messageRuntime) {
         return
       }
       if (
         currentRuntimeGeneration !== undefined
+        && isRuntimeBearingFreshAgentFrame
         && messageRuntime
         && (
           messageRuntime.runtimeId !== paneContentRef.current.runtimeId

@@ -114,6 +114,20 @@ describe('reconcile reducers', () => {
       .toBe('A duplicate terminal for this session was detected and ignored.')
   })
 
+  it('adopts the authoritative runtime on attach and clears the old fence before a reconcile create', () => {
+    let state = stateWithTerminalPane({ runtimeId: 'terminal-old', runtimeGeneration: 7 })
+    state = panesReducer(state, applyReconcileAttach({
+      tabId: 'tab1', paneId: 'p1', terminalId: 'terminal-new',
+      runtime: { runtimeId: 'terminal-new', generation: 8 },
+    } as any))
+    expect(terminalContent(state, 'tab1', 'p1')).toMatchObject({
+      runtimeId: 'terminal-new', runtimeGeneration: 8,
+    })
+    state = panesReducer(state, resetPaneForReconcileCreate({ tabId: 'tab1', paneId: 'p1', intent: 'fresh' }))
+    expect(terminalContent(state, 'tab1', 'p1').runtimeId).toBeUndefined()
+    expect(terminalContent(state, 'tab1', 'p1').runtimeGeneration).toBeUndefined()
+  })
+
   it('resetPaneForReconcileCreate(respawn) clears handles, keeps createRequestId, sets server-named sessionRef', () => {
     const state = stateWithTerminalPane({ createRequestId: 'cr-keep', terminalId: 'dead', streamId: 'st', sessionRef: { provider: 'claude', sessionId: 'client-guess' } })
     const next = panesReducer(state, resetPaneForReconcileCreate({ tabId: 'tab1', paneId: 'p1', intent: 'respawn', sessionRef: { provider: 'claude', sessionId: 'server-truth' } }))
