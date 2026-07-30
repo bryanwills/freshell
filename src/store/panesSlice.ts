@@ -605,6 +605,8 @@ function clearTerminalContentForRecreate(
   node.content.terminalId = undefined
   node.content.serverInstanceId = undefined
   node.content.streamId = undefined
+  node.content.runtimeId = undefined
+  node.content.runtimeGeneration = undefined
   node.content.status = 'creating'
   node.content.createRequestId = nextRequestId
   if (!sanitizeSessionRef(node.content.sessionRef)) {
@@ -656,6 +658,25 @@ function findReconcilePaneContent(
   const content = leaf?.content
   if (content?.kind === 'terminal' || content?.kind === 'fresh-agent') return content
   return undefined
+}
+
+function canAdoptReconcileRuntime(
+  content: TerminalPaneContent | FreshAgentPaneContent,
+  runtime: { runtimeId: string; generation: number } | undefined,
+  nextServerInstanceId: string | undefined,
+): boolean {
+  const currentGeneration = content.runtimeGeneration
+  if (currentGeneration === undefined) return true
+  if (!runtime) return false
+  if (runtime.runtimeId === content.runtimeId) return runtime.generation >= currentGeneration
+  if (
+    content.serverInstanceId
+    && nextServerInstanceId
+    && content.serverInstanceId !== nextServerInstanceId
+  ) {
+    return true
+  }
+  return runtime.generation > currentGeneration
 }
 
 function freshAgentPaneMatchesMaterializedSession(
@@ -924,7 +945,14 @@ function mergeTerminalState(
  */
 function stripStaleIds(content: PaneContent): PaneContentInput {
   if (content.kind === 'terminal') {
-    const { terminalId: _terminalId, createRequestId: _createRequestId, status: _status, ...rest } = content
+    const {
+      terminalId: _terminalId,
+      runtimeId: _runtimeId,
+      runtimeGeneration: _runtimeGeneration,
+      createRequestId: _createRequestId,
+      status: _status,
+      ...rest
+    } = content
     return rest
   }
   if (content.kind === 'browser') {
@@ -937,6 +965,8 @@ function stripStaleIds(content: PaneContent): PaneContentInput {
       createRequestId: _createRequestId,
       status: _status,
       serverInstanceId: _serverInstanceId,
+      runtimeId: _runtimeId,
+      runtimeGeneration: _runtimeGeneration,
       createError: _createError,
       reconcileEpoch: _reconcileEpoch,
       pendingReconcile: _pendingReconcile,
@@ -1619,6 +1649,8 @@ export const panesSlice = createSlice({
             content: normalizePaneContent({
               ...node.content,
               sessionId: undefined,
+              runtimeId: undefined,
+              runtimeGeneration: undefined,
               createRequestId: nanoid(),
               status: 'creating',
               createError: undefined,
@@ -1973,6 +2005,7 @@ export const panesSlice = createSlice({
       if (!terminalId) return
       const content = findReconcileTerminalContent(state, tabId, paneId)
       if (!content) return
+      if (!canAdoptReconcileRuntime(content, action.payload.runtime, serverInstanceId)) return
 
       content.terminalId = terminalId
       content.serverInstanceId = serverInstanceId
@@ -2090,6 +2123,7 @@ export const panesSlice = createSlice({
       const content = findReconcilePaneContent(state, tabId, paneId)
       if (!content || content.kind !== 'fresh-agent') return
       if (!sessionRef?.sessionId || sessionRef.provider !== content.provider) return // malformed verdict — no-op
+      if (!canAdoptReconcileRuntime(content, action.payload.runtime, serverInstanceId)) return
       content.sessionId = sessionRef.sessionId
       content.sessionRef = { provider: sessionRef.provider, sessionId: sessionRef.sessionId }
       content.resumeSessionId = sessionRef.sessionId
@@ -2258,6 +2292,8 @@ export const panesSlice = createSlice({
           node.content.terminalId = undefined
           node.content.serverInstanceId = undefined
           node.content.streamId = undefined
+          node.content.runtimeId = undefined
+          node.content.runtimeGeneration = undefined
           node.content.status = 'creating'
           node.content.createRequestId = createRequestId
           node.content.sessionRef = expectedSessionRef

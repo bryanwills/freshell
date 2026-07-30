@@ -523,6 +523,8 @@ describe('panesSlice', () => {
           provider: 'claude',
           createRequestId: 'req-1',
           status: 'create-failed' as any,
+          runtimeId: 'runtime-failed',
+          runtimeGeneration: 4,
           createError: {
             code: 'RESTORE_INTERNAL',
             message: 'boom',
@@ -540,6 +542,8 @@ describe('panesSlice', () => {
       if (layout.content.kind === 'fresh-agent') {
         expect((layout.content as any).createError).toBeUndefined()
         expect(layout.content.createRequestId).not.toBe('req-1')
+        expect(layout.content.runtimeId).toBeUndefined()
+        expect(layout.content.runtimeGeneration).toBeUndefined()
       }
     })
   })
@@ -2804,6 +2808,8 @@ describe('panesSlice', () => {
             terminalId: 'term-dead',
             serverInstanceId: 'srv-old',
             streamId: 'stream-old',
+            runtimeId: 'runtime-dead',
+            runtimeGeneration: 4,
             sessionRef: { provider: 'codex', sessionId: 'codex-thread-1' },
           },
         } as any,
@@ -2829,6 +2835,8 @@ describe('panesSlice', () => {
       expect((dead.content as TerminalPaneContent).createRequestId).not.toBe('req-dead')
       expect((dead.content as TerminalPaneContent).serverInstanceId).toBeUndefined()
       expect((dead.content as TerminalPaneContent).streamId).toBeUndefined()
+      expect((dead.content as TerminalPaneContent).runtimeId).toBeUndefined()
+      expect((dead.content as TerminalPaneContent).runtimeGeneration).toBeUndefined()
       expect((dead.content as TerminalPaneContent).sessionRef).toEqual({
         provider: 'codex',
         sessionId: 'codex-thread-1',
@@ -2936,6 +2944,8 @@ describe('panesSlice', () => {
         terminalId: 'term-old',
         serverInstanceId: 'srv-1',
         streamId: 'stream-1',
+        runtimeId: 'runtime-old',
+        runtimeGeneration: 7,
         sessionRef: { provider: 'codex', sessionId: 'thread-1' },
         codexDurability: {
           schemaVersion: 1,
@@ -2957,6 +2967,8 @@ describe('panesSlice', () => {
       expect(content.terminalId).toBeUndefined()
       expect(content.serverInstanceId).toBeUndefined()
       expect(content.streamId).toBeUndefined()
+      expect(content.runtimeId).toBeUndefined()
+      expect(content.runtimeGeneration).toBeUndefined()
       expect(content.createRequestId).toBe('req-new')
       expect(content.status).toBe('creating')
       expect(content.sessionRef).toEqual({ provider: 'codex', sessionId: 'thread-1' })
@@ -4152,6 +4164,8 @@ describe('panesSlice', () => {
           createRequestId: 'stale-cr',
           status: 'running',
           mode: 'shell',
+          runtimeId: 'stale-runtime',
+          runtimeGeneration: 5,
         },
       }
       const paneTitles = { 'old-pane': 'My Shell' }
@@ -4167,6 +4181,8 @@ describe('panesSlice', () => {
       if (restoredLayout.type === 'leaf') {
         // Stale terminalId should be cleared
         expect((restoredLayout.content as TerminalPaneContent).terminalId).toBeUndefined()
+        expect((restoredLayout.content as TerminalPaneContent).runtimeId).toBeUndefined()
+        expect((restoredLayout.content as TerminalPaneContent).runtimeGeneration).toBeUndefined()
         // Fresh createRequestId should be generated
         expect((restoredLayout.content as TerminalPaneContent).createRequestId).not.toBe('stale-cr')
         // Status should be reset to creating
@@ -4257,6 +4273,8 @@ describe('panesSlice', () => {
           showThinking: false,
           showTools: true,
           showTimecodes: true,
+          runtimeId: 'stale-fresh-runtime',
+          runtimeGeneration: 6,
         },
       } as PaneNode
 
@@ -4275,6 +4293,8 @@ describe('panesSlice', () => {
       expect(restoredLayout.content.status).toBe('creating')
       expect(restoredLayout.content.serverInstanceId).toBeUndefined()
       expect(restoredLayout.content.createError).toBeUndefined()
+      expect(restoredLayout.content.runtimeId).toBeUndefined()
+      expect(restoredLayout.content.runtimeGeneration).toBeUndefined()
       expect(restoredLayout.content).toMatchObject({
         kind: 'fresh-agent',
         sessionType: 'freshclaude',

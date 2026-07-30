@@ -233,6 +233,62 @@ const freshAgentSlice = createSlice({
   name: 'freshAgent',
   initialState,
   reducers: {
+    adoptReconcileRuntime(state, action: PayloadAction<{
+      provider: string
+      sessionIds: string[]
+      runtime: RuntimeDescriptor
+      allowServerTransition?: boolean
+    }>) {
+      const { provider, runtime, allowServerTransition } = action.payload
+      if (
+        (state.retiredRuntimeGenerations?.[runtime.runtimeId] ?? -1)
+        >= runtime.generation
+      ) {
+        return
+      }
+      const sessionIds = new Set(action.payload.sessionIds.filter(Boolean))
+      for (const session of Object.values(state.sessions)) {
+        if (session.provider !== provider || !sessionIds.has(session.sessionId)) continue
+        const currentGeneration = session.runtimeGeneration
+        if (currentGeneration !== undefined) {
+          const sameRuntime = session.runtimeId === runtime.runtimeId
+          if (sameRuntime ? runtime.generation < currentGeneration : (
+            !allowServerTransition && runtime.generation <= currentGeneration
+          )) {
+            continue
+          }
+          if (session.runtimeId) {
+            state.retiredRuntimeGenerations ??= {}
+            state.retiredRuntimeGenerations[session.runtimeId] = Math.max(
+              state.retiredRuntimeGenerations[session.runtimeId] ?? -1,
+              currentGeneration,
+            )
+          }
+        }
+        session.runtimeId = runtime.runtimeId
+        session.runtimeGeneration = runtime.generation
+      }
+    },
+
+    clearReconcileRuntime(state, action: PayloadAction<{
+      provider: string
+      sessionIds: string[]
+    }>) {
+      const sessionIds = new Set(action.payload.sessionIds.filter(Boolean))
+      state.retiredRuntimeGenerations ??= {}
+      for (const session of Object.values(state.sessions)) {
+        if (session.provider !== action.payload.provider || !sessionIds.has(session.sessionId)) continue
+        if (session.runtimeId && session.runtimeGeneration !== undefined) {
+          state.retiredRuntimeGenerations[session.runtimeId] = Math.max(
+            state.retiredRuntimeGenerations[session.runtimeId] ?? -1,
+            session.runtimeGeneration,
+          )
+        }
+        session.runtimeId = undefined
+        session.runtimeGeneration = undefined
+      }
+    },
+
     applyAgentRestartReplaced(state, action: PayloadAction<AgentRestartReplacedMessage>) {
       const replacement = action.payload
       if (replacement.kind !== 'fresh-agent') return
@@ -770,6 +826,7 @@ const freshAgentSlice = createSlice({
 })
 
 export const {
+  adoptReconcileRuntime,
   applyAgentRestartReplaced,
   addAssistantMessage,
   addPermissionRequest,
@@ -779,6 +836,7 @@ export const {
   clearPendingCreate,
   clearPendingCreateFailure,
   clearPendingCreateFailureForSession,
+  clearReconcileRuntime,
   clearSessionLost,
   clearStreaming,
   createFailed,

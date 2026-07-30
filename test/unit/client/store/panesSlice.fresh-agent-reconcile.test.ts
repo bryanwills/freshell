@@ -280,6 +280,26 @@ describe('applyFreshAgentReconcileAttach', () => {
     expect(leafContent(state, tabId).runtimeId).toBeUndefined()
     expect(leafContent(state, tabId).runtimeGeneration).toBeUndefined()
   })
+
+  it('does not let a stale same-server attach downgrade a replacement runtime', () => {
+    const state = stateWithFreshAgentPane({
+      sessionId: DURABLE, sessionRef: { provider: 'claude', sessionId: DURABLE },
+      runtimeId: 'fresh-new', runtimeGeneration: 8, serverInstanceId: 'server-current',
+    })
+    const stale = panesReducer(state, applyFreshAgentReconcileAttach({
+      tabId, paneId, sessionRef: { provider: 'claude', sessionId: DURABLE },
+      serverInstanceId: 'server-current', runtime: { runtimeId: 'fresh-old', generation: 7 },
+    }))
+    expect(leafContent(stale, tabId)).toMatchObject({ runtimeId: 'fresh-new', runtimeGeneration: 8 })
+
+    const currentServer = panesReducer(stale, applyFreshAgentReconcileAttach({
+      tabId, paneId, sessionRef: { provider: 'claude', sessionId: DURABLE },
+      serverInstanceId: 'server-next', runtime: { runtimeId: 'fresh-server-next', generation: 0 },
+    }))
+    expect(leafContent(currentServer, tabId)).toMatchObject({
+      runtimeId: 'fresh-server-next', runtimeGeneration: 0, serverInstanceId: 'server-next',
+    })
+  })
 })
 
 describe('resetFreshAgentPaneForReconcileCreate', () => {

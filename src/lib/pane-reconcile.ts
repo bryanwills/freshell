@@ -37,6 +37,10 @@ import {
   setReconcileWarming,
 } from '@/store/panesSlice'
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
+import {
+  adoptReconcileRuntime,
+  clearReconcileRuntime,
+} from '@/store/freshAgentSlice'
 
 /** Protocol cap on request size (mirrors PaneReconcileRequestSchema). */
 const MAX_RECONCILE_PANES = 200
@@ -149,6 +153,7 @@ function toFreshAgentReconcilePane(
     kind: 'fresh-agent',
     mode: content.provider,
     createRequestId: content.createRequestId,
+    ...(content.serverInstanceId ? { serverInstanceId: content.serverInstanceId } : {}),
     ...(content.sessionRef ? { sessionRef: content.sessionRef } : {}),
     ...(content.resumeSessionId ? { resumeSessionId: content.resumeSessionId } : {}),
     ...(content.status ? { status: content.status } : {}),
@@ -269,6 +274,11 @@ function foldFreshAgentVerdict(
   outcome: FoldOutcome,
 ): boolean {
   const { tabId, paneId } = paneRefFromOwnKey(pane.paneKey)
+  const provider = pane.mode
+  const paneSessionIds = [
+    pane.sessionRef?.sessionId,
+    pane.resumeSessionId,
+  ].filter((sessionId): sessionId is string => Boolean(sessionId))
 
   switch (verdict.verdict) {
     case 'attach': {
@@ -284,10 +294,25 @@ function foldFreshAgentVerdict(
         corrected: verdict.corrected,
         duplicate: verdict.duplicate ? true : undefined,
       }))
+      if (verdict.runtime) {
+        dispatch(adoptReconcileRuntime({
+          provider,
+          sessionIds: [...paneSessionIds, verdict.sessionRef.sessionId],
+          runtime: verdict.runtime,
+          allowServerTransition: Boolean(
+            pane.serverInstanceId
+            && pane.serverInstanceId !== result.serverInstanceId
+          ),
+        }))
+      }
       outcome.attached++
       return true
     }
     case 'respawn': {
+      dispatch(clearReconcileRuntime({
+        provider,
+        sessionIds: [...paneSessionIds, ...(verdict.sessionRef?.sessionId ? [verdict.sessionRef.sessionId] : [])],
+      }))
       dispatch(resetFreshAgentPaneForReconcileCreate({
         tabId,
         paneId,
@@ -299,6 +324,10 @@ function foldFreshAgentVerdict(
       return true
     }
     case 'fresh': {
+      dispatch(clearReconcileRuntime({
+        provider,
+        sessionIds: paneSessionIds,
+      }))
       dispatch(resetFreshAgentPaneForReconcileCreate({
         tabId,
         paneId,
