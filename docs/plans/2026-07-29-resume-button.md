@@ -22,6 +22,9 @@
 - Spec: disambiguation list capped at **20**, most-recent first.
 - Spec: index warming is NOT "not found" — distinct loading/retry state.
 - Spec-sanctioned accepted limitation: **prefix matching only matches indexed sessions**; exact-id fallbacks cover index misses. Document this in code comments where implemented.
+- Deployment reality (AGENTS.md "Rust Server (Self-Hosted Production)"): the canonical self-hosted production deployment is the **Rust server** on port 3002, which serves the same `dist/client` from disk but has **no** `/api/sessions/resolve` route. Per spec, this feature's API is implemented on the Node server only (the Rust `IndexExistenceProbe` is NOT this feature's API) — so the client MUST degrade gracefully when the endpoint is missing: a 404 from resolve shows an explicit "this server build does not support resume-by-id" error (never a generic failure, never a broken-looking button). Rust parity is a recorded follow-up (Task 1 verification log), not a silent scope cut.
+- Id-family case rules: UUID/hex tokens compare and dedupe **case-insensitively**; `ses_` + base62 ids are **case-SENSITIVE** everywhere (base62 upper/lower case are distinct values — two ids differing only in case are different sessions).
+- Server work budget: resolve requests are bounded — candidate tokens capped (`MAX_RESUME_CANDIDATES`), exact-id fallbacks gated on strict id shape and limited per request, and the opencode by-id busy timeout is short (500 ms). One request must never stall the event loop for a prolonged period.
 - Repo: TDD red-green-refactor for every task; run tests via the coordinated wrapper `npm run test:vitest -- --config <config> <files> --run` (check `npm run test:status` before broad runs).
 - Repo: NodeNext ESM — server/shared relative imports use `.js` extensions. Client imports use `@/` and `@shared/` aliases (no extension).
 - Repo: a11y for all new UI — semantic elements, labels/aria, testable via role/label.
@@ -47,25 +50,27 @@
 
 ---
 
-### Task 1: Confirm the Node server serves the sidebar (spec-mandated verification)
+### Task 1: Confirm the target backend AND record the Rust-deployment degradation contract (spec-mandated verification)
 
-The spec requires the planner/implementer to confirm which server serves the sidebar in the default dev/start path before implementing there. Planner pre-verification: `package.json` `dev` runs `tsx watch server/index.ts` (+ vite client), and `start` runs `node dist/server/index.js` — the **Node server**. This task re-verifies and records it.
+The spec requires the planner/implementer to confirm which server serves the sidebar in the default dev/start path before implementing there. Planner pre-verification: `package.json` `dev` runs `tsx watch server/index.ts` (+ vite client), and `start` runs `node dist/server/index.js` — the **Node server**. HOWEVER, per AGENTS.md ("Rust Server (Self-Hosted Production)") the canonical self-hosted PRODUCTION deployment is the **Rust server** (`scripts/launch-rust.sh`, port 3002), which serves the **same `dist/client`** from disk and has NO `/api/sessions/resolve` route. The spec scopes this feature's API to the Node server (the Rust `IndexExistenceProbe` is NOT this feature's API), so the client shipped in `dist/client` MUST degrade gracefully on a resolve 404 (Task 7 implements + tests this) and the parity gap MUST be recorded as an explicit follow-up — not silently scope-cut. This task re-verifies and records both facts.
 
 **Files:**
 - Modify: `docs/plans/2026-07-29-resume-button.md` (this file — append verification log)
 
 **Interfaces:**
-- Consumes: `package.json` scripts.
-- Produces: a committed verification record; all later server tasks target `server/index.ts` + `server/sessions-router.ts`. Rust-server parity is OUT of scope.
+- Consumes: `package.json` scripts; AGENTS.md "Rust Server (Self-Hosted Production)" section; `crates/freshell-server` route surface.
+- Produces: a committed verification record; all later server tasks target `server/index.ts` + `server/sessions-router.ts`; Task 7's 404-degradation behavior is the deployment-safety contract for Rust-served clients; Rust-server endpoint parity is a RECORDED follow-up.
 
-- [ ] **Step 1: Verify the default dev/start scripts**
+- [ ] **Step 1: Verify the default dev/start scripts and the Rust deployment facts**
 
 Run:
 ```bash
 cd /home/dan/code/freshell/.worktrees/resume-button
 node -e "const s=require('./package.json').scripts; console.log('dev:', s.dev); console.log('start:', s.start)"
+grep -n "sessions/resolve" -r crates/freshell-server/src || echo "RUST-HAS-NO-RESOLVE-ROUTE (expected)"
+grep -n "Rust Server (Self-Hosted Production)" AGENTS.md
 ```
-Expected output contains `tsx watch server/index.ts` in `dev` and `node dist/server/index.js` in `start`. If it does NOT, STOP — the spec's target-backend premise is wrong; surface this to review instead of proceeding.
+Expected: `dev` contains `tsx watch server/index.ts`, `start` contains `node dist/server/index.js`, the Rust crate has NO resolve route (the `RUST-HAS-NO-RESOLVE-ROUTE` echo fires), and the AGENTS.md section exists. If the dev/start expectation does NOT hold, STOP — the spec's target-backend premise is wrong; surface this to review instead of proceeding. If the Rust crate DOES already have a resolve route, STOP and surface that too (the degradation contract may be unnecessary or conflicting).
 
 - [ ] **Step 2: Record the verification in this plan**
 
@@ -75,7 +80,8 @@ Append to the END of this plan file (`docs/plans/2026-07-29-resume-button.md`):
 
 ## Verification log
 
-- Target backend confirmed (Task 1): `npm run dev` → `tsx watch server/index.ts`; `npm run start` → `node dist/server/index.js`. The Node server (`server/index.ts`) serves the sidebar in the default dev/start path. Feature implemented there; Rust-server parity out of scope per spec.
+- Target backend confirmed (Task 1): `npm run dev` → `tsx watch server/index.ts`; `npm run start` → `node dist/server/index.js`. The Node server (`server/index.ts`) serves the sidebar in the default dev/start path; the feature's API is implemented there per spec.
+- Deployment gap recorded (Task 1): the canonical self-hosted production is the RUST server (AGENTS.md, `scripts/launch-rust.sh`, port 3002) serving the same `dist/client`; it has no `/api/sessions/resolve`. The client degrades gracefully on resolve 404 (explicit "this server build does not support resume-by-id" message — implemented and tested in Task 7). FOLLOW-UP: Rust-server `/api/sessions/resolve` parity is required before the Resume button is fully functional on the canonical production deployment.
 ```
 
 - [ ] **Step 3: Commit**
@@ -102,7 +108,7 @@ EOF
 
 **Interfaces:**
 - Consumes: nothing (pure, dependency-free — it must stay importable from both client and server).
-- Produces: `parseResumeInput(raw: string): ResumeInputParse` where `ResumeInputParse = { candidates: string[]; agentHint?: ResumeAgentHint }` and `ResumeAgentHint = { provider: 'claude' | 'codex' | 'opencode' | 'amplifier'; source: 'command' | 'word' | 'id-format' }`. Task 6 (server route) imports it as `'../shared/resume-input-parser.js'`; Task 7 (client) as `'@shared/resume-input-parser'`.
+- Produces: `parseResumeInput(raw: string): ResumeInputParse` where `ResumeInputParse = { candidates: string[]; agentHint?: ResumeAgentHint }` and `ResumeAgentHint = { provider: 'claude' | 'codex' | 'opencode' | 'amplifier'; source: 'command' | 'word' | 'id-format' }`; also `MAX_RESUME_CANDIDATES = 8` (work-budget cap on candidates). Task 6 (server route) imports it as `'../shared/resume-input-parser.js'`; Task 7 (client) as `'@shared/resume-input-parser'`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -110,7 +116,7 @@ Create `test/unit/shared/resume-input-parser.test.ts`:
 
 ```typescript
 import { describe, it, expect } from 'vitest'
-import { parseResumeInput } from '@shared/resume-input-parser'
+import { parseResumeInput, MAX_RESUME_CANDIDATES } from '@shared/resume-input-parser'
 
 describe('parseResumeInput — token extraction', () => {
   const cases: Array<{ name: string; input: string; expected: string[] }> = [
@@ -203,8 +209,20 @@ describe('parseResumeInput — token extraction', () => {
     })
   }
 
-  it('dedupes case-insensitively, keeping first casing', () => {
+  it('dedupes hex/UUID tokens case-insensitively, keeping first casing', () => {
     expect(parseResumeInput('417E8345 417e8345').candidates).toEqual(['417E8345'])
+  })
+
+  it('keeps case-distinct ses_ ids separate (base62 is case-SENSITIVE)', () => {
+    const a = 'ses_root0000000000000000000000'
+    const b = 'ses_ROOT0000000000000000000000'
+    expect(parseResumeInput(`${a} ${b}`).candidates).toEqual([a, b])
+  })
+
+  it('caps candidates at MAX_RESUME_CANDIDATES (server work budget)', () => {
+    const tokens = Array.from({ length: MAX_RESUME_CANDIDATES + 4 }, (_, i) => `417e83450a${String(i).padStart(2, '0')}`)
+    const { candidates } = parseResumeInput(tokens.join(' '))
+    expect(candidates).toHaveLength(MAX_RESUME_CANDIDATES)
   })
 })
 
@@ -278,11 +296,21 @@ export type ResumeAgentHint = {
 }
 
 export type ResumeInputParse = {
-  /** Candidate session-id tokens, best-first, deduped case-insensitively. */
+  /**
+   * Candidate session-id tokens, best-first, capped at MAX_RESUME_CANDIDATES.
+   * UUID/hex tokens dedupe case-insensitively; ses_-style base62 ids are
+   * case-SENSITIVE (distinct case = distinct id).
+   */
   candidates: string[]
   /** Advisory only — store evidence always overrides this. */
   agentHint?: ResumeAgentHint
 }
+
+/**
+ * Work budget: candidates are capped so one pasted blob can never trigger
+ * unbounded server-side scans/DB lookups in the resolve endpoint.
+ */
+export const MAX_RESUME_CANDIDATES = 8
 
 const ANSI_RE = /\u001b\[[0-9;?]*[ -/]*[@-~]/g
 const UUID_RE = /[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/g
@@ -311,11 +339,17 @@ function blank(text: string, tokens: string[]): string {
   return result
 }
 
-function dedupeCaseInsensitive(tokens: string[]): string[] {
+/**
+ * UUID/hex-family tokens (only hex digits and dashes) dedupe case-insensitively
+ * (UUIDs/hex are case-preserving but case-equal). Anything else — notably
+ * ses_ + base62 ids — dedupes case-SENSITIVELY: base62 upper/lower case are
+ * distinct values, so two ids differing only in case are DIFFERENT sessions.
+ */
+function dedupeCandidates(tokens: string[]): string[] {
   const seen = new Set<string>()
   const out: string[] = []
   for (const t of tokens) {
-    const key = t.toLowerCase()
+    const key = /^[0-9a-fA-F-]+$/.test(t) ? t.toLowerCase() : t
     if (seen.has(key)) continue
     seen.add(key)
     out.push(t)
@@ -372,7 +406,9 @@ export function parseResumeInput(raw: string): ResumeInputParse {
     .filter((t) => /\d/.test(t))
     .sort((a, b) => b.length - a.length)
 
-  const candidates = dedupeCaseInsensitive([...prefixedIds, ...uuids, ...hexTokens])
+  // Cap = work budget: bounds resolver scans + exact-id fallback lookups per request.
+  const candidates = dedupeCandidates([...prefixedIds, ...uuids, ...hexTokens])
+    .slice(0, MAX_RESUME_CANDIDATES)
 
   const command = detectCommandHint(text)
   if (command) return { candidates, agentHint: { provider: command, source: 'command' } }
@@ -419,7 +455,7 @@ EOF
 - Consumes: `ProjectGroup`, `CodingCliSession`, `CodingCliProviderName` from `server/coding-cli/types.js`; indexer snapshot shape `getProjects(): ProjectGroup[]` (already public — see `SessionsRouterDeps.codingCliIndexer`).
 - Produces (used by Tasks 4–6):
   - `CodingCliSessionIndexer.isReady(): boolean`
-  - `resolveSessionCandidates(candidates: string[], deps: SessionResolverDeps): Promise<{ matches: ResolveMatch[] }>`
+  - `resolveSessionCandidates(candidates: string[], deps: SessionResolverDeps): Promise<{ matches: ResolveMatch[]; providerErrors: CodingCliProviderName[] }>` — `providerErrors` lists providers whose exact-id fallback THREW (provider unavailable ≠ not found)
   - `type ResolveMatch = { provider: CodingCliProviderName; sessionId: string; cwd?: string; projectPath: string; sessionType: string; title?: string; firstUserMessage?: string; lastActivityAt: number; matchType: 'exact' | 'prefix'; matchedToken: string }`
   - `type ExactIdFallback = (id: string) => Promise<ResolveMatch | null>`
   - `type SessionResolverDeps = { getProjects: () => ProjectGroup[]; fallbacks?: { claudeTranscriptById?: ExactIdFallback; opencodeSessionById?: ExactIdFallback } }`
@@ -485,10 +521,15 @@ describe('resolveSessionCandidates', () => {
     expect(matches[0]).toMatchObject({ provider: 'amplifier', sessionId: AMPLIFIER_FULL, matchType: 'prefix' })
   })
 
-  it('exact-id match is case-insensitive', async () => {
+  it('exact-id match is case-insensitive for UUID/hex tokens', async () => {
     const { matches } = await resolveSessionCandidates([CLAUDE_V4.toUpperCase()], { getProjects: () => fourProviderSnapshot })
     expect(matches).toHaveLength(1)
     expect(matches[0].sessionId).toBe(CLAUDE_V4)
+  })
+
+  it('ses_ ids are case-SENSITIVE (base62): a case-variant does NOT match', async () => {
+    const { matches } = await resolveSessionCandidates(['ses_ROOT0000000000000000000000'], { getProjects: () => fourProviderSnapshot })
+    expect(matches).toHaveLength(0)
   })
 
   it('opencode ses_ id resolves to opencode even though other providers exist', async () => {
@@ -565,11 +606,21 @@ describe('resolveSessionCandidates', () => {
   })
 
   it('zero matches when nothing resolves anywhere', async () => {
-    const { matches } = await resolveSessionCandidates(['deadbeef1234'], {
+    const { matches, providerErrors } = await resolveSessionCandidates(['deadbeef1234'], {
       getProjects: () => fourProviderSnapshot,
       fallbacks: { claudeTranscriptById: async () => null, opencodeSessionById: async () => null },
     })
     expect(matches).toEqual([])
+    expect(providerErrors).toEqual([])
+  })
+
+  it('a THROWING fallback is reported as a provider error, never as "not found"', async () => {
+    const { matches, providerErrors } = await resolveSessionCandidates([OPENCODE_ID], {
+      getProjects: () => projects([]),
+      fallbacks: { opencodeSessionById: async () => { throw new Error('database is locked') } },
+    })
+    expect(matches).toEqual([])
+    expect(providerErrors).toEqual(['opencode'])
   })
 })
 ```
@@ -612,6 +663,8 @@ export type SessionResolverDeps = {
    * Exact-id fallbacks for sessions the index misses (claude transcript locate,
    * opencode by-id DB query). ACCEPTED LIMITATION (per spec): PREFIX matching
    * only covers indexed sessions — fallbacks are exact-id only.
+   * A fallback that THROWS means "provider unavailable" (locked/corrupt DB,
+   * missing roots) — recorded in providerErrors, never treated as "not found".
    */
   fallbacks?: {
     claudeTranscriptById?: ExactIdFallback
@@ -641,37 +694,64 @@ function rank(matches: ResolveMatch[]): ResolveMatch[] {
 }
 
 /**
+ * UUID/hex-family tokens (hex digits + dashes only) match case-insensitively.
+ * Everything else — notably ses_ + base62 ids — matches case-SENSITIVELY:
+ * base62 upper/lower case are distinct values, so case-folding could resolve
+ * the WRONG session.
+ */
+function isCaseInsensitiveToken(token: string): boolean {
+  return /^[0-9a-fA-F-]+$/.test(token)
+}
+
+/**
  * One scan answers all agents at once (spec: "evidence decides") — no per-agent
  * probe ordering. Candidates are tried best-first; the first token that
- * resolves anywhere wins.
+ * resolves anywhere wins. A fallback that throws marks its provider in
+ * providerErrors (unavailable ≠ not found).
  */
 export async function resolveSessionCandidates(
   candidates: string[],
   deps: SessionResolverDeps,
-): Promise<{ matches: ResolveMatch[] }> {
+): Promise<{ matches: ResolveMatch[]; providerErrors: CodingCliProviderName[] }> {
   const sessions = deps.getProjects()
     .flatMap((p) => p.sessions)
     .filter((s) => !s.isSubagent)
 
+  const providerErrors = new Set<CodingCliProviderName>()
+  const done = (matches: ResolveMatch[]) => ({ matches, providerErrors: [...providerErrors] })
+
   for (const token of candidates) {
-    const lower = token.toLowerCase()
+    const ci = isCaseInsensitiveToken(token)
+    const norm = (value: string) => (ci ? value.toLowerCase() : value)
+    const target = norm(token)
 
-    const exact = sessions.filter((s) => s.sessionId.toLowerCase() === lower)
-    if (exact.length > 0) return { matches: rank(exact.map((s) => toMatch(s, 'exact', token))) }
+    const exact = sessions.filter((s) => norm(s.sessionId) === target)
+    if (exact.length > 0) return done(rank(exact.map((s) => toMatch(s, 'exact', token))))
 
-    const prefix = sessions.filter((s) => s.sessionId.toLowerCase().startsWith(lower))
-    if (prefix.length > 0) return { matches: rank(prefix.map((s) => toMatch(s, 'prefix', token))) }
+    const prefix = sessions.filter((s) => norm(s.sessionId).startsWith(target))
+    if (prefix.length > 0) return done(rank(prefix.map((s) => toMatch(s, 'prefix', token))))
 
     const fallbackHits: ResolveMatch[] = []
-    for (const fallback of [deps.fallbacks?.claudeTranscriptById, deps.fallbacks?.opencodeSessionById]) {
+    const fallbackEntries: Array<[CodingCliProviderName, ExactIdFallback | undefined]> = [
+      ['claude', deps.fallbacks?.claudeTranscriptById],
+      ['opencode', deps.fallbacks?.opencodeSessionById],
+    ]
+    for (const [provider, fallback] of fallbackEntries) {
       if (!fallback) continue
-      const hit = await fallback(token)
-      if (hit) fallbackHits.push(hit)
+      try {
+        const hit = await fallback(token)
+        if (hit) fallbackHits.push(hit)
+      } catch {
+        // Provider unavailable (locked/corrupt DB, unreadable roots) is NOT
+        // "not found" — record it so the route reports a degraded state and
+        // the client offers retry instead of "no matching session".
+        providerErrors.add(provider)
+      }
     }
-    if (fallbackHits.length > 0) return { matches: rank(fallbackHits) }
+    if (fallbackHits.length > 0) return done(rank(fallbackHits))
   }
 
-  return { matches: [] }
+  return done([])
 }
 ```
 
@@ -765,6 +845,16 @@ describe('locateClaudeTranscriptById', () => {
     expect(hit!.lastActivityAt).toBeGreaterThan(0)
   })
 
+  it('finds a lowercase transcript when the pasted id is UPPERCASE (case-sensitive FS)', async () => {
+    await writeTranscript('-home-u-proj', SESSION_ID, [
+      JSON.stringify({ type: 'user', cwd: '/home/u/proj', message: { content: 'hello' } }),
+    ])
+    const hit = await locateClaudeTranscriptById(SESSION_ID.toUpperCase(), [root])
+    expect(hit).not.toBeNull()
+    expect(hit!.sessionId).toBe(SESSION_ID)
+    expect(hit!.filePath).toBe(path.join(root, '-home-u-proj', `${SESSION_ID}.jsonl`))
+  })
+
   it('returns null when no transcript exists', async () => {
     expect(await locateClaudeTranscriptById(SESSION_ID, [root])).toBeNull()
   })
@@ -822,6 +912,10 @@ export async function locateClaudeTranscriptById(
   roots: string[],
 ): Promise<ClaudeTranscriptHit | null> {
   if (!UUID_SHAPE.test(sessionId)) return null
+  // Claude writes lowercase-UUID transcript filenames; the input contract
+  // accepts UUIDs in ANY case and Linux filesystems are case-sensitive, so
+  // normalize before building paths and return the canonical lowercase id.
+  const id = sessionId.toLowerCase()
   for (const root of roots) {
     let projectDirs: string[]
     try {
@@ -830,7 +924,7 @@ export async function locateClaudeTranscriptById(
       continue
     }
     for (const dir of projectDirs) {
-      const candidate = path.join(root, dir, `${sessionId}.jsonl`)
+      const candidate = path.join(root, dir, `${id}.jsonl`)
       let stat
       try {
         stat = await fsp.stat(candidate)
@@ -838,7 +932,7 @@ export async function locateClaudeTranscriptById(
         continue
       }
       const cwd = await readCwdFromTranscriptHead(candidate)
-      return { sessionId, cwd, filePath: candidate, lastActivityAt: stat.mtimeMs }
+      return { sessionId: id, cwd, filePath: candidate, lastActivityAt: stat.mtimeMs }
     }
   }
   return null
@@ -1006,7 +1100,18 @@ Create `server/coding-cli/providers/opencode-by-id-query.ts`:
 ```typescript
 import type { OpencodeSessionRow } from './opencode-listing-query.js'
 
-const OPENCODE_DB_BUSY_TIMEOUT_MS = 5000
+/**
+ * SHORT busy timeout, deliberately much smaller than the listing query's 5 s:
+ * this synchronous lookup runs on the Node event loop, so a locked DB must
+ * fail fast (the failure is surfaced as provider-unavailable, NOT "not found").
+ * Event-loop-blocking budget rationale: unlike the ~180 ms listing scan (which
+ * runs in a worker thread for that reason), this is an indexed primary-key
+ * point lookup (`WHERE id = ? LIMIT 1`) — sub-millisecond even on a 531 MB DB.
+ * Per-request work is additionally bounded by MAX_RESUME_CANDIDATES, the
+ * strict ses_ shape gate, and the per-request fallback budget (Task 6), so the
+ * worst case is a handful of point lookups + at most this timeout when locked.
+ */
+const OPENCODE_BYID_BUSY_TIMEOUT_MS = 500
 
 /**
  * Exact-id opencode lookup for the resolve endpoint's fallback path — the
@@ -1014,7 +1119,8 @@ const OPENCODE_DB_BUSY_TIMEOUT_MS = 5000
  * listing query it deliberately includes ARCHIVED and CHILD sessions: an
  * exact id pasted by the user must resolve even when the listing hides it.
  * Lazy `node:sqlite` import for the same vi.mock/TDZ reason documented in
- * opencode-listing-query.ts.
+ * opencode-listing-query.ts. Errors PROPAGATE to the caller (provider
+ * unavailable ≠ not found — the resolver records them as providerErrors).
  */
 export async function runOpencodeSessionByIdQuery(
   dbPath: string,
@@ -1023,7 +1129,7 @@ export async function runOpencodeSessionByIdQuery(
   const { DatabaseSync } = await import('node:sqlite')
   const db = new DatabaseSync(dbPath, { readOnly: true })
   try {
-    db.exec(`PRAGMA busy_timeout = ${OPENCODE_DB_BUSY_TIMEOUT_MS}`)
+    db.exec(`PRAGMA busy_timeout = ${OPENCODE_BYID_BUSY_TIMEOUT_MS}`)
     const tableNames = new Set(
       (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name?: unknown }>)
         .map((row) => row.name),
@@ -1087,8 +1193,8 @@ EOF
 **Interfaces:**
 - Consumes: `parseResumeInput` from `../shared/resume-input-parser.js` (Task 2); `resolveSessionCandidates`, `ResolveMatch`, `ExactIdFallback` from `./coding-cli/session-resolver.js` (Task 3); `locateClaudeTranscriptById` (Task 4); `runOpencodeSessionByIdQuery` (Task 5); `CodingCliProvider` interface (`getSessionRoots()`, `name`); `OpencodeProvider.getDatabasePath()`.
 - Produces: HTTP contract used by the client (Task 7):
-  - Request: `POST /api/sessions/resolve` body `{ input: string }` (1–20000 chars; 400 on invalid body).
-  - Response 200: `{ indexState: 'ready' | 'warming', tokens: string[], agentHint: { provider, source } | null, homeDir: string, matches: ResolveMatch[] }`.
+  - Request: `POST /api/sessions/resolve` body `{ input: string }` (1–20000 chars; 400 on invalid body; candidate tokens are already capped by `MAX_RESUME_CANDIDATES` in the parser).
+  - Response 200: `{ indexState: 'ready' | 'warming' | 'degraded', tokens: string[], agentHint: { provider, source } | null, homeDir: string, providerErrors: ('claude' | 'opencode')[], matches: ResolveMatch[] }`. `degraded` = zero matches AND at least one provider fallback FAILED (provider unavailable ≠ not found — the client shows retry, never "no matching session").
 - Wiring note: `server/index.ts` (~line 748) passes the live `CodingCliSessionIndexer` instance as `codingCliIndexer`, so the new optional `isReady` dep is picked up structurally — verify this when editing; if `index.ts` instead builds an object literal for `codingCliIndexer`, add `isReady: () => codingCliIndexer.isReady()` to that literal.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1101,6 +1207,7 @@ import { describe, it, expect, vi } from 'vitest'
 import express from 'express'
 import request from 'supertest'
 import { createSessionsRouter, type SessionsRouterDeps } from '../../../server/sessions-router'
+import { FALLBACK_BUDGET_PER_REQUEST } from '../../../server/coding-cli/resolve-fallbacks'
 import type { ProjectGroup } from '../../../server/coding-cli/types'
 
 const CLAUDE_V4 = 'ed2afda6-a340-443e-ba60-024a1b3554b4'
@@ -1202,6 +1309,33 @@ describe('POST /api/sessions/resolve', () => {
     expect(res.body.matches[0].cwd).toBe('/tmp/fb')
   })
 
+  it('reports degraded (NOT "not found") when a provider fallback FAILS', async () => {
+    const res = await request(makeApp({
+      codingCliIndexer: { getProjects: () => [], refresh: async () => {}, isReady: () => true },
+      resolveFallbacks: { opencodeSessionById: async () => { throw new Error('database is locked') } },
+    })).post('/api/sessions/resolve').send({ input: 'ses_root0000000000000000000000' })
+    expect(res.status).toBe(200)
+    expect(res.body.indexState).toBe('degraded')
+    expect(res.body.providerErrors).toEqual(['opencode'])
+    expect(res.body.matches).toEqual([])
+  })
+
+  it('bounds per-request fallback work to FALLBACK_BUDGET_PER_REQUEST', async () => {
+    const fallback = vi.fn().mockResolvedValue(null)
+    await request(makeApp({
+      codingCliIndexer: { getProjects: () => [], refresh: async () => {}, isReady: () => true },
+      resolveFallbacks: { claudeTranscriptById: fallback },
+    })).post('/api/sessions/resolve').send({
+      input: [
+        'ed2afda6-a340-443e-ba60-024a1b3554b1',
+        'ed2afda6-a340-443e-ba60-024a1b3554b2',
+        'ed2afda6-a340-443e-ba60-024a1b3554b3',
+        'ed2afda6-a340-443e-ba60-024a1b3554b4',
+      ].join(' '),
+    })
+    expect(fallback.mock.calls.length).toBeLessThanOrEqual(FALLBACK_BUDGET_PER_REQUEST)
+  })
+
   it('400s on a missing/invalid body', async () => {
     const res = await request(makeApp()).post('/api/sessions/resolve').send({})
     expect(res.status).toBe(400)
@@ -1231,6 +1365,36 @@ export type ResolveFallbacks = {
   opencodeSessionById?: ExactIdFallback
 }
 
+/** Strict opencode id shape — the by-id DB query only runs for real ses_ ids (work budget). */
+const OPENCODE_ID_SHAPE = /^ses_[0-9a-zA-Z]{26}$/
+
+/**
+ * Per-request work budget: each fallback may do real work at most this many
+ * times per request; beyond that it reports a miss without doing work.
+ * Combined with MAX_RESUME_CANDIDATES and the id-shape gates this bounds the
+ * synchronous work one request can put on the event loop.
+ */
+export const FALLBACK_BUDGET_PER_REQUEST = 2
+
+export function withRequestBudget(
+  fallbacks: ResolveFallbacks,
+  max = FALLBACK_BUDGET_PER_REQUEST,
+): ResolveFallbacks {
+  const budgeted = (fallback?: ExactIdFallback): ExactIdFallback | undefined => {
+    if (!fallback) return undefined
+    let used = 0
+    return async (id) => {
+      if (used >= max) return null
+      used += 1
+      return fallback(id)
+    }
+  }
+  return {
+    claudeTranscriptById: budgeted(fallbacks.claudeTranscriptById),
+    opencodeSessionById: budgeted(fallbacks.opencodeSessionById),
+  }
+}
+
 /** Build the production exact-id fallbacks from the live provider set. */
 export function buildResolveFallbacks(providers: CodingCliProvider[]): ResolveFallbacks {
   const claude = providers.find((p) => p.name === 'claude')
@@ -1256,22 +1420,22 @@ export function buildResolveFallbacks(providers: CodingCliProvider[]): ResolveFa
 
   const opencodeSessionById: ExactIdFallback | undefined = opencode?.getDatabasePath
     ? async (id): Promise<ResolveMatch | null> => {
-        try {
-          const row = await runOpencodeSessionByIdQuery(opencode.getDatabasePath!(), id)
-          if (!row) return null
-          return {
-            provider: 'opencode',
-            sessionId: row.sessionId,
-            cwd: row.cwd || undefined,
-            projectPath: row.projectPath ?? row.cwd ?? '',
-            sessionType: 'opencode',
-            title: row.title || undefined,
-            lastActivityAt: row.lastActivityAt,
-            matchType: 'exact',
-            matchedToken: id,
-          }
-        } catch {
-          return null // DB missing/locked/degraded — treat as a miss, not an error.
+        // Shape gate (work budget): never open the DB for non-opencode tokens.
+        if (!OPENCODE_ID_SHAPE.test(id)) return null
+        // NO catch here: a locked/corrupt/unreadable DB must PROPAGATE so the
+        // resolver records provider-unavailable (degraded), never "not found".
+        const row = await runOpencodeSessionByIdQuery(opencode.getDatabasePath!(), id)
+        if (!row) return null
+        return {
+          provider: 'opencode',
+          sessionId: row.sessionId,
+          cwd: row.cwd || undefined,
+          projectPath: row.projectPath ?? row.cwd ?? '',
+          sessionType: 'opencode',
+          title: row.title || undefined,
+          lastActivityAt: row.lastActivityAt,
+          matchType: 'exact',
+          matchedToken: id,
         }
       }
     : undefined
@@ -1290,7 +1454,7 @@ Add imports at the top (keep `.js` extensions — NodeNext):
 import os from 'os'
 import { parseResumeInput } from '../shared/resume-input-parser.js'
 import { resolveSessionCandidates } from './coding-cli/session-resolver.js'
-import { buildResolveFallbacks, type ResolveFallbacks } from './coding-cli/resolve-fallbacks.js'
+import { buildResolveFallbacks, withRequestBudget, type ResolveFallbacks } from './coding-cli/resolve-fallbacks.js'
 ```
 
 Extend `SessionsRouterDeps`: inside the existing `codingCliIndexer` object type add `isReady?: () => boolean`, and add two new optional top-level deps:
@@ -1330,17 +1494,23 @@ Add the route inside `createSessionsRouter(deps)`, after the `router.post('/sess
     }
     try {
       const { candidates, agentHint } = parseResumeInput(parsed.data.input)
-      const indexState: 'ready' | 'warming' =
-        deps.codingCliIndexer.isReady?.() === false ? 'warming' : 'ready'
-      const { matches } = await resolveSessionCandidates(candidates, {
+      const { matches, providerErrors } = await resolveSessionCandidates(candidates, {
         getProjects: () => deps.codingCliIndexer.getProjects(),
-        fallbacks: resolveFallbacks,
+        // Fresh budget per request: bounds fallback work (event-loop safety).
+        fallbacks: withRequestBudget(resolveFallbacks),
       })
+      // degraded = zero matches AND a provider fallback FAILED: absence needs
+      // evidence (spec) — the client shows retry, never "no matching session".
+      const indexState: 'ready' | 'warming' | 'degraded' =
+        deps.codingCliIndexer.isReady?.() === false ? 'warming'
+        : matches.length === 0 && providerErrors.length > 0 ? 'degraded'
+        : 'ready'
       res.json({
         indexState,
         tokens: candidates,
         agentHint: agentHint ?? null,
         homeDir: deps.homeDir ?? os.homedir(),
+        providerErrors,
         matches,
       })
     } catch (err) {
@@ -1402,7 +1572,7 @@ Create `test/unit/client/resume-session-dialog.test.tsx`:
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { cleanup, fireEvent, render, screen, act } from '@testing-library/react'
 import ResumeSessionDialog from '@/components/ResumeSessionDialog'
-import type { ResumeResolveResponse } from '@/lib/api'
+import { ApiError, type ResumeResolveResponse } from '@/lib/api'
 
 const mockResolve = vi.fn<(input: string) => Promise<ResumeResolveResponse>>()
 vi.mock('@/lib/api', async (importOriginal) => {
@@ -1418,6 +1588,7 @@ function response(overrides: Partial<ResumeResolveResponse>): ResumeResolveRespo
     tokens: [CLAUDE_V4],
     agentHint: null,
     homeDir: '/home/testuser',
+    providerErrors: [],
     matches: [],
     ...overrides,
   }
@@ -1470,10 +1641,37 @@ describe('ResumeSessionDialog', () => {
     expect(screen.getByLabelText(/resume string/i)).toBeInTheDocument()
   })
 
-  it('Escape closes the dialog', () => {
+  it('Escape closes the dialog via the DOCUMENT-level listener', () => {
     const { onClose } = renderDialog()
-    fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' })
+    fireEvent.keyDown(document, { key: 'Escape' })
     expect(onClose).toHaveBeenCalled()
+  })
+
+  it('traps Tab focus: wraps from the last focusable to the first and back (Shift+Tab)', () => {
+    renderDialog()
+    const dialog = screen.getByRole('dialog')
+    const picker = screen.getByLabelText(/agent/i)
+    // With an empty input, "Find session" is disabled, so Cancel is the last focusable.
+    const cancel = screen.getByRole('button', { name: /cancel/i })
+    cancel.focus()
+    fireEvent.keyDown(dialog, { key: 'Tab' })
+    expect(document.activeElement).toBe(picker)
+    fireEvent.keyDown(dialog, { key: 'Tab', shiftKey: true })
+    expect(document.activeElement).toBe(cancel)
+  })
+
+  it('locks background scroll while open; restores scroll and focus on close', () => {
+    const outside = document.createElement('button')
+    document.body.appendChild(outside)
+    outside.focus()
+    const onClose = vi.fn()
+    const onResume = vi.fn()
+    const { rerender } = render(<ResumeSessionDialog open onClose={onClose} onResume={onResume} />)
+    expect(document.body.style.overflow).toBe('hidden')
+    rerender(<ResumeSessionDialog open={false} onClose={onClose} onResume={onResume} />)
+    expect(document.body.style.overflow).toBe('')
+    expect(document.activeElement).toBe(outside)
+    outside.remove()
   })
 
   it('single match: resumes with the STORE provider even when the picker disagrees, and shows a note', async () => {
@@ -1544,8 +1742,50 @@ describe('ResumeSessionDialog', () => {
     expect(screen.queryByRole('alert')).toBeNull()
     expect(screen.getByRole('status')).toHaveTextContent(/index is still warming/i)
     fireEvent.click(screen.getByRole('button', { name: /retry/i }))
-    await act(async () => { await Promise.resolve() })
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
     expect(onResume).toHaveBeenCalled()
+  })
+
+  it('degraded (provider unavailable): retry state, NOT "no matching session"', async () => {
+    mockResolve.mockResolvedValueOnce(response({ indexState: 'degraded', providerErrors: ['opencode'], matches: [] }))
+    mockResolve.mockResolvedValueOnce(response({ matches: [match()] }))
+    const { onResume } = renderDialog()
+    await pasteAndResolve(CLAUDE_V4)
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.getByRole('status')).toHaveTextContent(/could not be searched/i)
+    fireEvent.click(screen.getByRole('button', { name: /retry/i }))
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    expect(onResume).toHaveBeenCalled()
+  })
+
+  it('ignores STALE responses: a late first response cannot override or auto-resume', async () => {
+    let resolveFirst!: (r: ResumeResolveResponse) => void
+    mockResolve.mockReturnValueOnce(new Promise<ResumeResolveResponse>((r) => { resolveFirst = r }))
+    mockResolve.mockResolvedValueOnce(response({ matches: [] }))
+    const { onResume } = renderDialog()
+    const input = screen.getByLabelText(/resume string/i)
+    fireEvent.change(input, { target: { value: 'ed2afda6' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    fireEvent.change(input, { target: { value: CLAUDE_V4 } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    expect(screen.getByRole('alert')).toHaveTextContent(/no matching session/i)
+    // The stale FIRST response now arrives with a single match: it must be
+    // ignored — a stale auto-resume would open the WRONG session.
+    await act(async () => {
+      resolveFirst(response({ matches: [match()] }))
+      await Promise.resolve(); await Promise.resolve()
+    })
+    expect(onResume).not.toHaveBeenCalled()
+    expect(screen.getByRole('alert')).toHaveTextContent(/no matching session/i)
+  })
+
+  it('resolve 404 (endpoint absent, e.g. Rust-served client): explicit unsupported message', async () => {
+    mockResolve.mockRejectedValue(new ApiError(404, 'Not Found'))
+    const { onResume } = renderDialog()
+    await pasteAndResolve(CLAUDE_V4)
+    expect(screen.getByRole('alert')).toHaveTextContent(/does not support resume-by-id/i)
+    expect(onResume).not.toHaveBeenCalled()
   })
 
   it('garbage input: inline error, no resume', async () => {
@@ -1594,10 +1834,12 @@ export type ResumeResolveMatch = {
 }
 
 export type ResumeResolveResponse = {
-  indexState: 'ready' | 'warming'
+  /** 'degraded' = zero matches AND a provider fallback failed — retry, NOT "not found". */
+  indexState: 'ready' | 'warming' | 'degraded'
   tokens: string[]
   agentHint: { provider: ResumeResolveMatch['provider']; source: 'command' | 'word' | 'id-format' } | null
   homeDir: string
+  providerErrors: Array<'claude' | 'opencode'>
   matches: ResumeResolveMatch[]
 }
 
@@ -1616,7 +1858,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Loader2 } from 'lucide-react'
 import { OVERLAY_Z } from '@/components/ui/overlay'
-import { resolveResumeInput, type ResumeResolveMatch, type ResumeResolveResponse } from '@/lib/api'
+import { ApiError, resolveResumeInput, type ResumeResolveMatch, type ResumeResolveResponse } from '@/lib/api'
 import { parseResumeInput, type ResumeProviderName } from '@shared/resume-input-parser'
 import { DEFAULT_ENABLED_CLI_PROVIDERS } from '@shared/coding-cli-defaults'
 
@@ -1635,6 +1877,21 @@ function formatRelativeTime(timestamp: number): string {
   if (hours < 24) return `${hours}h`
   if (days < 7) return `${days}d`
   return new Date(timestamp).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+}
+
+// Focus-trap helper — same pattern as src/components/ui/confirm-modal.tsx
+// (repo modal a11y convention: trap Tab, restore focus, lock scroll, doc-level Escape).
+function getFocusable(container: HTMLElement): HTMLElement[] {
+  const selectors = [
+    'button',
+    '[href]',
+    'input',
+    'select',
+    'textarea',
+    '[tabindex]:not([tabindex="-1"])',
+  ]
+  return Array.from(container.querySelectorAll<HTMLElement>(selectors.join(',')))
+    .filter((el) => !el.hasAttribute('disabled') && !el.getAttribute('aria-hidden'))
 }
 
 export type ResumeSessionDialogProps = {
@@ -1671,15 +1928,43 @@ export default function ResumeSessionDialog({ open, onClose, onResume }: ResumeS
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const dialogRef = useRef<HTMLDivElement>(null)
   const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const previousFocusRef = useRef<HTMLElement | null>(null)
+  const previousOverflowRef = useRef<string | null>(null)
+  // Stale-response guard: only the LATEST resolve request may mutate state.
+  const resolveSeqRef = useRef(0)
 
   useEffect(() => {
-    if (open) inputRef.current?.focus()
     if (!open) {
       setInputValue(''); setResult(null); setErrorText(null); setNote(null)
       setResolving(false); setPickerTouched(false)
+      resolveSeqRef.current += 1 // invalidate any in-flight resolve
     }
     return () => { if (closeTimerRef.current) clearTimeout(closeTimerRef.current) }
   }, [open])
+
+  // Modal a11y (mirrors src/components/ui/confirm-modal.tsx): capture + restore
+  // the previously focused element, lock background scroll, focus the paste field.
+  useEffect(() => {
+    if (!open) return
+    previousFocusRef.current = document.activeElement as HTMLElement | null
+    previousOverflowRef.current = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    inputRef.current?.focus()
+    return () => {
+      document.body.style.overflow = previousOverflowRef.current || ''
+      previousFocusRef.current?.focus()
+    }
+  }, [open])
+
+  // Document-level Escape (works regardless of where focus sits).
+  useEffect(() => {
+    if (!open) return
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') { e.preventDefault(); onClose() }
+    }
+    document.addEventListener('keydown', handleKey)
+    return () => document.removeEventListener('keydown', handleKey)
+  }, [open, onClose])
 
   const finishResume = useCallback((m: ResumeResolveMatch) => {
     onResume({
@@ -1697,6 +1982,10 @@ export default function ResumeSessionDialog({ open, onClose, onResume }: ResumeS
   const runResolve = useCallback(async (text: string) => {
     const trimmed = text.trim()
     if (!trimmed) return
+    // Stale-response guard: bump the sequence; only the LATEST request may
+    // mutate state. A stale single-match response must NEVER auto-resume —
+    // it could open the WRONG session.
+    const seq = ++resolveSeqRef.current
     setResolving(true); setErrorText(null); setNote(null); setResult(null)
     // Live local hint (advisory only — server evidence decides).
     const localParse = parseResumeInput(trimmed)
@@ -1704,11 +1993,17 @@ export default function ResumeSessionDialog({ open, onClose, onResume }: ResumeS
     let response: ResumeResolveResponse
     try {
       response = await resolveResumeInput(trimmed)
-    } catch {
+    } catch (err) {
+      if (seq !== resolveSeqRef.current) return // stale — ignore
       setResolving(false)
-      setErrorText('Could not reach the server. Try again.')
+      // Deployment degradation contract (Task 1): the canonical Rust-served
+      // production has no resolve endpoint — a 404 gets an explicit message.
+      setErrorText(err instanceof ApiError && err.status === 404
+        ? 'This server build does not support resume-by-id yet.'
+        : 'Could not reach the server. Try again.')
       return
     }
+    if (seq !== resolveSeqRef.current) return // stale — ignore
     setResolving(false)
     setResult(response)
     setAnywayCwd(response.homeDir)
@@ -1735,8 +2030,12 @@ export default function ResumeSessionDialog({ open, onClose, onResume }: ResumeS
 
   if (!open) return null
 
-  const warming = result !== null && result.indexState === 'warming'
-    && result.tokens.length > 0 && result.matches.length === 0
+  // warming AND degraded are retry states — NEITHER is "not found" (spec:
+  // absence needs evidence; provider unavailable gets loading/retry).
+  const retryState = result !== null && result.tokens.length > 0 && result.matches.length === 0
+    && (result.indexState === 'warming' || result.indexState === 'degraded')
+    ? result.indexState
+    : null
   const showDisambiguation = (result?.matches.length ?? 0) > 1
   const showResumeAnyway = errorText !== null && errorText.startsWith('No matching session')
 
@@ -1752,7 +2051,27 @@ export default function ResumeSessionDialog({ open, onClose, onResume }: ResumeS
         aria-labelledby="resume-session-dialog-title"
         data-testid="resume-session-dialog"
         className="bg-card border border-border rounded-lg shadow-lg w-full max-w-lg p-4 flex flex-col gap-3"
-        onKeyDown={(e) => { if (e.key === 'Escape') { e.stopPropagation(); onClose() } }}
+        onKeyDown={(e) => {
+          if (e.key === 'Escape') { e.stopPropagation(); onClose(); return }
+          if (e.key !== 'Tab') return
+          // Focus trap — repo modal pattern (see src/components/ui/confirm-modal.tsx).
+          const dialog = dialogRef.current
+          if (!dialog) return
+          const focusables = getFocusable(dialog)
+          if (focusables.length === 0) { e.preventDefault(); return }
+          const first = focusables[0]
+          const last = focusables[focusables.length - 1]
+          const active = document.activeElement as HTMLElement | null
+          if (e.shiftKey) {
+            if (active === first || !dialog.contains(active)) {
+              e.preventDefault()
+              last.focus()
+            }
+          } else if (active === last) {
+            e.preventDefault()
+            first.focus()
+          }
+        }}
       >
         <h2 id="resume-session-dialog-title" className="text-sm font-medium">Resume a session</h2>
 
@@ -1807,10 +2126,12 @@ export default function ResumeSessionDialog({ open, onClose, onResume }: ResumeS
 
         {note && <div role="status" className="text-sm text-emerald-500">{note}</div>}
 
-        {warming && (
+        {retryState && (
           <div role="status" className="flex items-center gap-2 text-sm text-muted-foreground">
             <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
-            Session index is still warming — this is not a "not found".
+            {retryState === 'warming'
+              ? 'Session index is still warming — this is not a "not found".'
+              : 'Some agents could not be searched right now — this is not a "not found".'}
             <button
               type="button"
               className="underline hover:text-foreground"
@@ -1892,7 +2213,8 @@ Implementation notes for this step (facts verified during load-bearing validatio
 - `formatRelativeTime` is a module-LOCAL (non-exported) function in `src/components/Sidebar.tsx` (~line 107) and exists nowhere else — that is why the dialog defines its own local copy above. Do NOT import it from Sidebar.tsx (Sidebar renders this dialog; that import would be circular) and do NOT add it to `@/lib/utils` (keeps this change's blast radius to new files).
 - `OVERLAY_Z` (`src/components/ui/overlay.ts`) is a map of Tailwind z-index classes `{ tooltip: 'z-40', menu: 'z-50', modal: 'z-[60]' }`, NOT a number — hence `${OVERLAY_Z.modal}` appended to the overlay `className` (never `style={{ zIndex: … }}`).
 - `DEFAULT_ENABLED_CLI_PROVIDERS` is `readonly ['claude','codex','opencode','amplifier']` — the `.map` cast shown handles it.
-- Keep the focus behavior: initial focus lands on the paste field (`inputRef`), Escape closes. If the repo's a11y tests demand a full focus trap, mirror the `getFocusable`/Tab-cycling logic from `src/components/ui/confirm-modal.tsx` inside this component.
+- Modal a11y is MANDATORY (repo a11y rule), not conditional: the component mirrors `src/components/ui/confirm-modal.tsx` exactly — `getFocusable` + Tab/Shift+Tab focus trap on the dialog, previous-focus capture and restore on close, `document.body.style.overflow` scroll lock while open, and a document-level Escape listener. The Step 1 tests cover each of these behaviors; do not remove any of them.
+- Stale-response guard is MANDATORY: `resolveSeqRef` invalidates in-flight resolves on every new resolve and on close; a stale response (including a stale single-match auto-resume) must be ignored. The Step 1 reversed-ordering test proves it.
 
 - [ ] **Step 5: Run tests to verify they pass**
 
@@ -1925,7 +2247,7 @@ EOF
 - Test: `test/unit/client/sidebar-resume-footer.test.tsx`
 
 **Interfaces:**
-- Consumes: `ResumeSessionDialog` (Task 7); `openSessionTab` thunk from `@/store/tabsSlice` — signature `openSessionTab({ sessionId, title?, cwd?, provider?, sessionType?, … })`; NOTE: `openSessionTab` already dedupes against open panes internally (see the "Dedupe by session is handled in openSessionTab" comment in `src/store/tabsSlice.ts` ~line 297) — do NOT reimplement dedup.
+- Consumes: `ResumeSessionDialog` (Task 7); `openSessionTab` thunk from `@/store/tabsSlice` — signature `openSessionTab({ sessionId, title?, cwd?, provider?, sessionType?, … })`; NOTE: `openSessionTab` already dedupes against open panes internally (see the "Dedupe by session is handled in openSessionTab" comment in `src/store/tabsSlice.ts` ~line 297) — do NOT reimplement dedup. Also consumes the Sidebar's existing `onNavigate` prop: every session-open path in Sidebar.tsx calls `onNavigate('terminal')` (see ~lines 401/430/450) and the resume handler MUST too, or the resumed tab stays hidden behind non-terminal views.
 - Produces: `data-testid="sidebar-footer"` (pinned footer container) and `data-testid="sidebar-resume-button"` — the flow tests (Task 9) and the spec's UI acceptance depend on these exact testids.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1978,25 +2300,25 @@ beforeEach(() => vi.clearAllMocks())
 afterEach(() => cleanup())
 
 describe('Sidebar pinned resume footer', () => {
-  it('renders the footer OUTSIDE the scrollable session list, as a following sibling', () => {
+  it('pins the footer: IMMEDIATE next sibling of the flex-1 min-h-0 scroll wrapper, outside it, non-shrinking', () => {
+    // jsdom cannot do layout, so this asserts the EXACT pinning mechanism the
+    // spec mandates instead of faking scroll events: the scroll wrapper is the
+    // `flex flex-1 min-h-0` div that CONTAINS the session list; the footer is
+    // that wrapper's IMMEDIATE next sibling inside the same flex-column parent
+    // and carries flex-shrink-0 so it can never be scrolled away or squeezed
+    // out. Any placement that violates the spec (inside the list, deeper in the
+    // tree, or after other siblings) fails one of these assertions.
     renderSidebar()
     const footer = screen.getByTestId('sidebar-footer')
     const list = screen.getByTestId('sidebar-session-list')
-    expect(list.contains(footer)).toBe(false)
-    // Footer must come AFTER the scroll wrapper in document order (pinned below).
-    expect(list.compareDocumentPosition(footer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
-    // Pinning mechanism: the footer must not flex-shrink away.
+    const wrapper = footer.previousElementSibling as HTMLElement | null
+    expect(wrapper).not.toBeNull()
+    expect(wrapper!.className).toContain('flex-1')
+    expect(wrapper!.className).toContain('min-h-0')
+    expect(wrapper!.contains(list)).toBe(true)
+    expect(wrapper!.contains(footer)).toBe(false)
+    expect(footer.parentElement).toBe(wrapper!.parentElement)
     expect(footer.className).toContain('flex-shrink-0')
-  })
-
-  it('footer persists at every scroll position of the list', () => {
-    renderSidebar()
-    const list = screen.getByTestId('sidebar-session-list')
-    for (const pos of [0, 200, 100000]) {
-      fireEvent.scroll(list, { target: { scrollTop: pos } })
-      expect(screen.getByTestId('sidebar-footer')).toBeInTheDocument()
-      expect(list.contains(screen.getByTestId('sidebar-footer'))).toBe(false)
-    }
   })
 
   it('renders in fullWidth mobile mode', () => {
@@ -2054,7 +2376,12 @@ const handleResumeResolved = useCallback((opts: {
     firstUserMessage: opts.firstUserMessage,
     hasTitle: Boolean(opts.title),
   }))
-}, [dispatch])
+  // Sidebar convention — every session-open path in this file calls
+  // onNavigate('terminal') so the opened tab is actually VISIBLE even when the
+  // user was on the Tabs/Panes/etc. view. Task 9's flow tests render with
+  // view="tabs" and assert this navigation happens.
+  onNavigate('terminal')
+}, [dispatch, onNavigate])
 ```
 
 In the JSX: find the session-list wrapper `<div className="flex flex-1 min-h-0 flex-col">` (opens ~line 833, contains `data-testid="sidebar-session-list"`). Immediately AFTER that wrapper's closing `</div>` — as its next sibling, still inside the component's root `h-full flex flex-col` div — insert:
@@ -2165,7 +2492,7 @@ const CLAUDE_V4 = 'ed2afda6-a340-443e-ba60-024a1b3554b4'
 const AMPLIFIER_FULL = '417e8345-90ab-4cde-8f01-234567890abc'
 
 function response(overrides: Partial<ResumeResolveResponse> = {}): ResumeResolveResponse {
-  return { indexState: 'ready', tokens: [CLAUDE_V4], agentHint: null, homeDir: '/home/t', matches: [], ...overrides }
+  return { indexState: 'ready', tokens: [CLAUDE_V4], agentHint: null, homeDir: '/home/t', providerErrors: [], matches: [], ...overrides }
 }
 
 function claudeMatch() {
@@ -2189,14 +2516,33 @@ function makeStore() {
   })
 }
 
+// Render on a NON-terminal view: resume must both open the tab AND navigate
+// to the terminal view (Sidebar convention), which view="terminal" would hide.
 function renderApp() {
   const store = makeStore()
+  const onNavigate = vi.fn()
   render(
     <Provider store={store}>
-      <Sidebar view="terminal" onNavigate={vi.fn()} />
+      <Sidebar view="tabs" onNavigate={onNavigate} />
     </Provider>,
   )
-  return store
+  return { store, onNavigate }
+}
+
+// The resumed TUPLE must be verified — not just tabs.length (an implementation
+// that always opened a claude pane would otherwise pass every flow).
+function expectResumedTab(
+  store: ReturnType<typeof makeStore>,
+  expected: { provider: string; sessionId: string; cwd?: string },
+) {
+  const tabs = store.getState().tabs.tabs
+  expect(tabs).toHaveLength(1)
+  expect(tabs[0]).toMatchObject({
+    codingCliProvider: expected.provider,
+    mode: expected.provider,
+    ...(expected.cwd !== undefined ? { initialCwd: expected.cwd } : {}),
+    sessionRef: { provider: expected.provider, sessionId: expected.sessionId },
+  })
 }
 
 async function openDialogAndResolve(text: string) {
@@ -2211,13 +2557,43 @@ beforeEach(() => mockResolve.mockReset())
 afterEach(() => cleanup())
 
 describe('resume button end-to-end flows (spec acceptance)', () => {
-  it('paste claude UUID with no hint → resolve finds claude → a claude tab opens', async () => {
+  it('paste claude UUID with no hint → resolve finds claude → a claude tab opens AND navigates to terminal view', async () => {
     mockResolve.mockResolvedValue(response({ matches: [claudeMatch()] }))
-    const store = renderApp()
+    const { store, onNavigate } = renderApp()
     await openDialogAndResolve(CLAUDE_V4)
-    const tabs = store.getState().tabs.tabs
-    expect(tabs).toHaveLength(1)
+    expectResumedTab(store, { provider: 'claude', sessionId: CLAUDE_V4, cwd: '/home/u/proj' })
     expect(mockResolve).toHaveBeenCalledWith(CLAUDE_V4)
+    // Sidebar convention: the resumed tab must become VISIBLE (we rendered view="tabs").
+    expect(onNavigate).toHaveBeenCalledWith('terminal')
+  })
+
+  it('codex resume command → resolve finds codex → a CODEX tab opens (full id, correct provider)', async () => {
+    const CODEX_V7 = '019fac27-69d7-78a0-b972-b339d551042e'
+    mockResolve.mockResolvedValue(response({
+      tokens: [CODEX_V7],
+      agentHint: { provider: 'codex', source: 'command' },
+      matches: [{ ...claudeMatch(), provider: 'codex' as const, sessionId: CODEX_V7, sessionType: 'codex', matchedToken: CODEX_V7 }],
+    }))
+    const { store } = renderApp()
+    await openDialogAndResolve(`codex resume ${CODEX_V7}`)
+    expect(mockResolve).toHaveBeenCalledWith(`codex resume ${CODEX_V7}`)
+    expectResumedTab(store, { provider: 'codex', sessionId: CODEX_V7, cwd: '/home/u/proj' })
+  })
+
+  it('quoted claude --resume with picker set to codex → evidence wins → CLAUDE tab + note', async () => {
+    mockResolve.mockResolvedValue(response({
+      agentHint: { provider: 'claude', source: 'command' },
+      matches: [claudeMatch()],
+    }))
+    const { store } = renderApp()
+    fireEvent.click(screen.getByTestId('sidebar-resume-button'))
+    fireEvent.change(screen.getByLabelText(/agent/i), { target: { value: 'codex' } })
+    const input = screen.getByLabelText(/resume string/i)
+    fireEvent.change(input, { target: { value: `"claude --resume ${CLAUDE_V4}"` } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    expect(dialog().getByRole('status')).toHaveTextContent(/found in claude/i)
+    expectResumedTab(store, { provider: 'claude', sessionId: CLAUDE_V4, cwd: '/home/u/proj' })
   })
 
   it('bare ses_ id with picker set to claude → evidence wins → opencode resume + note', async () => {
@@ -2228,7 +2604,7 @@ describe('resume button end-to-end flows (spec acceptance)', () => {
       matchedToken: 'ses_root0000000000000000000000',
     }
     mockResolve.mockResolvedValue(response({ tokens: [ocMatch.sessionId], matches: [ocMatch] }))
-    const store = renderApp()
+    const { store } = renderApp()
     fireEvent.click(screen.getByTestId('sidebar-resume-button'))
     fireEvent.change(screen.getByLabelText(/agent/i), { target: { value: 'claude' } })
     const input = screen.getByLabelText(/resume string/i)
@@ -2236,30 +2612,31 @@ describe('resume button end-to-end flows (spec acceptance)', () => {
     fireEvent.keyDown(input, { key: 'Enter' })
     await act(async () => { await Promise.resolve(); await Promise.resolve() })
     expect(dialog().getByRole('status')).toHaveTextContent(/found in opencode/i)
-    expect(store.getState().tabs.tabs).toHaveLength(1)
+    // Evidence wins over the picker: the opened tab must be the OPENCODE tuple.
+    expectResumedTab(store, { provider: 'opencode', sessionId: ocMatch.sessionId, cwd: '/home/u/oc' })
   })
 
-  it('prefix 417e8345 resolves to the amplifier session', async () => {
+  it('prefix 417e8345 resolves to the amplifier session (FULL id, amplifier tuple)', async () => {
     mockResolve.mockResolvedValue(response({
       tokens: ['417e8345'],
       matches: [{ ...claudeMatch(), provider: 'amplifier' as const, sessionId: AMPLIFIER_FULL, sessionType: 'amplifier', matchType: 'prefix' as const, matchedToken: '417e8345' }],
     }))
-    const store = renderApp()
+    const { store } = renderApp()
     await openDialogAndResolve('417e8345')
-    expect(store.getState().tabs.tabs).toHaveLength(1)
+    expectResumedTab(store, { provider: 'amplifier', sessionId: AMPLIFIER_FULL, cwd: '/home/u/proj' })
   })
 
   it('session already open in a pane → focuses it, no duplicate tab', async () => {
     mockResolve.mockResolvedValue(response({ matches: [claudeMatch()] }))
-    const store = renderApp()
+    const { store } = renderApp()
     await openDialogAndResolve(CLAUDE_V4)
-    expect(store.getState().tabs.tabs).toHaveLength(1)
+    expectResumedTab(store, { provider: 'claude', sessionId: CLAUDE_V4 })
     const firstTabId = store.getState().tabs.tabs[0].id
     // Resume the SAME session again.
     cleanup()
     render(
       <Provider store={store}>
-        <Sidebar view="terminal" onNavigate={vi.fn()} />
+        <Sidebar view="tabs" onNavigate={vi.fn()} />
       </Provider>,
     )
     await openDialogAndResolve(CLAUDE_V4)
@@ -2270,7 +2647,7 @@ describe('resume button end-to-end flows (spec acceptance)', () => {
 
   it('garbage with no id-like token → inline error, NO tab created', async () => {
     mockResolve.mockResolvedValue(response({ tokens: [], matches: [] }))
-    const store = renderApp()
+    const { store } = renderApp()
     await openDialogAndResolve('garbage text with no ids')
     expect(dialog().getByRole('alert')).toHaveTextContent(/no session id/i)
     expect(store.getState().tabs.tabs).toHaveLength(0)
@@ -2278,7 +2655,7 @@ describe('resume button end-to-end flows (spec acceptance)', () => {
 
   it('valid id while index warming → retry state, no error, NO tab', async () => {
     mockResolve.mockResolvedValue(response({ indexState: 'warming', matches: [] }))
-    const store = renderApp()
+    const { store } = renderApp()
     await openDialogAndResolve(CLAUDE_V4)
     expect(dialog().queryByRole('alert')).toBeNull()
     expect(dialog().getByRole('status')).toHaveTextContent(/warming/i)
