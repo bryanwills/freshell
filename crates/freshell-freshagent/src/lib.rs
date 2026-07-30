@@ -48,10 +48,12 @@ pub mod spawn_gate;
 pub mod terminal_tabs;
 
 pub use claude::FreshClaudeState;
-// Kata 09v1: the ONE claude_snapshot item visible outside this crate — the
-// raw-file existence check freshell-server's IndexExistenceProbe shares with
-// the attach arm. Keep the rest of claude_snapshot crate-private.
-pub use claude_snapshot::locate_transcript;
+// Kata 09v1 + SYNC-06: the TWO claude_snapshot items visible outside this
+// crate — the raw-file existence check freshell-server's IndexExistenceProbe
+// shares with the attach arm, and the original-cwd reader the resume-resolve
+// claude fallback pairs with it (`claude-transcript-locator.ts` parity).
+// Keep the rest of claude_snapshot crate-private.
+pub use claude_snapshot::{locate_transcript, transcript_cwd};
 pub use codex::FreshCodexState;
 pub use identity_sink::{
     FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink, SharedPaneIdentitySink,
