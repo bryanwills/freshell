@@ -3,6 +3,12 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 import express, { type Express } from 'express'
 import request from 'supertest'
 import { createSessionsRouter } from '../../../server/sessions-router.js'
+import {
+  buildResolveFallbacks,
+  FALLBACK_BUDGET_PER_REQUEST,
+  type ResolveFallbacks,
+} from '../../../server/coding-cli/resolve-fallbacks.js'
+import type { CodingCliProvider } from '../../../server/coding-cli/provider.js'
 import type { ProjectGroup } from '../../../server/coding-cli/types.js'
 
 const CLAUDE_ID = 'ed2afda6-a340-443e-ba60-024a1b3554b4'
@@ -67,17 +73,12 @@ function fixtureProjects(): ProjectGroup[] {
 interface HarnessOptions {
   projects?: ProjectGroup[]
   ready?: boolean
-  resolveOpencodeSessionIds?: (
-    ids: readonly string[],
-  ) => Promise<{
-    rootsBySessionId: Map<string, string>
-    directoriesBySessionId?: Map<string, string>
-    unresolvedSessionIds: Set<string>
-  }>
-  locateClaudeTranscript?: (
-    id: string,
-  ) => Promise<{ sessionId: string; sourceFile: string; cwd?: string } | null>
+  resolveFallbacks?: ResolveFallbacks
 }
+
+const opencodeStub = () =>
+  ({ name: 'opencode', getDatabasePath: () => '/tmp/x.db' }) as unknown as CodingCliProvider
+const claudeStub = () => ({ name: 'claude' }) as unknown as CodingCliProvider
 
 function buildApp(options: HarnessOptions = {}): Express {
   const app = express()
@@ -98,8 +99,7 @@ function buildApp(options: HarnessOptions = {}): Express {
       perfConfig: { slowSessionRefreshMs: 500 },
       terminalMetadata: { list: () => [] },
       getIndexReadiness: () => options.ready ?? true,
-      resolveOpencodeSessionIds: options.resolveOpencodeSessionIds,
-      locateClaudeTranscript: options.locateClaudeTranscript,
+      resolveFallbacks: options.resolveFallbacks,
     }),
   )
   return app
@@ -212,24 +212,31 @@ describe('POST /api/sessions/resolve', () => {
     expect(res.body).toMatchObject({ status: 'warming', matches: [] })
   })
 
-  it('falls back to the opencode by-id query on exact-id index miss (with the row directory as cwd)', async () => {
+  it('falls back to the off-thread opencode by-id lookup on exact-id index miss (row directory as cwd)', async () => {
     const unknown = 'ses_child000000000000000000000'
+    const runOpencodeById = vi.fn().mockResolvedValue({
+      sessionId: unknown,
+      cwd: '/repo/beta',
+      title: 'child session',
+      createdAt: 1,
+      lastActivityAt: 2,
+      projectPath: '/repo/beta',
+    })
     const res = await post(
       buildApp({
-        resolveOpencodeSessionIds: vi.fn().mockResolvedValue({
-          rootsBySessionId: new Map([[unknown, OPENCODE_ID]]),
-          directoriesBySessionId: new Map([[unknown, '/repo/beta']]),
-          unresolvedSessionIds: new Set<string>(),
-        }),
+        resolveFallbacks: buildResolveFallbacks([opencodeStub()], { runOpencodeById }),
       }),
       { input: unknown },
     )
+    expect(runOpencodeById).toHaveBeenCalledWith('/tmp/x.db', unknown)
     expect(res.body.matches).toEqual([
       {
         provider: 'opencode',
         sessionId: unknown,
         cwd: '/repo/beta',
         sessionType: 'opencode',
+        title: 'child session',
+        lastActivityAt: 2,
         matchKind: 'exact',
       },
     ])
@@ -239,10 +246,12 @@ describe('POST /api/sessions/resolve', () => {
     const unknown = 'aaaaaaaa-1111-4222-8333-444444444444'
     const res = await post(
       buildApp({
-        locateClaudeTranscript: vi.fn().mockResolvedValue({
-          sessionId: unknown,
-          sourceFile: `/home/u/.claude/projects/x/${unknown}.jsonl`,
-          cwd: '/repo/gamma',
+        resolveFallbacks: buildResolveFallbacks([claudeStub()], {
+          locateClaudeTranscript: vi.fn().mockResolvedValue({
+            sessionId: unknown,
+            sourceFile: `/home/u/.claude/projects/x/${unknown}.jsonl`,
+            cwd: '/repo/gamma',
+          }),
         }),
       }),
       { input: unknown },
@@ -256,6 +265,45 @@ describe('POST /api/sessions/resolve', () => {
         matchKind: 'exact',
       },
     ])
+  })
+
+  it('shape-gates the opencode fallback: a short ses_ token never touches the DB path', async () => {
+    const runOpencodeById = vi.fn().mockResolvedValue(null)
+    const res = await post(
+      buildApp({
+        resolveFallbacks: buildResolveFallbacks([opencodeStub()], { runOpencodeById }),
+      }),
+      { input: 'ses_short123' },
+    )
+    expect(res.body).toMatchObject({ status: 'ready', matches: [] })
+    expect(runOpencodeById).not.toHaveBeenCalled()
+  })
+
+  it('caps opencode by-id fallback work per request, with a FRESH budget on the next request', async () => {
+    const runOpencodeById = vi.fn().mockResolvedValue(null)
+    const app2 = buildApp({
+      resolveFallbacks: buildResolveFallbacks([opencodeStub()], { runOpencodeById }),
+    })
+    const ids = ['a', 'b', 'c'].map((c) => `ses_${c.repeat(26)}`)
+    const input = ids.join(' ')
+    const first = await post(app2, { input })
+    expect(first.body.matches).toEqual([])
+    expect(runOpencodeById).toHaveBeenCalledTimes(FALLBACK_BUDGET_PER_REQUEST)
+    // The budget is per-request, not per-server: a second request gets its own.
+    await post(app2, { input })
+    expect(runOpencodeById).toHaveBeenCalledTimes(FALLBACK_BUDGET_PER_REQUEST * 2)
+  })
+
+  it('a failing opencode by-id lookup (locked DB) never fails the request', async () => {
+    const runOpencodeById = vi.fn().mockRejectedValue(new Error('database is locked'))
+    const res = await post(
+      buildApp({
+        resolveFallbacks: buildResolveFallbacks([opencodeStub()], { runOpencodeById }),
+      }),
+      { input: 'ses_child000000000000000000000' },
+    )
+    expect(res.status).toBe(200)
+    expect(res.body).toMatchObject({ status: 'ready', matches: [] })
   })
 
   it('returns ready + empty matches for garbage input with no id-like token', async () => {

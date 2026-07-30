@@ -77,7 +77,8 @@ export class OpencodeProvider implements CodingCliProvider {
     this.queryRunner = options.queryRunner ?? createWorkerListingRunner()
   }
 
-  private getDatabasePath(): string {
+  /** Public: resolve-fallbacks builds the off-thread by-id lookup from this path. */
+  getDatabasePath(): string {
     return path.join(this.homeDir, 'opencode.db')
   }
 

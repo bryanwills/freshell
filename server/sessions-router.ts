@@ -21,7 +21,7 @@ import {
 import { querySessionDirectory } from './session-directory/service.js'
 import { ResumeResolveRequestSchema } from '../shared/resume-resolve-contract.js'
 import { resolveResumeInput } from './coding-cli/resolve-session.js'
-import type { ClaudeTranscriptHit } from './coding-cli/claude-transcript-locator.js'
+import type { ResolveFallbacks } from './coding-cli/resolve-fallbacks.js'
 import { createRequestAbortSignal } from './read-models/request-abort.js'
 import {
   defaultReadModelScheduler,
@@ -60,12 +60,8 @@ export interface SessionsRouterDeps {
   readModelScheduler?: ReadModelWorkScheduler
   /** Global index readiness (startup-state codingCliIndexer task). Defaults to ready. */
   getIndexReadiness?: () => boolean
-  /** Opencode by-id sqlite fallback (OpencodeProvider.resolveOpencodeSessionRoots). */
-  resolveOpencodeSessionIds?: (
-    ids: readonly string[],
-  ) => Promise<{ rootsBySessionId: Map<string, string>; unresolvedSessionIds: Set<string> }>
-  /** Claude transcript exact-id fallback. */
-  locateClaudeTranscript?: (sessionId: string) => Promise<ClaudeTranscriptHit | null>
+  /** Exact-id resolve fallbacks (buildResolveFallbacks); budget applied per request. */
+  resolveFallbacks?: ResolveFallbacks
 }
 
 export function createSessionsRouter(deps: SessionsRouterDeps): Router {
@@ -250,8 +246,7 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
     const response = await resolveResumeInput(parsed.data.input, {
       getProjects: () => deps.codingCliIndexer.getProjects(),
       isIndexReady: deps.getIndexReadiness ?? (() => true),
-      resolveOpencodeSessionIds: deps.resolveOpencodeSessionIds,
-      locateClaudeTranscript: deps.locateClaudeTranscript,
+      fallbacks: deps.resolveFallbacks,
     })
     res.json(response)
   })

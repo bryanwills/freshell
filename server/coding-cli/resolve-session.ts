@@ -4,21 +4,21 @@ import type {
   ResumeResolveResponse,
 } from '../../shared/resume-resolve-contract.js'
 import type { CodingCliSession, ProjectGroup } from './types.js'
-import type { ClaudeTranscriptHit } from './claude-transcript-locator.js'
+import { withRequestBudget, type ResolveFallbacks } from './resolve-fallbacks.js'
+import { logger } from '../logger.js'
 
 export const RESOLVE_MATCH_CAP = 20
+
+const log = logger.child({ component: 'resolve-session' })
 
 export interface ResolveResumeDeps {
   getProjects: () => ProjectGroup[]
   isIndexReady: () => boolean
-  resolveOpencodeSessionIds?: (
-    ids: readonly string[],
-  ) => Promise<{
-    rootsBySessionId: Map<string, string>
-    directoriesBySessionId?: Map<string, string>
-    unresolvedSessionIds: Set<string>
-  }>
-  locateClaudeTranscript?: (sessionId: string) => Promise<ClaudeTranscriptHit | null>
+  /**
+   * Exact-id fallbacks (buildResolveFallbacks). Shape-gated and budget-capped
+   * PER REQUEST here; the opencode lookup runs off the event loop.
+   */
+  fallbacks?: ResolveFallbacks
 }
 
 export async function resolveResumeInput(
@@ -55,50 +55,30 @@ export async function resolveResumeInput(
   }
 
   // Exact-id fallbacks for sessions the index cannot see (opencode child
-  // sessions; cwd-less claude transcripts skipped on cold start).
-  for (const candidate of candidates) {
-    if (
-      candidate.kind === 'prefixed-id' &&
-      candidate.token.startsWith('ses_') &&
-      deps.resolveOpencodeSessionIds
-    ) {
-      const resolution = await deps.resolveOpencodeSessionIds([candidate.token])
-      if (!resolution.unresolvedSessionIds.has(candidate.token)) {
-        return {
-          status: 'ready',
-          matches: [
-            {
-              provider: 'opencode',
-              sessionId: candidate.token,
-              // opencode resumes in the SPAWN cwd, not the session's stored
-              // project dir — a cwd-less match would run the agent in the
-              // wrong directory. The sqlite row's NOT NULL `directory`
-              // column always supplies it.
-              cwd: resolution.directoriesBySessionId?.get(candidate.token),
-              sessionType: 'opencode',
-              matchKind: 'exact',
-            },
-          ],
-          hint,
+  // sessions; cwd-less claude transcripts skipped on cold start). Full-id
+  // shape gates make wrong-shape tokens free no-ops, the per-request budget
+  // bounds the real work a pasted blob can trigger, and the opencode lookup
+  // runs OFF the event loop (worker thread) — a locked DB can never stall
+  // the server.
+  if (deps.fallbacks) {
+    const fallbacks = withRequestBudget(deps.fallbacks)
+    for (const candidate of candidates) {
+      for (const fallback of [fallbacks.opencodeSessionById, fallbacks.claudeTranscriptById]) {
+        if (!fallback) continue
+        let match: ResumeResolveMatch | null = null
+        try {
+          match = await fallback(candidate.token)
+        } catch (err) {
+          // Provider failure ≠ not found, but the contract has no degraded
+          // channel yet (follow-up work). Log and keep resolving — never
+          // reject: an async express 4 handler would surface that as an
+          // unhandled rejection, not a response.
+          log.warn(
+            { candidateKind: candidate.kind, error: err instanceof Error ? err.message : String(err) },
+            'Resume resolve exact-id fallback failed',
+          )
         }
-      }
-    }
-    if (candidate.kind === 'uuid' && deps.locateClaudeTranscript) {
-      const hit = await deps.locateClaudeTranscript(candidate.token)
-      if (hit) {
-        return {
-          status: 'ready',
-          matches: [
-            {
-              provider: 'claude',
-              sessionId: hit.sessionId,
-              cwd: hit.cwd,
-              sessionType: 'claude',
-              matchKind: 'exact',
-            },
-          ],
-          hint,
-        }
+        if (match) return { status: 'ready', matches: [match], hint }
       }
     }
   }
