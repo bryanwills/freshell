@@ -59,10 +59,10 @@ use freshell_platform::{
     RealFileProbe, ShellType,
 };
 use freshell_protocol::{
-    ClientMessage, ErrorCode, ErrorMsg, Pong, ServerMessage, SessionLocator, Shell, TerminalAttach,
-    TerminalCreate, TerminalCreated, TerminalIdOnly, TerminalInputBlocked,
-    TerminalInputBlockedReason, TerminalKill, TerminalMetaRecord, TerminalMetaUpdated,
-    TerminalResize,
+    AgentRestartFailed, AgentRestartFailureCode, ClientMessage, ErrorCode, ErrorMsg, Pong,
+    RuntimeDescriptor, ServerMessage, SessionLocator, Shell, TerminalAttach, TerminalCreate,
+    TerminalCreated, TerminalIdOnly, TerminalInputBlocked, TerminalInputBlockedReason,
+    TerminalKill, TerminalMetaRecord, TerminalMetaUpdated, TerminalResize,
 };
 use freshell_terminal::{build_child_env_from_process, FrameSink};
 
@@ -713,7 +713,23 @@ async fn handle_client_text(
                     session_id = %request.session_id,
                     "agent.restart.rejected_unnegotiated"
                 );
-                return true;
+                return send(
+                    ws_tx,
+                    &ServerMessage::AgentRestartFailed(AgentRestartFailed {
+                        request_id: request.request_id,
+                        provider: request.provider,
+                        session_id: request.session_id,
+                        kind: request.kind,
+                        runtime: RuntimeDescriptor {
+                            runtime_id: request.live_id,
+                            generation: request.expected_generation,
+                        },
+                        code: AgentRestartFailureCode::CapabilityNotNegotiated,
+                        message: "agent restart was not negotiated for this connection".into(),
+                        retryable: false,
+                    }),
+                )
+                .await;
             }
             let restart = state.restart.clone();
             let broadcast_tx = Arc::clone(&state.broadcast_tx);

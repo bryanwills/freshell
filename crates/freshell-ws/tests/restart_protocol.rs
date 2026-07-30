@@ -1564,7 +1564,7 @@ async fn connected_websocket_dispatches_restart_started_replaced_and_failed() {
 }
 
 #[tokio::test]
-async fn v7_connection_without_restart_negotiation_cannot_start_a_transaction() {
+async fn v7_connection_without_restart_negotiation_receives_a_correlated_failure() {
     let (url, registry, state) = common::spawn_server_with_specs_and_state(vec![]).await;
     let runtime = Arc::new(FakeRuntime::resumable("must-not-start"));
     let _runtime_registration = state.restart.set_runtime(runtime.clone());
@@ -1584,15 +1584,12 @@ async fn v7_connection_without_restart_negotiation_cannot_start_a_transaction() 
     .await
     .unwrap();
 
-    assert!(
-        tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            common::next_frame_of_type(&mut ws, "agent.restart.started",)
-        )
-        .await
-        .is_err(),
-        "an older-v7-shaped ready frame must not authorize agent.restart"
-    );
+    let failed = common::next_frame_of_type(&mut ws, "agent.restart.failed").await;
+    assert_eq!(failed["requestId"], "unnegotiated-r1");
+    assert_eq!(failed["runtimeId"], "term-unnegotiated");
+    assert_eq!(failed["generation"], 1);
+    assert_eq!(failed["code"], "CAPABILITY_NOT_NEGOTIATED");
+    assert_eq!(failed["retryable"], false);
     assert_eq!(runtime.shutdowns.load(Ordering::SeqCst), 0);
     registry.kill_all();
 }

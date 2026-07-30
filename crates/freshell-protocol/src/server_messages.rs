@@ -270,6 +270,9 @@ pub enum TerminalRunStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AgentRestartFailureCode {
+    /// The connection did not negotiate `agentRestartV1`, so the server did
+    /// not begin a restart transaction.
+    CapabilityNotNegotiated,
     Unresumable,
     RuntimeNotFound,
     StaleGeneration,
