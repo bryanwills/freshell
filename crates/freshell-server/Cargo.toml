@@ -111,3 +111,4 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # use, `crates/freshell-ws/Cargo.toml`) — no mock, the actual wire protocol.
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
+async-trait = "0.1"

@@ -664,16 +664,20 @@ async fn main() -> ExitCode {
         freshell_ws::restart::ProductionRestartRuntime::new(ws_state.clone()),
     ));
     {
+        let session_index = session_index.clone();
         let restart = restart.clone();
         let broadcast_tx = Arc::clone(&broadcast_tx);
         tokio::spawn(async move {
-            restart
-                .recover_pending_registered(|message| {
-                    if let Ok(frame) = serde_json::to_string(message) {
-                        let _ = broadcast_tx.send(frame);
-                    }
-                })
-                .await;
+            warm_initial_session_index_then(session_index, || async move {
+                restart
+                    .recover_pending_registered(|message| {
+                        if let Ok(frame) = serde_json::to_string(message) {
+                            let _ = broadcast_tx.send(frame);
+                        }
+                    })
+                    .await;
+            })
+            .await;
         });
     }
 
@@ -813,27 +817,12 @@ async fn main() -> ExitCode {
     // the coding-CLI sessions from the isolated home's provider transcript dirs,
     // reusing `freshell-sessions` parsers. Replaces the earlier empty-page stub.
     //
-    // Warm the cache in the background so the first real request never pays
-    // the cold full-sweep cost. The scan itself runs in `spawn_blocking`
-    // (inside `SessionIndex::snapshot`), so this never delays serving other
-    // requests while it's in flight.
+    // The boot recovery task above warms the cache before recovering stopped
+    // restart transactions, so the first real request does not pay the cold
+    // full-sweep cost and recovery never mistakes a cold index for missing
+    // durable state. The scan itself runs in `spawn_blocking` (inside
+    // `SessionIndex::snapshot`), so serving remains unblocked while it runs.
     if let Some(index) = &session_index {
-        let warm_index = Arc::clone(index);
-        // DIAG-01: log the initial warm sweep's count + duration (an
-        // equivalent call to `index.warm()`'s own body -- `snapshot()` is
-        // what `warm()` calls internally -- but keeping the return value
-        // here lets this main.rs-scoped call site report a real count
-        // instead of discarding it).
-        tokio::spawn(async move {
-            let start = std::time::Instant::now();
-            let items = warm_index.snapshot().await;
-            tracing::info!(
-                event = "session_index_warm",
-                count = items.len(),
-                duration_ms = start.elapsed().as_millis() as u64,
-                "session index warm sweep complete"
-            );
-        });
         // SESSION-09: start the periodic sessions.changed sweep -- see
         // `spawn_sessions_sweep`'s doc comment for the full parity rationale.
         // `ws_state` is Clone (cheap: every field is an Arc/primitive), so
@@ -1626,6 +1615,35 @@ fn resolve_client_dir() -> PathBuf {
     PathBuf::from("dist/client")
 }
 
+/// Publish the first session-index snapshot before running boot work whose
+/// preflight treats a cold index as retryable `Unknown`.
+///
+/// The callback still runs when no provider home resolved (and therefore no
+/// index exists), preserving the previous no-index recovery behavior. In the
+/// normal production path, however, an already-stopped pending restart gets
+/// one deterministic recovery attempt against disk truth instead of depending
+/// on a surviving client to resend after the background warm happens to finish.
+async fn warm_initial_session_index_then<F, Fut>(
+    session_index: Option<Arc<freshell_sessions::directory_index::SessionIndex>>,
+    after_warm: F,
+) where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    if let Some(index) = session_index {
+        // DIAG-01: preserve the initial warm sweep's count + duration.
+        let start = std::time::Instant::now();
+        let items = index.snapshot().await;
+        tracing::info!(
+            event = "session_index_warm",
+            count = items.len(),
+            duration_ms = start.elapsed().as_millis() as u64,
+            "session index warm sweep complete"
+        );
+    }
+    after_warm().await;
+}
+
 /// SESSION-09 sweep cadence: >= `SessionIndex`'s own TTL (`DEFAULT_TTL`, 1s)
 /// so every tick's `snapshot()` call re-validates the on-disk corpus rather
 /// than reading a stale cached snapshot. See [`spawn_sessions_sweep`]'s doc
@@ -1824,8 +1842,14 @@ fn spawn_sessions_sweep(
 #[cfg(test)]
 mod sessions_sweep_tests {
     use super::*;
+    use freshell_protocol::{
+        AgentRestart, AgentRestartFailureCode, AgentRuntimeKind, ServerMessage,
+    };
     use freshell_sessions::directory_index::{
         ClaudeSource, IndexedSession, SessionIndex, SessionSource,
+    };
+    use freshell_ws::restart::{
+        RestartCoordinator, RestartFailure, RestartRuntime, RuntimeLocator,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1999,6 +2023,139 @@ mod sessions_sweep_tests {
             after, before,
             "signature should change after a new, later-activity session file appears (before={before:?}, after={after:?})"
         );
+
+        std::fs::remove_dir_all(claude_home.parent().unwrap()).ok();
+    }
+
+    struct PendingUntilColdIndexWarms {
+        index: Arc<SessionIndex>,
+        recovery_attempts: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl RestartRuntime for PendingUntilColdIndexWarms {
+        type ResumePlan = ();
+
+        async fn preflight(
+            &self,
+            _request: &AgentRestart,
+        ) -> Result<Self::ResumePlan, RestartFailure> {
+            Ok(())
+        }
+
+        async fn shutdown_for_restart(
+            &self,
+            _request: &AgentRestart,
+            _plan: &Self::ResumePlan,
+        ) -> Result<(), RestartFailure> {
+            Ok(())
+        }
+
+        async fn create_replacement(
+            &self,
+            _request: &AgentRestart,
+            _plan: Self::ResumePlan,
+        ) -> Result<String, RestartFailure> {
+            Err(RestartFailure::new(
+                AgentRestartFailureCode::ReplacementFailed,
+                "server stopped after teardown",
+                true,
+            ))
+        }
+
+        async fn recover_replacement(
+            &self,
+            request: &AgentRestart,
+            _context: Option<&freshell_ws::restart::RestartResumeContext>,
+        ) -> Result<String, RestartFailure> {
+            self.recovery_attempts.fetch_add(1, Ordering::SeqCst);
+            let ready = self.index.peek().is_some_and(|items| {
+                items.iter().any(|item| {
+                    item.provider == request.provider && item.session_id == request.session_id
+                })
+            });
+            if ready {
+                Ok("term-after-cold-index".to_string())
+            } else {
+                Err(RestartFailure::new(
+                    AgentRestartFailureCode::PreflightFailed,
+                    "session index is still warming; retry restart shortly",
+                    true,
+                ))
+            }
+        }
+    }
+
+    /// Regression: production boot must publish the first real disk snapshot
+    /// before it asks the registered adapter to recover an already-stopped
+    /// runtime. Otherwise the honest cold-index `Unknown` becomes one
+    /// retryable failure with no client left to resend the request.
+    #[tokio::test]
+    async fn cold_index_warms_before_pending_restart_recovery() {
+        let claude_home = unique_temp_dir("restart-cold-index").join(".claude");
+        let session_id = "66666666-6666-4666-8666-666666666666";
+        write_claude_session(
+            &claude_home,
+            session_id,
+            "/tmp/restart-cold-index",
+            "2026-07-29T00:00:00.000Z",
+        );
+        let index = Arc::new(SessionIndex::new(vec![
+            Arc::new(ClaudeSource::new(claude_home.clone())) as Arc<dyn SessionSource>,
+        ]));
+        assert!(index.peek().is_none(), "regression requires a cold index");
+
+        let request = AgentRestart {
+            request_id: "boot-cold-index-r1".to_string(),
+            provider: "claude".to_string(),
+            session_id: session_id.to_string(),
+            kind: AgentRuntimeKind::Terminal,
+            live_id: "term-before-restart".to_string(),
+            expected_generation: 1,
+        };
+        let runtime = Arc::new(PendingUntilColdIndexWarms {
+            index: Arc::clone(&index),
+            recovery_attempts: AtomicUsize::new(0),
+        });
+        let restart_state_path = claude_home.parent().unwrap().join("restart-state.json");
+        let coordinator = RestartCoordinator::new_persistent(restart_state_path.clone()).unwrap();
+        coordinator.register_initial(
+            RuntimeLocator::new(
+                AgentRuntimeKind::Terminal,
+                request.provider.clone(),
+                request.session_id.clone(),
+            ),
+            &request.live_id,
+        );
+        coordinator.execute(request.clone(), runtime.as_ref()).await;
+        assert_eq!(coordinator.pending_recoveries().len(), 1);
+        drop(coordinator);
+
+        let coordinator = RestartCoordinator::new_persistent(restart_state_path).unwrap();
+        assert_eq!(
+            coordinator.pending_recoveries().len(),
+            1,
+            "the stopped runtime must still be pending after coordinator reopen"
+        );
+        let _registration = coordinator.set_runtime(runtime.clone());
+        let emitted = std::sync::Mutex::new(Vec::new());
+
+        warm_initial_session_index_then(Some(Arc::clone(&index)), || async {
+            coordinator
+                .recover_pending_registered(|message| {
+                    emitted.lock().unwrap().push(message.clone());
+                })
+                .await;
+        })
+        .await;
+
+        assert_eq!(runtime.recovery_attempts.load(Ordering::SeqCst), 1);
+        assert!(coordinator.pending_recoveries().is_empty());
+        assert!(matches!(
+            emitted.lock().unwrap().last(),
+            Some(ServerMessage::AgentRestartReplaced(replaced))
+                if replaced.runtime.runtime_id == "term-after-cold-index"
+        ));
 
         std::fs::remove_dir_all(claude_home.parent().unwrap()).ok();
     }
