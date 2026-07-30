@@ -543,9 +543,18 @@ export const claudeProvider: CodingCliProvider = {
     let projectDirs: string[] = []
     try {
       projectDirs = (await fsp.readdir(projectsDir)).map((name) => path.join(projectsDir, name))
-    } catch {
-      return []
+    } catch (err) {
+      // Root-level ABSENCE is a legitimate empty result; any OTHER root error
+      // (EACCES/EIO/EMFILE, ...) must REJECT so the indexer records a scan
+      // failure — a provider outage must never read as "no sessions".
+      const code = (err as NodeJS.ErrnoException | null)?.code
+      if (code === 'ENOENT' || code === 'ENOTDIR') return []
+      throw err
     }
+
+    // ACCEPTED LIMITATION: per-subdirectory/per-file errors deeper in the tree
+    // are best-effort skips (partial results beat none); only the root-level
+    // enumeration above distinguishes failure from absence.
 
     const files: string[] = []
     for (const projectDir of projectDirs) {

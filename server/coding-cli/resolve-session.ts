@@ -1,10 +1,12 @@
 import { parseResumeInput } from '../../shared/resume-input-parser.js'
 import type {
+  ResumeResolveHint,
   ResumeResolveMatch,
-  ResumeResolveResponse,
+  ResumeResolveProviderError,
 } from '../../shared/resume-resolve-contract.js'
 import type { CodingCliSession, ProjectGroup } from './types.js'
-import { withRequestBudget, type ResolveFallbacks } from './resolve-fallbacks.js'
+import { withRequestBudget, type ExactIdFallback, type ResolveFallbacks } from './resolve-fallbacks.js'
+import { ClaudeTranscriptLocatorError } from './claude-transcript-locator.js'
 import { logger } from '../logger.js'
 
 export const RESOLVE_MATCH_CAP = 20
@@ -19,6 +21,25 @@ export interface ResolveResumeDeps {
    * PER REQUEST here; the opencode lookup runs off the event loop.
    */
   fallbacks?: ResolveFallbacks
+}
+
+/**
+ * Resolve pipeline result. providerErrors carries fallback failures only
+ * (provider unavailable ≠ not found); the route merges in indexer scan
+ * failures and adds unsearchedProviders/homeDir before responding.
+ */
+export interface ResolveResumeResult {
+  status: 'ready' | 'warming' | 'degraded'
+  matches: ResumeResolveMatch[]
+  hint: ResumeResolveHint | null
+  providerErrors: ResumeResolveProviderError[]
+}
+
+/** Errno code for a provider-error summary: typed locator errors carry it in .code. */
+function errnoCodeOf(err: unknown): string | undefined {
+  if (err instanceof ClaudeTranscriptLocatorError) return err.code
+  const code = (err as NodeJS.ErrnoException | null)?.code
+  return typeof code === 'string' ? code : undefined
 }
 
 /**
@@ -51,14 +72,14 @@ function isCaseInsensitiveToken(token: string): boolean {
 export async function resolveResumeInput(
   input: string,
   deps: ResolveResumeDeps,
-): Promise<ResumeResolveResponse> {
+): Promise<ResolveResumeResult> {
   const { candidates, hint } = parseResumeInput(input)
 
   if (!deps.isIndexReady()) {
-    return { status: 'warming', matches: [], hint }
+    return { status: 'warming', matches: [], hint, providerErrors: [] }
   }
   if (candidates.length === 0) {
-    return { status: 'ready', matches: [], hint }
+    return { status: 'ready', matches: [], hint, providerErrors: [] }
   }
 
   const sessions = deps.getProjects().flatMap((group) => group.sessions)
@@ -70,9 +91,21 @@ export async function resolveResumeInput(
   // can never stall the server.
   const fallbacks = deps.fallbacks ? withRequestBudget(deps.fallbacks) : undefined
 
-  const finish = (matches: ResumeResolveMatch[]): ResumeResolveResponse => {
+  // Provider failure ≠ not found: a throwing fallback records a per-provider
+  // error summary while resolution CONTINUES (prefix/later tokens). Any entry
+  // here makes the result 'degraded' — even with matches, because a failed
+  // HIGHER-priority exact search may have hidden the right session.
+  const errorsByProvider = new Map<string, ResumeResolveProviderError>()
+
+  const finish = (matches: ResumeResolveMatch[]): ResolveResumeResult => {
     matches.sort((a, b) => (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0))
-    return { status: 'ready', matches: dedupe(matches).slice(0, RESOLVE_MATCH_CAP), hint }
+    const providerErrors = [...errorsByProvider.values()]
+    return {
+      status: providerErrors.length > 0 ? 'degraded' : 'ready',
+      matches: dedupe(matches).slice(0, RESOLVE_MATCH_CAP),
+      hint,
+      providerErrors,
+    }
   }
 
   for (const candidate of candidates) {
@@ -88,22 +121,34 @@ export async function resolveResumeInput(
 
     // 2. Exact-id fallbacks run BEFORE prefix matching. Cheap: the shape
     // gates inside withRequestBudget mean prefix-length tokens do no
-    // fallback work at all.
+    // fallback work at all. Iterated as [provider, fallback] PAIRS so a
+    // failure is attributed to the RIGHT provider (identity travels with
+    // the entry, never its position).
     if (fallbacks) {
       const hits: ResumeResolveMatch[] = []
-      for (const fallback of [fallbacks.claudeTranscriptById, fallbacks.opencodeSessionById]) {
+      const entries: Array<[string, ExactIdFallback | undefined]> = [
+        ['claude', fallbacks.claudeTranscriptById],
+        ['opencode', fallbacks.opencodeSessionById],
+      ]
+      for (const [provider, fallback] of entries) {
         if (!fallback) continue
         try {
           const match = await fallback(candidate.token)
           if (match) hits.push(match)
         } catch (err) {
-          // Provider failure ≠ not found, but the contract has no degraded
-          // channel yet (follow-up work: the provider-health lane). Log and
-          // keep resolving — never reject: an async express 4 handler would
-          // surface that as an unhandled rejection, not a response. Typed
-          // locator errors (ClaudeTranscriptLocatorError) arrive here intact.
+          // Never reject: an async express 4 handler would surface that as
+          // an unhandled rejection, not a response. Typed locator errors
+          // (ClaudeTranscriptLocatorError) arrive here intact — errno in .code.
+          const code = errnoCodeOf(err)
+          if (!errorsByProvider.has(provider)) {
+            errorsByProvider.set(provider, {
+              provider,
+              ...(code ? { code } : {}),
+              message: err instanceof Error ? err.message : String(err),
+            })
+          }
           log.warn(
-            { candidateKind: candidate.kind, error: err instanceof Error ? err.message : String(err) },
+            { provider, candidateKind: candidate.kind, error: err instanceof Error ? err.message : String(err) },
             'Resume resolve exact-id fallback failed',
           )
         }
@@ -121,7 +166,7 @@ export async function resolveResumeInput(
     }
   }
 
-  return { status: 'ready', matches: [], hint }
+  return finish([])
 }
 
 function toMatch(session: CodingCliSession, matchKind: 'exact' | 'prefix'): ResumeResolveMatch {

@@ -73,7 +73,14 @@ function fixtureProjects(): ProjectGroup[] {
 interface HarnessOptions {
   projects?: ProjectGroup[]
   ready?: boolean
+  /** Omit getIndexReadiness entirely (readiness comes from the indexer signal alone). */
+  omitStartupReadiness?: boolean
   resolveFallbacks?: ResolveFallbacks
+  settings?: Record<string, unknown>
+  indexerIsReady?: () => boolean
+  getScanFailures?: () => string[]
+  requestRefresh?: () => void
+  homeDir?: string
 }
 
 const opencodeStub = () =>
@@ -87,19 +94,23 @@ function buildApp(options: HarnessOptions = {}): Express {
     '/api',
     createSessionsRouter({
       configStore: {
-        getSettings: vi.fn().mockResolvedValue({}),
+        getSettings: vi.fn().mockResolvedValue(options.settings ?? {}),
         patchSessionOverride: vi.fn(),
         deleteSession: vi.fn(),
       },
       codingCliIndexer: {
         getProjects: () => options.projects ?? fixtureProjects(),
         refresh: vi.fn().mockResolvedValue(undefined),
+        isReady: options.indexerIsReady,
+        getScanFailures: options.getScanFailures,
+        requestRefresh: options.requestRefresh,
       },
       codingCliProviders: [],
       perfConfig: { slowSessionRefreshMs: 500 },
       terminalMetadata: { list: () => [] },
-      getIndexReadiness: () => options.ready ?? true,
+      getIndexReadiness: options.omitStartupReadiness ? undefined : () => options.ready ?? true,
       resolveFallbacks: options.resolveFallbacks,
+      homeDir: options.homeDir,
     }),
   )
   return app
@@ -294,7 +305,7 @@ describe('POST /api/sessions/resolve', () => {
     expect(runOpencodeById).toHaveBeenCalledTimes(FALLBACK_BUDGET_PER_REQUEST * 2)
   })
 
-  it('a failing opencode by-id lookup (locked DB) never fails the request', async () => {
+  it('a failing opencode by-id lookup (locked DB) never fails the request — it degrades with a provider error', async () => {
     const runOpencodeById = vi.fn().mockRejectedValue(new Error('database is locked'))
     const res = await post(
       buildApp({
@@ -303,7 +314,98 @@ describe('POST /api/sessions/resolve', () => {
       { input: 'ses_child000000000000000000000' },
     )
     expect(res.status).toBe(200)
-    expect(res.body).toMatchObject({ status: 'ready', matches: [] })
+    expect(res.body).toMatchObject({ status: 'degraded', matches: [] })
+    expect(res.body.providerErrors).toEqual([
+      { provider: 'opencode', message: 'database is locked' },
+    ])
+  })
+
+  it('reports degraded (NOT "not found") when a provider SCAN failed, even with no fallback error', async () => {
+    const res = await post(
+      buildApp({ projects: [], getScanFailures: () => ['codex'] }),
+      { input: CODEX_ID },
+    )
+    expect(res.status).toBe(200)
+    expect(res.body.status).toBe('degraded')
+    expect(res.body.providerErrors).toEqual([
+      { provider: 'codex', message: 'session scan failed' },
+    ])
+    expect(res.body.matches).toEqual([])
+  })
+
+  it('reports degraded EVEN WITH matches when a higher-priority exact-id fallback failed (client must not auto-resume)', async () => {
+    // Unindexed full claude UUID (fallback throws) + a second token that
+    // prefix-matches an indexed amplifier session: the match survives, but
+    // the response must be degraded so the client refuses to auto-resume.
+    const MISSING_V4 = 'ed2afda6-a340-443e-ba60-024a1b3554b9'
+    const res = await post(
+      buildApp({
+        resolveFallbacks: buildResolveFallbacks([claudeStub()], {
+          locateClaudeTranscript: vi.fn().mockRejectedValue(new Error('EACCES: permission denied')),
+        }),
+      }),
+      { input: `${MISSING_V4} 417e8345` },
+    )
+    expect(res.status).toBe(200)
+    expect(res.body.status).toBe('degraded')
+    expect(res.body.providerErrors.map((e: { provider: string }) => e.provider)).toEqual(['claude'])
+    expect(res.body.matches.length).toBeGreaterThan(0)
+    expect(res.body.matches[0].provider).toBe('amplifier')
+  })
+
+  it('a degraded response fire-and-forgets indexer.requestRefresh() so Retry can converge', async () => {
+    const requestRefresh = vi.fn()
+    await post(
+      buildApp({ projects: [], getScanFailures: () => ['codex'], requestRefresh }),
+      { input: CODEX_ID },
+    )
+    expect(requestRefresh).toHaveBeenCalled()
+  })
+
+  it('a scan failure for a DISABLED provider is excluded from providerErrors (unsearched, not degraded)', async () => {
+    const res = await post(
+      buildApp({
+        settings: { codingCli: { enabledProviders: ['claude'] } },
+        getScanFailures: () => ['codex'],
+      }),
+      { input: CLAUDE_ID },
+    )
+    expect(res.body.providerErrors).toEqual([])
+    expect(res.body.unsearchedProviders).toEqual(['codex', 'opencode', 'amplifier'])
+    expect(res.body.status).toBe('ready')
+  })
+
+  it('reports DISABLED providers as unsearched, never silently as absence', async () => {
+    const res = await post(
+      buildApp({ settings: { codingCli: { enabledProviders: ['claude', 'opencode'] } } }),
+      { input: CLAUDE_ID },
+    )
+    expect(res.body.unsearchedProviders).toEqual(['codex', 'amplifier'])
+  })
+
+  it('returns the server home directory so the client can prefill a concrete cwd', async () => {
+    const res = await post(buildApp({ homeDir: '/home/testuser' }), { input: CLAUDE_ID })
+    expect(res.body.homeDir).toBe('/home/testuser')
+  })
+
+  it("index readiness is startupState OR'd with the indexer signal: indexer-ready wins over a stuck-false startup task", async () => {
+    // startupState readiness can stick false forever (its markReady only runs
+    // in the start chain's success path); once the indexer has completed a
+    // refresh the endpoint must stop reporting warming.
+    const res = await post(
+      buildApp({ ready: false, indexerIsReady: () => true }),
+      { input: CLAUDE_ID },
+    )
+    expect(res.body.status).toBe('ready')
+    expect(res.body.matches).toHaveLength(1)
+  })
+
+  it('reports warming from the indexer signal alone when no startup readiness is wired', async () => {
+    const res = await post(
+      buildApp({ omitStartupReadiness: true, indexerIsReady: () => false }),
+      { input: CLAUDE_ID },
+    )
+    expect(res.body).toMatchObject({ status: 'warming', matches: [] })
   })
 
   it('returns ready + empty matches for garbage input with no id-like token', async () => {

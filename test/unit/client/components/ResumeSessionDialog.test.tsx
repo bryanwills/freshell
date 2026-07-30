@@ -31,6 +31,11 @@ const match = (overrides: Record<string, unknown> = {}) => ({
 const ok = (matches: unknown[], hint: unknown = null) =>
   Promise.resolve({ status: 'ready', matches, hint })
 
+const degraded = (
+  matches: unknown[],
+  providerErrors: unknown[] = [{ provider: 'opencode', message: 'database is locked' }],
+) => Promise.resolve({ status: 'degraded', matches, hint: null, providerErrors })
+
 function renderDialog() {
   const store = configureStore({
     reducer: { connection: () => ({ serverInstanceId: 'srv-1' }) },
@@ -265,6 +270,92 @@ describe('ResumeSessionDialog', () => {
     typeAndResolve(V7)
     await screen.findByTestId('resume-warming')
     expect(resumeSessionInTab).not.toHaveBeenCalled()
+  })
+
+  it('degraded (provider unavailable): explicit "could not be searched" state with details, NOT "no matching session"', async () => {
+    apiPost.mockReturnValue(degraded([], [
+      { provider: 'opencode', code: 'EACCES', message: 'database is locked' },
+    ]))
+    renderDialog()
+    typeAndResolve(SES)
+    const notice = await screen.findByTestId('resume-degraded')
+    expect(notice.textContent).toMatch(/could not be searched/i)
+    expect(notice.textContent).toContain('opencode')
+    expect(notice.textContent).toContain('EACCES')
+    expect(screen.queryByTestId('resume-error')).toBeNull()
+    expect(resumeSessionInTab).not.toHaveBeenCalled()
+  })
+
+  it('degraded MANUAL retry re-resolves and can succeed', async () => {
+    apiPost
+      .mockReturnValueOnce(degraded([]))
+      .mockReturnValueOnce(ok([match()]))
+    renderDialog()
+    typeAndResolve(V7)
+    await screen.findByTestId('resume-degraded')
+    fireEvent.click(screen.getByTestId('resume-degraded-retry'))
+    await waitFor(() => expect(resumeSessionInTab).toHaveBeenCalled())
+  })
+
+  it('degraded does NOT auto-retry: no warming-style interval polling', async () => {
+    apiPost.mockReturnValue(degraded([]))
+    renderDialog()
+    typeAndResolve(V7)
+    await screen.findByTestId('resume-degraded')
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(apiPost).toHaveBeenCalledTimes(1)
+  })
+
+  it('degraded single match WITH cwd: NEVER auto-resumes — listed for manual confirmation instead', async () => {
+    // A failed provider means a higher-priority exact match may have been
+    // missed: auto-opening the surviving match could open the WRONG session.
+    apiPost.mockReturnValue(degraded([match()], [{ provider: 'claude', message: 'EACCES' }]))
+    renderDialog()
+    typeAndResolve(V7)
+    await screen.findByTestId('resume-degraded')
+    expect(resumeSessionInTab).not.toHaveBeenCalled()
+    // The surviving match is still offered for MANUAL confirmation.
+    const row = await screen.findByTestId('resume-match')
+    fireEvent.click(row)
+    expect(resumeSessionInTab).toHaveBeenCalledTimes(1)
+    expect(resumeSessionInTab.mock.calls[0][2]).toMatchObject({ provider: 'codex', sessionId: V7 })
+  })
+
+  it('prefills the working directory from the server homeDir instead of the "~" sentinel', async () => {
+    apiPost.mockReturnValue(Promise.resolve({
+      status: 'ready', matches: [], hint: null, homeDir: '/home/serveruser',
+    }))
+    renderDialog()
+    typeAndResolve(V4)
+    await screen.findByTestId('resume-anyway-button')
+    expect((screen.getByTestId('resume-anyway-cwd') as HTMLInputElement).value).toBe('/home/serveruser')
+    fireEvent.click(screen.getByTestId('resume-anyway-button'))
+    expect(resumeSessionInTab.mock.calls[0][2]).toMatchObject({ cwd: '/home/serveruser' })
+  })
+
+  it('homeDir prefill never overwrites a user-edited working directory', async () => {
+    apiPost.mockReturnValue(Promise.resolve({
+      status: 'ready', matches: [], hint: null, homeDir: '/home/serveruser',
+    }))
+    renderDialog()
+    typeAndResolve(V4)
+    await screen.findByTestId('resume-anyway-cwd')
+    fireEvent.change(screen.getByTestId('resume-anyway-cwd'), { target: { value: '/repo/mine' } })
+    typeAndResolve(V4)
+    await screen.findByTestId('resume-anyway-cwd')
+    expect((screen.getByTestId('resume-anyway-cwd') as HTMLInputElement).value).toBe('/repo/mine')
+  })
+
+  it('names DISABLED (unsearched) providers in the no-match message', async () => {
+    apiPost.mockReturnValue(Promise.resolve({
+      status: 'ready', matches: [], hint: null, unsearchedProviders: ['codex', 'amplifier'],
+    }))
+    renderDialog()
+    typeAndResolve(V4)
+    const error = await screen.findByTestId('resume-error')
+    expect(error.textContent).toMatch(/not searched \(disabled\): codex, amplifier/i)
+    // Resume-anyway stays available.
+    expect(screen.getByTestId('resume-anyway-button')).toBeInTheDocument()
   })
 
   it('traps Tab focus inside the dialog: wraps last→first and first→last (Shift+Tab)', () => {

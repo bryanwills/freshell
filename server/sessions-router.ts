@@ -1,3 +1,4 @@
+import os from 'os'
 import { Router } from 'express'
 import { z } from 'zod'
 import { cleanString } from './utils.js'
@@ -19,7 +20,11 @@ import {
   SessionTypeMetadataSourceSchema,
 } from '../shared/session-flavor.js'
 import { querySessionDirectory } from './session-directory/service.js'
-import { ResumeResolveRequestSchema } from '../shared/resume-resolve-contract.js'
+import {
+  ResumeResolveRequestSchema,
+  type ResumeResolveProviderError,
+  type ResumeResolveResponse,
+} from '../shared/resume-resolve-contract.js'
 import { resolveResumeInput } from './coding-cli/resolve-session.js'
 import type { ResolveFallbacks } from './coding-cli/resolve-fallbacks.js'
 import { createRequestAbortSignal } from './read-models/request-abort.js'
@@ -48,6 +53,12 @@ export interface SessionsRouterDeps {
   codingCliIndexer: {
     getProjects: () => any[]
     refresh: () => Promise<void>
+    /** True once at least one index refresh completed (resolve readiness signal). */
+    isReady?: () => boolean
+    /** Providers whose MOST RECENT listing attempt failed (unsearchable, not empty). */
+    getScanFailures?: () => string[]
+    /** Fire-and-forget refresh so a degraded response's Retry can converge. */
+    requestRefresh?: () => void
   }
   codingCliProviders: CodingCliProvider[]
   perfConfig: { slowSessionRefreshMs: number }
@@ -62,6 +73,8 @@ export interface SessionsRouterDeps {
   getIndexReadiness?: () => boolean
   /** Exact-id resolve fallbacks (buildResolveFallbacks); budget applied per request. */
   resolveFallbacks?: ResolveFallbacks
+  /** Server home directory returned to the resolve client for cwd prefill. Defaults to os.homedir(). */
+  homeDir?: string
 }
 
 export function createSessionsRouter(deps: SessionsRouterDeps): Router {
@@ -236,6 +249,11 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
     res.json({ ok: true })
   })
 
+  // The indexer scans ONLY settings-enabled providers, so a disabled
+  // provider's sessions can never be found. Report those as UNSEARCHED so
+  // "not found" never overclaims. Order matches the canonical provider list.
+  const KNOWN_RESUME_PROVIDERS = ['claude', 'codex', 'opencode', 'amplifier'] as const
+
   router.post('/sessions/resolve', async (req, res) => {
     const parsed = ResumeResolveRequestSchema.safeParse(req.body ?? {})
     if (!parsed.success) {
@@ -243,11 +261,56 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
         .status(400)
         .json({ error: 'Invalid resolve request', details: parsed.error.issues })
     }
-    const response = await resolveResumeInput(parsed.data.input, {
+    // Readiness = startupState (getIndexReadiness) OR'd with the indexer's own
+    // isReady() signal: startup readiness can stick false forever (its
+    // markReady only runs in the start chain's success path), so once the
+    // indexer has completed a refresh the endpoint must stop reporting
+    // warming. When NEITHER signal is wired, default to ready.
+    const readinessSignals: Array<() => boolean> = []
+    if (deps.getIndexReadiness) readinessSignals.push(deps.getIndexReadiness)
+    const indexerIsReady = deps.codingCliIndexer.isReady
+    if (indexerIsReady) readinessSignals.push(() => indexerIsReady.call(deps.codingCliIndexer))
+    const result = await resolveResumeInput(parsed.data.input, {
       getProjects: () => deps.codingCliIndexer.getProjects(),
-      isIndexReady: deps.getIndexReadiness ?? (() => true),
+      isIndexReady: () => readinessSignals.length === 0 || readinessSignals.some((fn) => fn()),
       fallbacks: deps.resolveFallbacks,
     })
+    const settings = await configStore.getSettings().catch(() => ({}))
+    const enabled = new Set<string>(
+      settings?.codingCli?.enabledProviders ?? KNOWN_RESUME_PROVIDERS,
+    )
+    const unsearchedProviders = KNOWN_RESUME_PROVIDERS.filter((name) => !enabled.has(name))
+    // A provider whose last index SCAN failed was not searched either — the
+    // indexer swallows listing failures into empty lists. A DISABLED provider
+    // is unsearched (reported above), never a provider error: otherwise a
+    // failed-then-disabled provider would keep responses degraded forever (no
+    // successful scan could ever clear it). Fallback errors win the dedupe —
+    // they carry the more specific message/code.
+    const errorsByProvider = new Map<string, ResumeResolveProviderError>(
+      result.providerErrors.map((entry) => [entry.provider, entry]),
+    )
+    for (const name of deps.codingCliIndexer.getScanFailures?.() ?? []) {
+      if (!enabled.has(name) || errorsByProvider.has(name)) continue
+      errorsByProvider.set(name, { provider: name, message: 'session scan failed' })
+    }
+    const providerErrors = [...errorsByProvider.values()]
+    // degraded = something FAILED — even when matches exist: a failed provider
+    // means a HIGHER-priority exact match may have been missed, so the client
+    // must never auto-resume a surviving lower-priority match.
+    const status: 'ready' | 'warming' | 'degraded' =
+      result.status === 'warming' ? 'warming' : providerErrors.length > 0 ? 'degraded' : 'ready'
+    // Fire-and-forget: give the user's Retry a chance to converge once a
+    // failed provider recovers (scan failures only clear on a new scan).
+    if (status === 'degraded') deps.codingCliIndexer.requestRefresh?.()
+    const response: ResumeResolveResponse = {
+      status,
+      matches: result.matches,
+      hint: result.hint,
+      providerErrors,
+      unsearchedProviders,
+      // Lets the client prefill a CONCRETE cwd instead of the '~' sentinel.
+      homeDir: deps.homeDir ?? os.homedir(),
+    }
     res.json(response)
   })
 

@@ -7,6 +7,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import { resolveResumeInput, RESOLVE_MATCH_CAP, type ResolveResumeDeps } from '../../../../server/coding-cli/resolve-session'
 import type { ResolveFallbacks } from '../../../../server/coding-cli/resolve-fallbacks'
+import { ClaudeTranscriptLocatorError } from '../../../../server/coding-cli/claude-transcript-locator'
 import type { ResumeResolveMatch } from '../../../../shared/resume-resolve-contract'
 import type { ProjectGroup, CodingCliSession } from '../../../../server/coding-cli/types'
 
@@ -203,28 +204,76 @@ describe('resolveResumeInput — matching core', () => {
     expect(matches).toEqual([])
   })
 
-  it('a THROWING fallback never fails the request (seam: degraded channel is follow-up work)', async () => {
+  it('a THROWING fallback never fails the request: it degrades with a provider error summary', async () => {
+    // Provider unavailable (locked/corrupt DB) is NOT "not found": the
+    // response must carry the failing provider so the route/client can say
+    // "something's wrong" instead of "no matching session".
     const response = await resolveResumeInput(OPENCODE_ID, deps(projects([]), {
       opencodeSessionById: async () => {
         throw new Error('database is locked')
       },
     }))
-    expect(response).toMatchObject({ status: 'ready', matches: [] })
+    expect(response).toMatchObject({ status: 'degraded', matches: [] })
+    expect(response.providerErrors).toEqual([
+      { provider: 'opencode', message: 'database is locked' },
+    ])
   })
 
-  it('a failed exact-id fallback does NOT hide a later lower-priority match', async () => {
+  it('provider identity in providerErrors comes from the fallback PAIR, not its position', async () => {
+    // Only the opencode fallback is supplied. If identity were positional
+    // (index 0 = claude), the error would be misattributed to claude.
+    const response = await resolveResumeInput(OPENCODE_ID, deps(projects([]), {
+      opencodeSessionById: async () => {
+        throw new Error('worker crashed')
+      },
+    }))
+    expect(response.providerErrors.map((e) => e.provider)).toEqual(['opencode'])
+  })
+
+  it('a typed ClaudeTranscriptLocatorError surfaces its errno code in the provider error', async () => {
+    const cause = Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' })
+    const response = await resolveResumeInput(CLAUDE_V4, deps(projects([]), {
+      claudeTranscriptById: async () => {
+        throw new ClaudeTranscriptLocatorError('failed to list claude projects dir: /tmp/x', cause)
+      },
+    }))
+    expect(response.status).toBe('degraded')
+    expect(response.providerErrors).toEqual([
+      {
+        provider: 'claude',
+        code: 'EACCES',
+        message: 'failed to list claude projects dir: /tmp/x',
+      },
+    ])
+  })
+
+  it('a healthy resolve reports NO provider errors', async () => {
+    const response = await resolveResumeInput(CLAUDE_V4, deps(fourProviderSnapshot, {
+      claudeTranscriptById: async () => null,
+      opencodeSessionById: async () => null,
+    }))
+    expect(response.status).toBe('ready')
+    expect(response.providerErrors).toEqual([])
+  })
+
+  it('a failed exact-id fallback does NOT hide a later lower-priority match — but marks the response degraded', async () => {
     // First token: full claude UUID, index miss, claude fallback THROWS.
     // Second token: prefix that matches an indexed amplifier session.
-    // Resolution must continue so the surviving match is still returned.
+    // Resolution must continue so the surviving match is still returned —
+    // AND the response must be degraded (a failed HIGHER-priority exact
+    // search means the surviving match may be the wrong session, so the
+    // client must never auto-resume it).
     const MISSING_V4 = 'ed2afda6-a340-443e-ba60-024a1b3554b9'
     const snapshot = projects([session({ provider: 'amplifier', sessionId: AMPLIFIER_FULL })])
-    const { matches } = await resolveResumeInput(`${MISSING_V4} 417e8345`, deps(snapshot, {
+    const response = await resolveResumeInput(`${MISSING_V4} 417e8345`, deps(snapshot, {
       claudeTranscriptById: async () => {
         throw new Error('EACCES')
       },
     }))
-    expect(matches).toHaveLength(1)
-    expect(matches[0]).toMatchObject({ provider: 'amplifier', matchKind: 'prefix' })
+    expect(response.matches).toHaveLength(1)
+    expect(response.matches[0]).toMatchObject({ provider: 'amplifier', matchKind: 'prefix' })
+    expect(response.status).toBe('degraded')
+    expect(response.providerErrors).toEqual([{ provider: 'claude', message: 'EACCES' }])
   })
 
   it('a fallback exact hit for a HIGHER-priority token beats an indexed exact hit of a LOWER-priority token', async () => {

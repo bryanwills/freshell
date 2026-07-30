@@ -765,8 +765,12 @@ async function main() {
     // locked opencode DB must never stall the server.
     resolveFallbacks: buildResolveFallbacks(codingCliProviders, {
       sessionMetadataStore,
+      // Multi-root: the claude provider's getSessionRoots() covers the primary
+      // projects dir AND any secondary roots (evaluated per lookup so runtime
+      // root changes are picked up) — an exact pasted id must resolve from
+      // every root the indexer scans.
       locateClaudeTranscript: (sessionId) =>
-        locateClaudeTranscript(sessionId, getClaudeProjectsDir()),
+        locateClaudeTranscript(sessionId, claudeProvider.getSessionRoots()),
     }),
   }))
 
