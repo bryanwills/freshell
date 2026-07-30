@@ -75,7 +75,7 @@ export class OpencodeProvider implements CodingCliProvider {
     this.queryRunner = options.queryRunner ?? createWorkerListingRunner()
   }
 
-  private getDatabasePath(): string {
+  getDatabasePath(): string {
     return path.join(this.homeDir, 'opencode.db')
   }
 

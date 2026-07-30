@@ -1,6 +1,10 @@
+import os from 'os'
 import { Router } from 'express'
 import { z } from 'zod'
 import { cleanString } from './utils.js'
+import { parseResumeInput } from '../shared/resume-input-parser.js'
+import { resolveSessionCandidates } from './coding-cli/session-resolver.js'
+import { buildResolveFallbacks, withRequestBudget, type ResolveFallbacks } from './coding-cli/resolve-fallbacks.js'
 import { makeSessionKey, type CodingCliProviderName } from './coding-cli/types.js'
 import type { CodingCliProvider } from './coding-cli/provider.js'
 import { CodingCliProviderSchema } from '../shared/ws-protocol.js'
@@ -28,6 +32,8 @@ import {
 
 const log = logger.child({ component: 'sessions-router' })
 
+export const ResolveBodySchema = z.object({ input: z.string().min(1).max(20_000) })
+
 export const SessionPatchSchema = z.object({
   titleOverride: z.string().optional().nullable(),
   summaryOverride: z.string().optional().nullable(),
@@ -45,8 +51,15 @@ export interface SessionsRouterDeps {
   codingCliIndexer: {
     getProjects: () => any[]
     refresh: () => Promise<void>
+    isReady?: () => boolean
+    getScanFailures?: () => CodingCliProviderName[]
+    requestRefresh?: () => void
   }
   codingCliProviders: CodingCliProvider[]
+  /** Test override for the exact-id fallbacks (defaults to buildResolveFallbacks(...)). */
+  resolveFallbacks?: ResolveFallbacks
+  /** Test override for the "resume anyway" default cwd (defaults to os.homedir()). */
+  homeDir?: string
   perfConfig: { slowSessionRefreshMs: number }
   terminalMetadata?: { list: () => TerminalMeta[] }
   registry?: { updateTitle: (id: string, title: string) => void }
@@ -253,6 +266,72 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
       await codingCliIndexer.refresh()
     }
     res.json({ ok: true, changed })
+  })
+
+  // Resume-button resolve: one scan answers all providers at once (spec:
+  // docs/plans/2026-07-29-resume-button-spec.md). Evidence decides the agent;
+  // the parsed hint is advisory UI state only. ACCEPTED LIMITATION (spec-
+  // sanctioned): prefix matching covers indexed sessions only; exact-id
+  // misses fall back to the claude transcript locator + opencode by-id query.
+  const resolveFallbacks = deps.resolveFallbacks
+    ?? buildResolveFallbacks(deps.codingCliProviders, { sessionMetadataStore: deps.sessionMetadataStore })
+  const KNOWN_RESUME_PROVIDERS = ['claude', 'codex', 'opencode', 'amplifier'] as const
+  router.post('/sessions/resolve', async (req, res) => {
+    const parsed = ResolveBodySchema.safeParse(req.body)
+    if (!parsed.success) {
+      res.status(400).json({ error: 'body must be { input: string } (1-20000 chars)' })
+      return
+    }
+    try {
+      // The indexer scans ONLY settings-enabled providers (verified:
+      // session-indexer.ts filters by enabledProviders, ~line 1385). A
+      // disabled provider's sessions cannot be found — report it as
+      // UNSEARCHED so the client never implies the id does not exist.
+      const settings = await deps.configStore.getSettings().catch(() => ({}))
+      const enabled = new Set<string>(
+        settings?.codingCli?.enabledProviders ?? KNOWN_RESUME_PROVIDERS,
+      )
+      const unsearchedProviders = KNOWN_RESUME_PROVIDERS.filter((n) => !enabled.has(n))
+      const { candidates, agentHint } = parseResumeInput(parsed.data.input)
+      const { matches, providerErrors: fallbackErrors } = await resolveSessionCandidates(candidates, {
+        getProjects: () => deps.codingCliIndexer.getProjects(),
+        // Fresh budget per request: bounds fallback work; shape gates run
+        // before the budget inside withRequestBudget.
+        fallbacks: withRequestBudget(resolveFallbacks),
+      })
+      // A provider whose last index scan FAILED was not searched either —
+      // the indexer swallows listing failures and still reports ready. A
+      // DISABLED provider is UNSEARCHED (reported above), never a provider
+      // error: without this filter a failed-then-disabled provider would
+      // keep responses degraded forever (no successful scan can ever clear
+      // it) and trap the user in a Retry loop.
+      const scanFailures = (deps.codingCliIndexer.getScanFailures?.() ?? [])
+        .filter((name) => enabled.has(name))
+      const providerErrors = [...new Set([...fallbackErrors, ...scanFailures])]
+      // degraded = something FAILED — even when matches exist: a failed
+      // provider means a HIGHER-priority exact match may have been missed,
+      // so the client must not auto-resume a surviving lower-priority match
+      // (and with zero matches it shows retry, never "no matching session").
+      const indexState: 'ready' | 'warming' | 'degraded' =
+        deps.codingCliIndexer.isReady?.() === false ? 'warming'
+        : providerErrors.length > 0 ? 'degraded'
+        : 'ready'
+      // Fire-and-forget: give the user's Retry a chance to converge once a
+      // failed provider recovers (scan failures only clear on a new scan).
+      if (indexState === 'degraded') deps.codingCliIndexer.requestRefresh?.()
+      res.json({
+        indexState,
+        tokens: candidates,
+        agentHint: agentHint ?? null,
+        homeDir: deps.homeDir ?? os.homedir(),
+        providerErrors,
+        unsearchedProviders,
+        matches,
+      })
+    } catch (err) {
+      log.warn({ err }, 'sessions/resolve failed')
+      res.status(500).json({ error: 'resolve failed' })
+    }
   })
 
   return router
