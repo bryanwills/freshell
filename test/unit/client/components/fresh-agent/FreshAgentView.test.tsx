@@ -6258,6 +6258,14 @@ describe('snapshot scheduler integration (zrrj)', () => {
         event: { type: 'freshAgent.session.snapshot' },
         runtime: { runtimeId: 'runtime-old', generation: 7 },
       })
+      wsHandler?.({
+        type: 'freshAgent.event',
+        sessionId: 'ses_fenced',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        event: { type: 'freshAgent.session.snapshot' },
+        runtime: { runtimeId: 'runtime-current', generation: 9 },
+      })
     })
 
     await new Promise((resolve) => setTimeout(resolve, 350))

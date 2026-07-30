@@ -2599,6 +2599,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     return isCurrent
   }, [recordTerminalPerfAuditEvent])
 
+  const isCurrentRuntimeMessage = useCallback((msg: { runtime?: { runtimeId: string, generation: number } }) => {
+    const content = contentRef.current
+    const generation = content?.runtimeGeneration
+    if (!content || generation === undefined) return true
+    const runtime = msg.runtime
+    return runtime !== undefined && runtime.runtimeId === content.runtimeId && runtime.generation === generation
+  }, [])
+
   const isCurrentAttachStreamMessage = useCallback((msg: {
     type: string
     terminalId: string
@@ -3640,6 +3648,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         }
 
         if (msg.type === 'terminal.output.batch' && msg.terminalId === tid) {
+          if (!isCurrentRuntimeMessage(msg)) return
           if (!isCurrentAttachStreamMessage(msg)) {
             if (debugRef.current) {
               log.debug('Ignoring stale attach generation message', {
@@ -3867,6 +3876,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         }
 
         if (msg.type === 'terminal.output' && msg.terminalId === tid) {
+          if (!isCurrentRuntimeMessage(msg)) return
           if (!isCurrentAttachStreamMessage(msg)) {
             if (debugRef.current) {
               log.debug('Ignoring stale attach generation message', {
@@ -3936,6 +3946,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         }
 
         if (msg.type === 'terminal.output.gap' && msg.terminalId === tid) {
+          if (!isCurrentRuntimeMessage(msg)) return
           if (!isCurrentAttachStreamMessage(msg)) {
             if (debugRef.current) {
               log.debug('Ignoring stale attach generation message', {
@@ -4000,6 +4011,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         }
 
         if (msg.type === 'terminal.stream.changed' && msg.terminalId === tid) {
+          if (!isCurrentRuntimeMessage(msg)) return
           if (!isCurrentAttachMessage(msg)) {
             if (debugRef.current) {
               log.debug('Ignoring stale attach generation stream change', {

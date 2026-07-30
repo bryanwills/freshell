@@ -837,6 +837,7 @@ export type TerminalStreamChangedMessage = {
   streamId: string
   reason: 'new_pty_session' | 'codex_pty_recovery' | 'retention_lost' | 'server_restart_incompatible_retention'
   attachRequestId?: string
+  runtime?: RuntimeDescriptor
 }
 
 export type TerminalDetachedMessage = {

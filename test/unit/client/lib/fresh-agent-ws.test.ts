@@ -153,6 +153,64 @@ describe('fresh-agent-ws', () => {
     })
   })
 
+  it('centrally fences created and materialized frames before they can mutate a fenced pane', () => {
+    const store = createFreshAgentPaneStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-runtime-fenced',
+        sessionId: 'placeholder-runtime-fenced',
+        status: 'running',
+        runtimeId: 'runtime-current',
+        runtimeGeneration: 8,
+      },
+    }))
+
+    const created = (runtime?: { runtimeId: string, generation: number }) =>
+      handleFreshAgentMessage(store.dispatch, {
+        type: 'freshAgent.created',
+        requestId: 'req-runtime-fenced',
+        sessionId: 'created-runtime-fenced',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        ...(runtime ? { runtime } : {}),
+      }, undefined, store.getState)
+
+    expect(created()).toBe(true)
+    expect(created({ runtimeId: 'runtime-old', generation: 7 })).toBe(true)
+    expect(created({ runtimeId: 'runtime-current', generation: 9 })).toBe(true)
+    expect(store.getState().freshAgent.sessions['freshcodex:codex:created-runtime-fenced']).toBeUndefined()
+
+    expect(created({ runtimeId: 'runtime-current', generation: 8 })).toBe(true)
+    expect(store.getState().freshAgent.sessions['freshcodex:codex:created-runtime-fenced']).toBeDefined()
+
+    const materialized = (runtime?: { runtimeId: string, generation: number }) =>
+      handleFreshAgentMessage(store.dispatch, {
+        type: 'freshAgent.session.materialized',
+        previousSessionId: 'placeholder-runtime-fenced',
+        sessionId: 'durable-runtime-fenced',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        ...(runtime ? { runtime } : {}),
+      }, undefined, store.getState)
+
+    expect(materialized()).toBe(true)
+    expect(materialized({ runtimeId: 'runtime-old', generation: 7 })).toBe(true)
+    expect(materialized({ runtimeId: 'runtime-current', generation: 9 })).toBe(true)
+    expect(store.getState().panes.layouts['tab-1']?.content).toMatchObject({
+      sessionId: 'placeholder-runtime-fenced',
+    })
+
+    expect(materialized({ runtimeId: 'runtime-current', generation: 8 })).toBe(true)
+    expect(store.getState().panes.layouts['tab-1']?.content).toMatchObject({
+      sessionId: 'durable-runtime-fenced',
+    })
+  })
+
   it('create.failed SESSION_RESERVED (retryable) is not projected into pendingCreateFailures and keeps the create route alive', () => {
     // Task 14: a transient reservation must never mint an error-card entry
     // (no Retry button racing the same-requestId re-drive) AND must not

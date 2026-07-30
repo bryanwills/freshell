@@ -1488,7 +1488,7 @@ export function FreshAgentView({
         && messageRuntime
         && (
           messageRuntime.runtimeId !== paneContentRef.current.runtimeId
-          || messageRuntime.generation < currentRuntimeGeneration
+          || messageRuntime.generation !== currentRuntimeGeneration
         )
       ) {
         return

@@ -133,6 +133,7 @@ export function handleFreshAgentMessage(
   switch (msg.type) {
     case 'freshAgent.created': {
       const created = msg as FreshAgentCreatedMessage
+      if (!isFreshAgentLifecycleMessageCurrent(created, getState?.())) return true
       const provider = created.provider ?? created.runtimeProvider
       const route = consumeCreateRoute(created.requestId)
       if (consumeCancelledCreate(created.requestId)) {
@@ -177,6 +178,7 @@ export function handleFreshAgentMessage(
     }
     case 'freshAgent.session.materialized': {
       const materialized = msg as FreshAgentSessionMaterializedMessage
+      if (!isFreshAgentLifecycleMessageCurrent(materialized, getState?.())) return true
       dispatch(materializeFreshAgentSessionState({
         previousSessionId: materialized.previousSessionId,
         sessionId: materialized.sessionId,
@@ -225,6 +227,53 @@ function isRuntimeFenced(value: { runtimeId?: string, runtimeGeneration?: number
 
 function matchesRuntimeFence(runtime: RuntimeDescriptor | undefined, fence: { runtimeId?: string, runtimeGeneration?: number }): boolean {
   return runtime?.runtimeId === fence.runtimeId && runtime?.generation === fence.runtimeGeneration
+}
+
+/**
+ * Lifecycle acknowledgements mutate before a session event can reach the
+ * reducer fence. Resolve the pane/session they target first, then require the
+ * same exact descriptor as ordinary transport frames once that target is
+ * fenced. This keeps delayed create/materialize acknowledgements from
+ * resurrecting an old runtime after a restart replacement.
+ */
+function isFreshAgentLifecycleMessageCurrent(
+  msg: FreshAgentCreatedMessage | FreshAgentSessionMaterializedMessage,
+  state: FreshAgentTransportState | undefined,
+): boolean {
+  if (!state) return true
+
+  const fences: Array<{ runtimeId?: string, runtimeGeneration?: number }> = []
+  const targetSessionId = msg.type === 'freshAgent.session.materialized'
+    ? msg.previousSessionId
+    : undefined
+  const provider = msg.type === 'freshAgent.created'
+    ? (msg.provider ?? msg.runtimeProvider)
+    : msg.provider
+
+  if (targetSessionId && provider) {
+    const session = state.freshAgent?.sessions?.[makeFreshAgentSessionKey({
+      sessionId: targetSessionId,
+      sessionType: msg.sessionType,
+      provider,
+    })]
+    if (session && isRuntimeFenced(session)) fences.push(session)
+  }
+
+  for (const layout of Object.values(state.panes?.layouts ?? {})) {
+    if (!layout) continue
+    for (const content of collectPaneContents(layout)) {
+      if (content.kind !== 'fresh-agent' || !isRuntimeFenced(content)) continue
+      const targetsCreatedPane = msg.type === 'freshAgent.created'
+        && content.createRequestId === msg.requestId
+      const targetsMaterializedPane = msg.type === 'freshAgent.session.materialized'
+        && content.sessionId === msg.previousSessionId
+        && content.sessionType === msg.sessionType
+        && content.provider === msg.provider
+      if (targetsCreatedPane || targetsMaterializedPane) fences.push(content)
+    }
+  }
+
+  return fences.every((fence) => matchesRuntimeFence(msg.runtime, fence))
 }
 
 /**
