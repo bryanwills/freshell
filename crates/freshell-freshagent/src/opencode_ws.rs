@@ -847,6 +847,41 @@ impl FreshOpencodeState {
         }));
     }
 
+    /// Restart-only teardown fenced to the exact runtime selected by the
+    /// coordinator. Both placeholder and durable aliases are removed while the
+    /// sessions map is locked, and only when they still point at that runtime.
+    pub async fn shutdown_for_restart(&self, session_id: &str, expected_runtime_id: &str) -> bool {
+        let session_arc = {
+            let mut sessions = self.sessions.lock().await;
+            let Some(session_arc) = sessions.get(session_id).cloned() else {
+                return false;
+            };
+            if session_arc.lock().await.runtime.runtime_id != expected_runtime_id {
+                return false;
+            }
+            sessions.retain(|_, candidate| !Arc::ptr_eq(candidate, &session_arc));
+            session_arc
+        };
+
+        let mut session = session_arc.lock().await;
+        if let Some(task) = session.turn_task.take() {
+            task.abort();
+        }
+        if let Some(bridge) = session.serve_bridge.take() {
+            bridge.abort();
+        }
+        if let Some(real) = session.real_session_id.as_deref() {
+            self.leases.clear_binding(PROVIDER, real);
+        }
+        self.leases.clear_binding(PROVIDER, session_id);
+        let placeholder = session.placeholder_id.clone();
+        drop(session);
+        self.create_dedup
+            .clear_for_session(|record| record.placeholder_id == placeholder)
+            .await;
+        true
+    }
+
     // ── freshAgent.interrupt (WS) ────────────────────────────────────────
 
     /// Handle a `freshAgent.interrupt` for opencode: mark the turn aborted (BEFORE
@@ -2329,6 +2364,35 @@ mod tests {
         let guard = st.sessions.lock().await;
         assert!(!guard.contains_key(placeholder), "placeholder key removed");
         assert!(!guard.contains_key(&real_id), "durable key removed");
+    }
+
+    #[tokio::test]
+    async fn restart_shutdown_removes_only_the_exact_opencode_runtime_and_all_aliases() {
+        let (st, killed) = state().await;
+        st.handle_create(create_msg("req-restart")).await;
+        let placeholder = "freshopencode-req-restart";
+        st.handle_send(send_msg(placeholder, "hello")).await;
+        let (real_id, runtime_id) = {
+            let sessions = st.sessions.lock().await;
+            let session = sessions.get(placeholder).unwrap().lock().await;
+            (
+                session.real_session_id.clone().unwrap(),
+                session.runtime.runtime_id.clone(),
+            )
+        };
+
+        assert!(
+            !st.shutdown_for_restart(&real_id, "fresh-runtime-stale")
+                .await
+        );
+        assert!(st.has_live_session(&real_id).await);
+        assert!(st.shutdown_for_restart(&real_id, &runtime_id).await);
+        assert!(!st.has_live_session(&real_id).await);
+        assert!(!st.has_live_session(placeholder).await);
+        assert!(
+            !killed.load(Ordering::SeqCst),
+            "per-session restart must preserve the shared serve sidecar"
+        );
     }
 
     #[tokio::test]

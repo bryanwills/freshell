@@ -4,7 +4,7 @@
 //! the cross-provider invariants: immutable request fingerprints, live runtime
 //! generations, preflight-before-shutdown ordering, and terminal-result replay.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -55,7 +55,18 @@ pub struct PendingRestartRecovery {
     pub request_id: String,
     pub request: AgentRestart,
     pub old_runtime: RuntimeDescriptor,
+    #[serde(default)]
+    pub resume_context: Option<RestartResumeContext>,
     pub last_failure: Option<AgentRestartFailed>,
+}
+
+/// Minimal provider resume data that must survive a server restart after the
+/// predecessor has already been retired.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestartResumeContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,12 +95,20 @@ struct PersistedOwnership {
 #[derive(Debug, Clone, Default)]
 struct RuntimeOwnership {
     by_locator: HashMap<RuntimeLocator, RuntimeDescriptor>,
+    locator_order: VecDeque<RuntimeLocator>,
     /// Exact descriptor for every observed live runtime id, including retired
     /// generations whose already-queued output/exit frames still need fencing.
     descriptor_by_live: HashMap<(AgentRuntimeKind, String), RuntimeDescriptor>,
+    descriptor_order: VecDeque<(AgentRuntimeKind, String)>,
     locator_by_live: HashMap<(AgentRuntimeKind, String), RuntimeLocator>,
+    /// Distinguishes a genuinely never-bound terminal from a predecessor whose
+    /// locator was deliberately removed during replacement. Retired entries
+    /// remain for the same bounded late-frame window as their descriptors.
+    retired_live: HashSet<(AgentRuntimeKind, String)>,
     fresh_event_aliases: HashMap<(String, String), RuntimeDescriptor>,
+    fresh_alias_order: VecDeque<(String, String)>,
     last_generation: HashMap<RuntimeLocator, u64>,
+    generation_order: VecDeque<RuntimeLocator>,
     results: HashMap<String, StoredResult>,
     result_order: VecDeque<String>,
     pending_recoveries: HashMap<String, PendingRestartRecovery>,
@@ -136,11 +155,25 @@ pub trait RestartRuntime: Send + Sync {
         plan: Self::ResumePlan,
     ) -> Result<String, RestartFailure>;
 
+    /// Capture the small provider context required to resume after process
+    /// restart. Called after preflight and persisted before teardown.
+    fn persisted_resume_context(
+        &self,
+        _request: &AgentRestart,
+        _plan: &Self::ResumePlan,
+    ) -> Option<RestartResumeContext> {
+        None
+    }
+
     /// Resume a replacement whose selected predecessor was already shut down
     /// before a retryable failure or server restart. Implementations may
     /// override this when recovery needs a path distinct from ordinary
     /// preflight; the default rebuilds a resume plan and creates directly.
-    async fn recover_replacement(&self, request: &AgentRestart) -> Result<String, RestartFailure> {
+    async fn recover_replacement(
+        &self,
+        request: &AgentRestart,
+        _context: Option<&RestartResumeContext>,
+    ) -> Result<String, RestartFailure> {
         let plan = self.preflight(request).await?;
         self.create_replacement(request, plan).await
     }
@@ -197,12 +230,23 @@ pub struct RestartCoordinator {
     request_lock_order: Arc<Mutex<VecDeque<String>>>,
     result_limit: usize,
     lock_limit: usize,
+    ownership_limit: usize,
     registered_runtime:
         Arc<std::sync::RwLock<Option<std::sync::Weak<dyn RestartRuntime<ResumePlan = ()>>>>>,
 }
 
 const DEFAULT_RESTART_RESULT_LIMIT: usize = 1_024;
 const DEFAULT_RESTART_LOCK_LIMIT: usize = 1_024;
+const DEFAULT_RESTART_OWNERSHIP_LIMIT: usize = 4_096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetainedOwnershipCounts {
+    pub descriptors: usize,
+    pub live_locators: usize,
+    pub current_locators: usize,
+    pub fresh_aliases: usize,
+    pub generation_high_waters: usize,
+}
 
 /// Keeps a dynamically-installed restart adapter alive without introducing a
 /// coordinator → adapter → [`crate::WsState`] reference cycle.
@@ -226,7 +270,10 @@ impl Default for RestartCoordinator {
 
 impl RestartCoordinator {
     pub fn new() -> Self {
-        Self::new_with_limits(DEFAULT_RESTART_RESULT_LIMIT, DEFAULT_RESTART_LOCK_LIMIT)
+        let mut coordinator =
+            Self::new_with_limits(DEFAULT_RESTART_RESULT_LIMIT, DEFAULT_RESTART_LOCK_LIMIT);
+        coordinator.ownership_limit = DEFAULT_RESTART_OWNERSHIP_LIMIT;
+        coordinator
     }
 
     pub fn new_with_limits(result_limit: usize, lock_limit: usize) -> Self {
@@ -240,6 +287,7 @@ impl RestartCoordinator {
             request_lock_order: Arc::new(Mutex::new(VecDeque::new())),
             result_limit: result_limit.max(1),
             lock_limit: lock_limit.max(1),
+            ownership_limit: result_limit.max(1),
             registered_runtime: Arc::new(std::sync::RwLock::new(None)),
         }
     }
@@ -271,6 +319,7 @@ impl RestartCoordinator {
             request_lock_order: Arc::new(Mutex::new(VecDeque::new())),
             result_limit,
             lock_limit,
+            ownership_limit: result_limit,
             registered_runtime: Arc::new(std::sync::RwLock::new(None)),
         })
     }
@@ -312,12 +361,20 @@ impl RestartCoordinator {
             .iter()
             .map(|entry| entry.request_id.clone())
             .collect();
+        let mut generations = persisted.generations;
+        if generations.len() > result_limit {
+            generations.drain(..generations.len().saturating_sub(result_limit));
+        }
+        let generation_order = generations
+            .iter()
+            .map(|entry| entry.locator.clone())
+            .collect();
         Ok(RuntimeOwnership {
-            last_generation: persisted
-                .generations
+            last_generation: generations
                 .into_iter()
                 .map(|entry| (entry.locator, entry.generation))
                 .collect(),
+            generation_order,
             results: persisted_results
                 .into_iter()
                 .map(|entry| (entry.request_id, entry.result))
@@ -340,11 +397,16 @@ impl RestartCoordinator {
         }
         let state = PersistedOwnership {
             generations: ownership
-                .last_generation
+                .generation_order
                 .iter()
-                .map(|(locator, generation)| PersistedGeneration {
-                    locator: locator.clone(),
-                    generation: *generation,
+                .filter_map(|locator| {
+                    ownership
+                        .last_generation
+                        .get(locator)
+                        .map(|generation| PersistedGeneration {
+                            locator: locator.clone(),
+                            generation: *generation,
+                        })
                 })
                 .collect(),
             results: ownership
@@ -601,6 +663,83 @@ impl RestartCoordinator {
         }
     }
 
+    fn touch_key<T: PartialEq + Clone>(order: &mut VecDeque<T>, key: &T) {
+        order.retain(|candidate| candidate != key);
+        order.push_back(key.clone());
+    }
+
+    fn set_generation_locked(
+        ownership: &mut RuntimeOwnership,
+        locator: RuntimeLocator,
+        generation: u64,
+    ) {
+        ownership
+            .last_generation
+            .insert(locator.clone(), generation);
+        Self::touch_key(&mut ownership.generation_order, &locator);
+    }
+
+    fn set_fresh_alias_locked(
+        ownership: &mut RuntimeOwnership,
+        alias: (String, String),
+        descriptor: RuntimeDescriptor,
+    ) {
+        ownership
+            .fresh_event_aliases
+            .insert(alias.clone(), descriptor);
+        Self::touch_key(&mut ownership.fresh_alias_order, &alias);
+    }
+
+    fn touch_descriptor_locked(ownership: &mut RuntimeOwnership, key: (AgentRuntimeKind, String)) {
+        Self::touch_key(&mut ownership.descriptor_order, &key);
+    }
+
+    fn prune_ownership_locked(ownership: &mut RuntimeOwnership, limit: usize) {
+        while ownership.descriptor_order.len() > limit {
+            let Some(key) = ownership.descriptor_order.pop_front() else {
+                break;
+            };
+            let removed = ownership.descriptor_by_live.remove(&key);
+            ownership.retired_live.remove(&key);
+            if let Some(locator) = ownership.locator_by_live.remove(&key) {
+                if ownership.by_locator.get(&locator) == removed.as_ref() {
+                    ownership.by_locator.remove(&locator);
+                    ownership.locator_order.retain(|entry| entry != &locator);
+                }
+            }
+            if let Some(removed) = removed {
+                ownership
+                    .fresh_event_aliases
+                    .retain(|_, descriptor| descriptor != &removed);
+                ownership
+                    .fresh_alias_order
+                    .retain(|alias| ownership.fresh_event_aliases.contains_key(alias));
+            }
+        }
+        while ownership.locator_order.len() > limit {
+            let Some(locator) = ownership.locator_order.pop_front() else {
+                break;
+            };
+            if let Some(descriptor) = ownership.by_locator.remove(&locator) {
+                ownership
+                    .locator_by_live
+                    .remove(&(locator.kind, descriptor.runtime_id.clone()));
+            }
+        }
+        while ownership.fresh_alias_order.len() > limit {
+            let Some(alias) = ownership.fresh_alias_order.pop_front() else {
+                break;
+            };
+            ownership.fresh_event_aliases.remove(&alias);
+        }
+        while ownership.generation_order.len() > limit {
+            let Some(locator) = ownership.generation_order.pop_front() else {
+                break;
+            };
+            ownership.last_generation.remove(&locator);
+        }
+    }
+
     pub fn retained_result_count(&self) -> usize {
         self.ownership
             .lock()
@@ -620,6 +759,17 @@ impl RestartCoordinator {
                 .expect("restart locator locks")
                 .len(),
         )
+    }
+
+    pub fn retained_ownership_counts(&self) -> RetainedOwnershipCounts {
+        let ownership = self.ownership.lock().expect("restart ownership lock");
+        RetainedOwnershipCounts {
+            descriptors: ownership.descriptor_by_live.len(),
+            live_locators: ownership.locator_by_live.len(),
+            current_locators: ownership.by_locator.len(),
+            fresh_aliases: ownership.fresh_event_aliases.len(),
+            generation_high_waters: ownership.last_generation.len(),
+        }
     }
 
     /// Register a runtime discovered by create/attach/inventory/reconciliation.
@@ -642,9 +792,11 @@ impl RestartCoordinator {
             .get(&(locator.kind, runtime_id.clone()))
             .cloned()
         {
-            let was_unbound = !ownership
-                .locator_by_live
-                .contains_key(&(locator.kind, runtime_id.clone()));
+            let live_key = (locator.kind, runtime_id.clone());
+            if ownership.retired_live.contains(&live_key) {
+                return existing;
+            }
+            let was_unbound = !ownership.locator_by_live.contains_key(&live_key);
             let existing = if was_unbound {
                 let generation = ownership
                     .last_generation
@@ -663,12 +815,15 @@ impl RestartCoordinator {
             } else {
                 existing
             };
-            ownership
+            let generation = ownership
                 .last_generation
-                .entry(locator.clone())
-                .and_modify(|generation| *generation = (*generation).max(existing.generation))
-                .or_insert(existing.generation);
+                .get(&locator)
+                .copied()
+                .unwrap_or_default()
+                .max(existing.generation);
+            Self::set_generation_locked(&mut ownership, locator.clone(), generation);
             Self::bind_locator_locked(&mut ownership, locator, runtime_id, existing.clone());
+            Self::prune_ownership_locked(&mut ownership, self.ownership_limit);
             self.persist_or_log(&ownership, "bind_existing_runtime");
             return existing;
         }
@@ -686,7 +841,8 @@ impl RestartCoordinator {
             runtime_id,
             descriptor.clone(),
         );
-        ownership.last_generation.insert(locator, generation);
+        Self::set_generation_locked(&mut ownership, locator, generation);
+        Self::prune_ownership_locked(&mut ownership, self.ownership_limit);
         self.persist_or_log(&ownership, "register_runtime");
         descriptor
     }
@@ -713,12 +869,22 @@ impl RestartCoordinator {
         }
         if let Some(previous_runtime) = ownership.by_locator.insert(locator, descriptor.clone()) {
             if previous_runtime.runtime_id != runtime_id {
-                ownership
-                    .locator_by_live
-                    .remove(&(live_key.0, previous_runtime.runtime_id));
+                let previous_key = (live_key.0, previous_runtime.runtime_id);
+                ownership.locator_by_live.remove(&previous_key);
+                ownership.retired_live.insert(previous_key);
             }
         }
-        ownership.descriptor_by_live.insert(live_key, descriptor);
+        let bound_locator = ownership
+            .locator_by_live
+            .get(&live_key)
+            .cloned()
+            .expect("locator inserted above");
+        Self::touch_key(&mut ownership.locator_order, &bound_locator);
+        ownership.retired_live.remove(&live_key);
+        ownership
+            .descriptor_by_live
+            .insert(live_key.clone(), descriptor);
+        Self::touch_descriptor_locked(ownership, live_key);
     }
 
     /// Register a runtime that does not have a durable locator. This keeps the
@@ -735,10 +901,12 @@ impl RestartCoordinator {
             .descriptor_by_live
             .entry((kind, runtime_id.clone()))
             .or_insert_with(|| RuntimeDescriptor {
-                runtime_id,
+                runtime_id: runtime_id.clone(),
                 generation: 1,
             })
             .clone();
+        Self::touch_descriptor_locked(&mut ownership, (kind, runtime_id));
+        Self::prune_ownership_locked(&mut ownership, self.ownership_limit);
         self.persist_or_log(&ownership, "register_unbound_runtime");
         descriptor
     }
@@ -855,11 +1023,13 @@ impl RestartCoordinator {
                     ),
                 });
                 if let Some(runtime) = frame.runtime.clone() {
-                    self.ownership
-                        .lock()
-                        .expect("restart ownership lock")
-                        .fresh_event_aliases
-                        .insert((frame.provider.clone(), frame.session_id.clone()), runtime);
+                    let mut ownership = self.ownership.lock().expect("restart ownership lock");
+                    Self::set_fresh_alias_locked(
+                        &mut ownership,
+                        (frame.provider.clone(), frame.session_id.clone()),
+                        runtime,
+                    );
+                    Self::prune_ownership_locked(&mut ownership, self.ownership_limit);
                 }
             }
             ServerMessage::FreshAgentSessionMaterialized(frame) => {
@@ -889,13 +1059,17 @@ impl RestartCoordinator {
                 });
                 if let Some(runtime) = frame.runtime.clone() {
                     let mut ownership = self.ownership.lock().expect("restart ownership lock");
-                    ownership.fresh_event_aliases.insert(
+                    Self::set_fresh_alias_locked(
+                        &mut ownership,
                         (frame.provider.clone(), frame.previous_session_id.clone()),
                         runtime.clone(),
                     );
-                    ownership
-                        .fresh_event_aliases
-                        .insert((frame.provider.clone(), frame.session_id.clone()), runtime);
+                    Self::set_fresh_alias_locked(
+                        &mut ownership,
+                        (frame.provider.clone(), frame.session_id.clone()),
+                        runtime,
+                    );
+                    Self::prune_ownership_locked(&mut ownership, self.ownership_limit);
                 }
             }
             ServerMessage::FreshAgentEvent(frame) => {
@@ -986,15 +1160,14 @@ impl RestartCoordinator {
         {
             return descriptor;
         }
-        ownership
-            .last_generation
-            .insert(locator.clone(), descriptor.generation);
+        Self::set_generation_locked(&mut ownership, locator.clone(), descriptor.generation);
         Self::bind_locator_locked(
             &mut ownership,
             locator,
             descriptor.runtime_id.clone(),
             descriptor.clone(),
         );
+        Self::prune_ownership_locked(&mut ownership, self.ownership_limit);
         self.persist_or_log(&ownership, "register_supplied_runtime");
         descriptor
     }
@@ -1114,6 +1287,7 @@ impl RestartCoordinator {
                 return outcome;
             }
         };
+        let resume_context = runtime.persisted_resume_context(&request, &plan);
 
         let started = ServerMessage::AgentRestartStarted(AgentRestartStarted {
             request_id: request.request_id.clone(),
@@ -1129,6 +1303,7 @@ impl RestartCoordinator {
                     request_id: request.request_id.clone(),
                     request: request.clone(),
                     old_runtime: expected.clone(),
+                    resume_context,
                     last_failure: None,
                 },
             );
@@ -1173,6 +1348,10 @@ impl RestartCoordinator {
                 .is_some_and(|current| current == &expected)
             {
                 ownership.by_locator.remove(&locator);
+                ownership
+                    .retired_live
+                    .insert((request.kind, expected.runtime_id.clone()));
+                ownership.locator_order.retain(|entry| entry != &locator);
             }
         }
 
@@ -1223,6 +1402,32 @@ impl RestartCoordinator {
                 }
             }
         };
+        if replacement_id == expected.runtime_id {
+            let failure = RestartFailure::new(
+                AgentRestartFailureCode::ReplacementFailed,
+                "replacement did not produce a distinct live runtime",
+                true,
+            );
+            let failed = self.failure_frame(&request, expected.clone(), &failure);
+            let persisted =
+                self.try_update_ownership("reject_reused_replacement_runtime", |ownership| {
+                    if let Some(recovery) =
+                        ownership.pending_recoveries.get_mut(&request.request_id)
+                    {
+                        recovery.last_failure = Some(failed.clone());
+                    }
+                });
+            let mut outcome = match persisted {
+                Ok(()) => RestartOutcome {
+                    messages: vec![ServerMessage::AgentRestartFailed(failed)],
+                    replayed: false,
+                },
+                Err(error) => self.persistence_failure(&request, expected, error),
+            };
+            emit(&outcome.messages[0]);
+            outcome.messages.insert(0, started);
+            return outcome;
+        }
 
         let (_replacement, terminal) =
             match self.commit_replacement(&request, &expected, replacement_id) {
@@ -1260,7 +1465,10 @@ impl RestartCoordinator {
             runtime: pending.old_runtime.clone(),
         });
         emit(&started);
-        let replacement_id = match runtime.recover_replacement(&request).await {
+        let replacement_id = match runtime
+            .recover_replacement(&request, pending.resume_context.as_ref())
+            .await
+        {
             Ok(runtime_id) => runtime_id,
             Err(failure) => {
                 let failed = self.failure_frame(&request, pending.old_runtime.clone(), &failure);
@@ -1296,6 +1504,34 @@ impl RestartCoordinator {
                 };
             }
         };
+        if replacement_id == pending.old_runtime.runtime_id {
+            let failure = RestartFailure::new(
+                AgentRestartFailureCode::ReplacementFailed,
+                "replacement did not produce a distinct live runtime",
+                true,
+            );
+            let failed = self.failure_frame(&request, pending.old_runtime.clone(), &failure);
+            let persisted =
+                self.try_update_ownership("reject_reused_recovery_runtime", |ownership| {
+                    if let Some(recovery) =
+                        ownership.pending_recoveries.get_mut(&request.request_id)
+                    {
+                        recovery.last_failure = Some(failed.clone());
+                    }
+                });
+            let terminal = match persisted {
+                Ok(()) => ServerMessage::AgentRestartFailed(failed),
+                Err(error) => self
+                    .persistence_failure(&request, pending.old_runtime, error)
+                    .messages
+                    .remove(0),
+            };
+            emit(&terminal);
+            return RestartOutcome {
+                messages: vec![started, terminal],
+                replayed: false,
+            };
+        }
         let terminal = match self.commit_replacement(&request, &pending.old_runtime, replacement_id)
         {
             Ok((_replacement, terminal)) => terminal,
@@ -1324,6 +1560,11 @@ impl RestartCoordinator {
         old_runtime: &RuntimeDescriptor,
         replacement_id: String,
     ) -> std::io::Result<(RuntimeDescriptor, ServerMessage)> {
+        if replacement_id == old_runtime.runtime_id {
+            return Err(std::io::Error::other(
+                "replacement reported the retired runtime id",
+            ));
+        }
         let locator = RuntimeLocator::from_request(request);
         let replacement = {
             let ownership = self.ownership.lock().expect("restart ownership lock");
@@ -1350,13 +1591,12 @@ impl RestartCoordinator {
             runtime: replacement.clone(),
         });
         self.try_update_ownership("commit_replacement", |ownership| {
-            ownership.descriptor_by_live.insert(
-                (request.kind, replacement.runtime_id.clone()),
-                replacement.clone(),
-            );
+            let replacement_key = (request.kind, replacement.runtime_id.clone());
             ownership
-                .last_generation
-                .insert(locator.clone(), replacement.generation);
+                .descriptor_by_live
+                .insert(replacement_key.clone(), replacement.clone());
+            Self::touch_descriptor_locked(ownership, replacement_key);
+            Self::set_generation_locked(ownership, locator.clone(), replacement.generation);
             Self::bind_locator_locked(
                 ownership,
                 locator,
@@ -1365,6 +1605,7 @@ impl RestartCoordinator {
             );
             ownership.pending_recoveries.remove(&request.request_id);
             self.insert_result_locked(ownership, request, terminal.clone());
+            Self::prune_ownership_locked(ownership, self.ownership_limit);
         })?;
         tracing::info!(
             request_id = %request.request_id,
@@ -1668,7 +1909,7 @@ impl ProductionRestartRuntime {
                 ServerMessage::FreshAgentCreated(created)
                     if created.request_id == create_request_id =>
                 {
-                    return created
+                    let runtime_id = created
                         .runtime
                         .map(|runtime| runtime.runtime_id)
                         .ok_or_else(|| {
@@ -1677,7 +1918,17 @@ impl ProductionRestartRuntime {
                                 "fresh-agent replacement omitted its runtime descriptor",
                                 true,
                             )
-                        });
+                        })?;
+                    if runtime_id == request.live_id
+                        || !self.fresh_is_live(provider, &request.session_id).await
+                    {
+                        return Err(RestartFailure::new(
+                            AgentRestartFailureCode::ReplacementFailed,
+                            "fresh-agent replacement did not become a distinct live runtime",
+                            true,
+                        ));
+                    }
+                    return Ok(runtime_id);
                 }
                 ServerMessage::FreshAgentCreateFailed(failed)
                     if failed.request_id == create_request_id =>
@@ -1782,7 +2033,7 @@ impl RestartRuntime for ProductionRestartRuntime {
         request: &AgentRestart,
         _plan: &(),
     ) -> Result<(), RestartFailure> {
-        let (provider, session_type) = Self::provider(request)?;
+        let (provider, _) = Self::provider(request)?;
         match request.kind {
             AgentRuntimeKind::Terminal => {
                 if !crate::terminal::shutdown_terminal_for_restart(&self.state, &request.live_id) {
@@ -1794,23 +2045,33 @@ impl RestartRuntime for ProductionRestartRuntime {
                 }
             }
             AgentRuntimeKind::FreshAgent => {
-                let kill = freshell_protocol::FreshAgentKill {
-                    provider,
-                    session_id: request.session_id.clone(),
-                    session_type,
-                    cwd: None,
-                };
-                match provider {
+                let stopped = match provider {
                     freshell_protocol::AgentProvider::Claude => {
-                        self.state.fresh_claude.handle_kill(kill).await
+                        self.state
+                            .fresh_claude
+                            .shutdown_for_restart(&request.session_id, &request.live_id)
+                            .await
                     }
                     freshell_protocol::AgentProvider::Codex => {
-                        self.state.fresh_codex.handle_kill(kill).await
+                        self.state
+                            .fresh_codex
+                            .shutdown_for_restart(&request.session_id, &request.live_id)
+                            .await
                     }
                     freshell_protocol::AgentProvider::Opencode => {
-                        self.state.fresh_opencode.handle_kill(kill).await
+                        self.state
+                            .fresh_opencode
+                            .shutdown_for_restart(&request.session_id, &request.live_id)
+                            .await
                     }
                     freshell_protocol::AgentProvider::Amplifier => unreachable!(),
+                };
+                if !stopped {
+                    return Err(RestartFailure::new(
+                        AgentRestartFailureCode::StaleGeneration,
+                        "selected fresh-agent runtime changed before shutdown",
+                        false,
+                    ));
                 }
             }
         }
@@ -1831,11 +2092,34 @@ impl RestartRuntime for ProductionRestartRuntime {
         self.create_from_builtin_path(request, plan).await
     }
 
-    async fn recover_replacement(&self, request: &AgentRestart) -> Result<String, RestartFailure> {
+    fn persisted_resume_context(
+        &self,
+        request: &AgentRestart,
+        _plan: &(),
+    ) -> Option<RestartResumeContext> {
+        self.plans
+            .lock()
+            .expect("production restart plans")
+            .get(&request.request_id)
+            .map(|plan| RestartResumeContext {
+                terminal_cwd: plan.cwd.clone(),
+            })
+    }
+
+    async fn recover_replacement(
+        &self,
+        request: &AgentRestart,
+        context: Option<&RestartResumeContext>,
+    ) -> Result<String, RestartFailure> {
         Self::provider(request)?;
         self.validate_durable(request)?;
-        self.create_from_builtin_path(request, ProductionResumePlan { cwd: None })
-            .await
+        self.create_from_builtin_path(
+            request,
+            ProductionResumePlan {
+                cwd: context.and_then(|context| context.terminal_cwd.clone()),
+            },
+        )
+        .await
     }
 }
 

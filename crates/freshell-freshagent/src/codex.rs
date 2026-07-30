@@ -1292,6 +1292,35 @@ impl FreshCodexState {
         }));
     }
 
+    /// Restart-only teardown fenced to the exact runtime selected by the
+    /// coordinator. The descriptor check and map removal share one lock scope,
+    /// so a stale restart can never remove a newer route for the same thread.
+    pub async fn shutdown_for_restart(&self, session_id: &str, expected_runtime_id: &str) -> bool {
+        let removed = {
+            let mut sessions = self.sessions.lock().await;
+            match sessions.get(session_id) {
+                Some(session) if session.runtime.runtime_id == expected_runtime_id => {
+                    sessions.remove(session_id)
+                }
+                _ => None,
+            }
+        };
+        let Some(session) = removed else {
+            return false;
+        };
+        session.consumer.abort();
+        session.client.close().await;
+        if let Some(kill_tx) = session.kill_tx {
+            let _ = kill_tx.send(());
+        }
+        let _ = session.watcher.await;
+        self.leases.clear_binding(PROVIDER, session_id);
+        self.create_dedup
+            .clear_for_session(|record| record.session_id == session_id)
+            .await;
+        true
+    }
+
     // ── freshAgent.attach (reload-rehydrate, PR-4) ──────────────────────────
 
     /// Reconcile liveness probe (campaign §4.3, Task 13): is this thread id
@@ -4489,6 +4518,33 @@ pub(crate) mod tests {
             !st.sessions.lock().await.contains_key("thread-1"),
             "session removed"
         );
+    }
+
+    #[tokio::test]
+    async fn restart_shutdown_removes_only_the_exact_codex_runtime() {
+        let (transport, _peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let st = state();
+        insert_fake_session(
+            &st,
+            "thread-restart",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-restart",
+        )
+        .await;
+
+        assert!(
+            !st.shutdown_for_restart("thread-restart", "fresh-runtime-stale")
+                .await
+        );
+        assert!(st.has_live_session("thread-restart").await);
+        assert!(
+            st.shutdown_for_restart("thread-restart", "fresh-runtime-test-thread-restart")
+                .await
+        );
+        assert!(!st.has_live_session("thread-restart").await);
     }
 
     #[tokio::test]

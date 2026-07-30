@@ -9,7 +9,9 @@ use freshell_protocol::{
     TerminalAttachReady, TerminalCreated, TerminalExit, TerminalInventory, TerminalOutput,
     TerminalRunStatus, TerminalSessionAssociated,
 };
-use freshell_ws::restart::{RestartCoordinator, RestartFailure, RestartRuntime, RuntimeLocator};
+use freshell_ws::restart::{
+    RestartCoordinator, RestartFailure, RestartResumeContext, RestartRuntime, RuntimeLocator,
+};
 use futures_util::SinkExt;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
@@ -484,6 +486,67 @@ async fn retired_runtime_frames_keep_the_old_generation_fence() {
     );
 }
 
+#[tokio::test]
+async fn late_association_from_retired_terminal_cannot_reclaim_the_locator() {
+    let coordinator = RestartCoordinator::new();
+    let old = coordinator.register_initial(locator(), "term-1");
+    coordinator
+        .execute(
+            restart("r1", "term-1", old.generation),
+            &FakeRuntime::resumable("term-2"),
+        )
+        .await;
+
+    let mut late = ServerMessage::TerminalSessionAssociated(TerminalSessionAssociated {
+        terminal_id: "term-1".to_string(),
+        session_ref: SessionLocator {
+            provider: "claude".to_string(),
+            session_id: "durable-1".to_string(),
+        },
+        previous_session_id: None,
+        runtime: None,
+    });
+    coordinator.observe_server_message(&mut late);
+
+    assert_eq!(
+        coordinator.runtime_for_locator(&locator()),
+        Some(RuntimeDescriptor {
+            runtime_id: "term-2".to_string(),
+            generation: old.generation + 1,
+        }),
+        "a delayed association from the retired predecessor must not become current"
+    );
+    let ServerMessage::TerminalSessionAssociated(late) = late else {
+        unreachable!()
+    };
+    assert_eq!(
+        late.runtime,
+        Some(old),
+        "the delayed frame still carries the predecessor fence"
+    );
+}
+
+#[tokio::test]
+async fn replacement_must_report_a_distinct_live_runtime() {
+    let coordinator = RestartCoordinator::new();
+    coordinator.register_initial(locator(), "term-1");
+
+    let outcome = coordinator
+        .execute(
+            restart("same-runtime", "term-1", 1),
+            &FakeRuntime::resumable("term-1"),
+        )
+        .await;
+
+    assert!(matches!(
+        outcome.messages.last(),
+        Some(ServerMessage::AgentRestartFailed(message))
+            if message.code == AgentRestartFailureCode::ReplacementFailed
+                && message.retryable
+    ));
+    assert_eq!(coordinator.runtime_for_locator(&locator()), None);
+}
+
 #[test]
 fn fresh_agent_create_and_stream_frames_share_one_descriptor() {
     let coordinator = RestartCoordinator::new();
@@ -808,6 +871,190 @@ async fn coordinator_bounds_result_and_lock_retention() {
     assert_eq!(reopened.retained_result_count(), 2);
 }
 
+#[test]
+fn coordinator_bounds_runtime_identity_and_generation_retention() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("bounded-ownership-state.json");
+    let coordinator = RestartCoordinator::new_persistent_with_limits(path.clone(), 2, 2).unwrap();
+
+    for index in 0..8 {
+        let locator = RuntimeLocator::new(
+            AgentRuntimeKind::FreshAgent,
+            "claude",
+            format!("durable-{index}"),
+        );
+        let descriptor = coordinator.register_initial(locator, format!("fresh-{index}"));
+        let mut created = ServerMessage::FreshAgentCreated(FreshAgentCreated {
+            provider: "claude".to_string(),
+            request_id: format!("create-{index}"),
+            runtime_provider: "claude".to_string(),
+            session_id: format!("alias-{index}"),
+            session_type: "freshclaude".to_string(),
+            session_ref: Some(SessionLocator {
+                provider: "claude".to_string(),
+                session_id: format!("durable-{index}"),
+            }),
+            runtime: Some(descriptor),
+        });
+        coordinator.observe_server_message(&mut created);
+    }
+
+    let counts = coordinator.retained_ownership_counts();
+    assert!(counts.descriptors <= 2, "{counts:?}");
+    assert!(counts.live_locators <= 2, "{counts:?}");
+    assert!(counts.current_locators <= 2, "{counts:?}");
+    assert!(counts.fresh_aliases <= 2, "{counts:?}");
+    assert!(counts.generation_high_waters <= 2, "{counts:?}");
+    drop(coordinator);
+
+    let reopened = RestartCoordinator::new_persistent_with_limits(path, 2, 2).unwrap();
+    assert!(reopened.retained_ownership_counts().generation_high_waters <= 2);
+}
+
+#[tokio::test]
+async fn retired_descriptor_fences_late_frames_only_for_the_bounded_window() {
+    let coordinator = RestartCoordinator::new_with_limits(2, 2);
+    let old = coordinator.register_initial(locator(), "term-old");
+    coordinator
+        .execute(
+            restart("bounded-fence", "term-old", old.generation),
+            &FakeRuntime::resumable("term-new"),
+        )
+        .await;
+    assert_eq!(
+        coordinator.runtime_for_live(AgentRuntimeKind::Terminal, "term-old"),
+        Some(old)
+    );
+
+    coordinator.register_live(AgentRuntimeKind::Terminal, "unrelated");
+
+    assert_eq!(
+        coordinator.runtime_for_live(AgentRuntimeKind::Terminal, "term-old"),
+        None,
+        "the oldest retired fence is eventually evicted instead of leaking forever"
+    );
+}
+
+struct ContextRecoveryRuntime {
+    expected_cwd: String,
+}
+
+#[async_trait::async_trait]
+impl RestartRuntime for ContextRecoveryRuntime {
+    type ResumePlan = ();
+
+    async fn preflight(&self, _request: &AgentRestart) -> Result<(), RestartFailure> {
+        Ok(())
+    }
+
+    async fn shutdown_for_restart(
+        &self,
+        _request: &AgentRestart,
+        _plan: &(),
+    ) -> Result<(), RestartFailure> {
+        Ok(())
+    }
+
+    async fn create_replacement(
+        &self,
+        _request: &AgentRestart,
+        _plan: (),
+    ) -> Result<String, RestartFailure> {
+        Err(RestartFailure::new(
+            AgentRestartFailureCode::ReplacementFailed,
+            "restart server before replacement",
+            true,
+        ))
+    }
+
+    fn persisted_resume_context(
+        &self,
+        _request: &AgentRestart,
+        _plan: &(),
+    ) -> Option<RestartResumeContext> {
+        Some(RestartResumeContext {
+            terminal_cwd: Some(self.expected_cwd.clone()),
+        })
+    }
+
+    async fn recover_replacement(
+        &self,
+        _request: &AgentRestart,
+        context: Option<&RestartResumeContext>,
+    ) -> Result<String, RestartFailure> {
+        assert_eq!(
+            context.and_then(|context| context.terminal_cwd.as_deref()),
+            Some(self.expected_cwd.as_str())
+        );
+        Ok("term-context-recovered".to_string())
+    }
+}
+
+#[tokio::test]
+async fn terminal_resume_context_survives_boot_recovery() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("restart-state.json");
+    let request = restart("context-r1", "term-1", 1);
+    let runtime = ContextRecoveryRuntime {
+        expected_cwd: "/workspace/project".to_string(),
+    };
+    let coordinator = RestartCoordinator::new_persistent(path.clone()).unwrap();
+    coordinator.register_initial(locator(), "term-1");
+    coordinator.execute(request.clone(), &runtime).await;
+    drop(coordinator);
+
+    let reopened = RestartCoordinator::new_persistent(path).unwrap();
+    let recovered = reopened.execute(request, &runtime).await;
+
+    assert!(matches!(
+        recovered.messages.last(),
+        Some(ServerMessage::AgentRestartReplaced(message))
+            if message.runtime.runtime_id == "term-context-recovered"
+    ));
+}
+
+#[tokio::test]
+async fn production_boot_recovery_recreates_terminal_with_persisted_cwd() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("restart-state.json");
+    let cwd = temp.path().join("restored-working-directory");
+    std::fs::create_dir(&cwd).unwrap();
+    let locator = RuntimeLocator::new(AgentRuntimeKind::Terminal, "amplifier", "durable-context");
+    let request = AgentRestart {
+        request_id: "production-context-r1".to_string(),
+        provider: "amplifier".to_string(),
+        session_id: "durable-context".to_string(),
+        kind: AgentRuntimeKind::Terminal,
+        live_id: "term-context-old".to_string(),
+        expected_generation: 1,
+    };
+    let failing = ContextRecoveryRuntime {
+        expected_cwd: cwd.to_string_lossy().into_owned(),
+    };
+    let coordinator = RestartCoordinator::new_persistent(path.clone()).unwrap();
+    coordinator.register_initial(locator, &request.live_id);
+    coordinator.execute(request.clone(), &failing).await;
+    drop(coordinator);
+
+    let (_url, registry, mut state) =
+        common::spawn_server_with_specs_and_state(vec![common::sleeper_cli_spec("amplifier")])
+            .await;
+    state.session_existence = Arc::new(PresentSessions);
+    let reopened = RestartCoordinator::new_persistent(path).unwrap();
+    let production = freshell_ws::restart::ProductionRestartRuntime::new(state);
+    let recovered = reopened.execute(request, &production).await;
+    let ServerMessage::AgentRestartReplaced(replaced) =
+        recovered.messages.last().expect("terminal result")
+    else {
+        panic!("expected production replacement: {:?}", recovered.messages)
+    };
+    let probe = registry
+        .probe(&replaced.runtime.runtime_id)
+        .expect("replacement terminal is live");
+    assert_eq!(probe.cwd.as_deref(), cwd.to_str());
+    registry.kill_all();
+}
+
 struct ConcurrentRuntime {
     entered: Arc<tokio::sync::Barrier>,
     replacement: &'static str,
@@ -888,8 +1135,7 @@ async fn connected_websocket_dispatches_restart_started_replaced_and_failed() {
             "term-ws-1",
             1,
         )))
-        .unwrap()
-        .into(),
+        .unwrap(),
     ))
     .await
     .unwrap();
@@ -915,9 +1161,7 @@ async fn connected_websocket_dispatches_restart_started_replaced_and_failed() {
         expected_generation: 1,
     };
     ws.send(WsMessage::Text(
-        serde_json::to_string(&ClientMessage::AgentRestart(failed_request))
-            .unwrap()
-            .into(),
+        serde_json::to_string(&ClientMessage::AgentRestart(failed_request)).unwrap(),
     ))
     .await
     .unwrap();
@@ -967,8 +1211,7 @@ async fn production_terminal_adapter_uses_the_builtin_restore_path() {
             live_id: terminal_id.clone(),
             expected_generation: generation,
         }))
-        .unwrap()
-        .into(),
+        .unwrap(),
     ))
     .await
     .unwrap();

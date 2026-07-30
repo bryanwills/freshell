@@ -641,6 +641,7 @@ impl FreshClaudeState {
             .lock()
             .await
             .retain(|_, mapped| mapped != &map_key);
+        self.leases.clear_binding(PROVIDER, &session_id);
 
         self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
             provider: PROVIDER.to_string(),
@@ -648,6 +649,62 @@ impl FreshClaudeState {
             session_type: session_type.to_string(),
             success: true,
         }));
+    }
+
+    /// Restart-only teardown, atomically fenced to the exact live runtime
+    /// descriptor selected by the coordinator. A durable-session match alone
+    /// is insufficient: a replacement may already have claimed the same
+    /// durable id while a stale restart task is awaiting this call.
+    pub async fn shutdown_for_restart(
+        &self,
+        durable_session_id: &str,
+        expected_runtime_id: &str,
+    ) -> bool {
+        let map_key = self
+            .resolve_session_key(durable_session_id)
+            .await
+            .unwrap_or_else(|| durable_session_id.to_string());
+        let removed = {
+            let mut sessions = self.sessions.lock().await;
+            match sessions.get(&map_key) {
+                Some(session) if session.runtime.runtime_id == expected_runtime_id => {
+                    sessions.remove(&map_key)
+                }
+                _ => None,
+            }
+        };
+        let Some(session) = removed else {
+            return false;
+        };
+
+        session.consumer.abort();
+        let mut stdin = session.stdin;
+        let _ = stdin.write_all(b"{\"type\":\"shutdown\"}\n").await;
+        let _ = stdin.flush().await;
+        if let Some(pid) = session.child.id() {
+            terminate_pid(pid as i32);
+        }
+        let mut child = session.child;
+        let _ = child.start_kill();
+        reap_owned_claude_sidecars(&session.ownership_id);
+
+        self.create_dedup
+            .clear_for_session(|record| record.session_id == map_key)
+            .await;
+        let mut removed_durables = Vec::new();
+        self.cli_index.lock().await.retain(|durable, mapped| {
+            if mapped == &map_key {
+                removed_durables.push(durable.clone());
+                false
+            } else {
+                true
+            }
+        });
+        self.leases.clear_binding(PROVIDER, durable_session_id);
+        for durable in removed_durables {
+            self.leases.clear_binding(PROVIDER, &durable);
+        }
+        true
     }
 
     // ── freshAgent.interrupt (WS) ────────────────────────────────────────────
@@ -1675,6 +1732,44 @@ pub(crate) mod tests {
                 cli_session_id: None,
                 broadcast_id: Arc::new(std::sync::Mutex::new(session_id.to_string())),
             },
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_shutdown_is_runtime_fenced_and_clears_the_durable_lease_binding() {
+        let st = state();
+        let durable = "durable-restart";
+        insert_fake_claude_session(&st, durable).await;
+        st.cli_index
+            .lock()
+            .await
+            .insert(durable.to_string(), durable.to_string());
+        assert_eq!(
+            st.leases.claim(PROVIDER, durable, "original", 1),
+            crate::session_lease::FreshSessionClaim::Acquired
+        );
+        assert!(st.leases.complete(PROVIDER, durable, "original", durable));
+
+        assert!(
+            !st.shutdown_for_restart(durable, "fresh-runtime-wrong")
+                .await,
+            "a stale descriptor must not tear down the current session"
+        );
+        assert!(st.has_live_session(durable).await);
+        assert!(matches!(
+            st.leases.claim(PROVIDER, durable, "contender", 2),
+            crate::session_lease::FreshSessionClaim::BoundLive { .. }
+        ));
+
+        assert!(
+            st.shutdown_for_restart(durable, "fresh-runtime-test-durable-restart")
+                .await
+        );
+        assert!(!st.has_live_session(durable).await);
+        assert_eq!(
+            st.leases.claim(PROVIDER, durable, "replacement", 3),
+            crate::session_lease::FreshSessionClaim::Acquired,
+            "successful explicit restart teardown must reopen the durable lease"
         );
     }
 
