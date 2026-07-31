@@ -21,7 +21,7 @@
 >   after each). They do NOT indicate pending work: every step of every task
 >   was executed and committed.
 > - **The branch's git history was subsequently REWORDED in place** (two
->   commit messages corrected; commit `97ab164a0` remapped the checklist
+>   commit messages corrected; commit `6976f1caf` remapped the checklist
 >   SHAs). `origin/feat/rust-resolve-parity` still holds the divergent
 >   pre-reword history, so Task 7's plain
 >   `git push -u origin feat/rust-resolve-parity` no longer applies:
@@ -33,7 +33,7 @@
 >   parity via `provider_home()`; resolve admission rescoped to the fallback
 >   dispatch) — the `POST-EXECUTION NOTE` blocks in the body mark where the
 >   landed implementation diverged from the original planned text.
-> - ERRATA (2026-07-31): the interim admission design (through `37be35b9a`)
+> - ERRATA (2026-07-31): the interim admission design (through `63bb31390`)
 >   awaited the semaphore INSIDE the outer resolver blocking worker, so permit
 >   starvation pinned an unbounded blocking-pool worker per dispatch for the
 >   full deadline — the exhaustion the semaphore claimed to prevent; fixed by
@@ -2166,7 +2166,7 @@ In `docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md`, append a N
 
 > **POST-EXECUTION NOTE (2026-07-31):** the `c38422a0` reference above is a
 > PRE-REWORD SHA that no longer exists in this branch's history (the branch
-> was reworded in place; commit `97ab164a0` remapped the checklist's SHAs).
+> was reworded in place; commit `6976f1caf` remapped the checklist's SHAs).
 > The bullet it points at now reads `PARTIAL / REOPENED (2026-07-30)` with no
 > commit reference, and the new bullet this step appends landed in the
 > checklist citing the reworded implementation commit `22022a848`.
