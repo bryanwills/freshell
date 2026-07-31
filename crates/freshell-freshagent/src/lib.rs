@@ -87,6 +87,27 @@ pub struct FreshAgentRestartResumePlan {
     pub settings: FreshAgentSettings,
 }
 
+/// Whether a mutating client control selects this exact live runtime.
+///
+/// Runtime metadata was added after the original fresh-agent protocol. An
+/// untagged control is compatible only with a first-generation runtime: no
+/// predecessor can exist yet, so it cannot accidentally mutate a replacement.
+/// Once a durable session has crossed a replacement boundary, both fields are
+/// mandatory and must match exactly.
+pub(crate) fn control_targets_runtime(
+    expected_runtime_id: Option<&str>,
+    expected_generation: Option<u64>,
+    runtime: &freshell_protocol::RuntimeDescriptor,
+) -> bool {
+    match (expected_runtime_id, expected_generation) {
+        (Some(runtime_id), Some(generation)) => {
+            runtime.runtime_id == runtime_id && runtime.generation == generation
+        }
+        (None, None) => runtime.generation <= 1,
+        _ => false,
+    }
+}
+
 /// Task 13b: the injected cross-kind liveness probe -- `(provider, session_id) -> bool`,
 /// true when a live terminal PTY currently owns that session. Constructed by
 /// `freshell-server`'s `main.rs` over the SAME probes the terminal D7 create-rung guard
@@ -149,6 +170,14 @@ const DEFAULT_TURN_TIMEOUT: Duration = Duration::from_secs(180);
 /// the terminal create pipeline before this seam is called.
 pub type RestartRetirementProbe = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
 
+/// Opaque permit returned by the server-owned restart coordinator. REST
+/// terminal creation retains it through spawn and ownership registration,
+/// without introducing a dependency from this crate back to `freshell-ws`.
+pub type RestartAdmissionPermit = Box<dyn std::any::Any + Send>;
+pub type RestartAdmissionFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<RestartAdmissionPermit, ()>> + Send>>;
+pub type RestartAdmissionGate = Arc<dyn Fn(String, String) -> RestartAdmissionFuture + Send + Sync>;
+
 /// Shared, cheaply-cloneable fresh-agent REST state (mergeable into the server app).
 #[derive(Clone)]
 pub struct FreshAgentState {
@@ -183,6 +212,9 @@ pub struct FreshAgentState {
     /// `None` keeps isolated crate tests that do not construct a coordinator
     /// usable.
     pub(crate) restart_retirement_probe: Option<RestartRetirementProbe>,
+    /// Atomic cross-kind restart admission. Unlike the read-only probe, this
+    /// returns a permit held through the final spawn/adoption commit.
+    pub(crate) restart_admission_gate: Option<RestartAdmissionGate>,
     /// paneId -> terminal pane record (Slice 1 `mode:'shell'` terminals
     /// created via `POST /api/tabs`). Disjoint from `panes` (fresh-agent-only)
     /// and `content_panes` (browser/editor) -- a pane id appears in exactly
@@ -313,6 +345,7 @@ impl FreshAgentState {
             terminal_registry: None,
             session_identity: None,
             restart_retirement_probe: None,
+            restart_admission_gate: None,
             terminal_panes: Arc::new(Mutex::new(HashMap::new())),
             content_panes: Arc::new(Mutex::new(HashMap::new())),
             tabs: Arc::new(Mutex::new(HashMap::new())),
@@ -502,6 +535,12 @@ impl FreshAgentState {
     /// probe into REST terminal create/split/respawn.
     pub fn with_restart_retirement_probe(mut self, probe: RestartRetirementProbe) -> Self {
         self.restart_retirement_probe = Some(probe);
+        self
+    }
+
+    /// Wire the restart coordinator's atomic durable-session admission gate.
+    pub fn with_restart_admission_gate(mut self, gate: RestartAdmissionGate) -> Self {
+        self.restart_admission_gate = Some(gate);
         self
     }
 

@@ -910,6 +910,10 @@ export function FreshAgentView({
       sessionId: current.sessionId,
       sessionType: current.sessionType,
       provider: current.provider,
+      ...(current.runtimeId && current.runtimeGeneration !== undefined ? {
+        expectedRuntimeId: current.runtimeId,
+        expectedGeneration: current.runtimeGeneration,
+      } : {}),
       ...(cwd ? { cwd } : {}),
       text,
       settings: {
@@ -1073,6 +1077,10 @@ export function FreshAgentView({
         sessionId: current.sessionId,
         sessionType: current.sessionType,
         provider: current.provider,
+        ...(current.runtimeId && current.runtimeGeneration !== undefined ? {
+          expectedRuntimeId: current.runtimeId,
+          expectedGeneration: current.runtimeGeneration,
+        } : {}),
         ...(cwd ? { cwd } : {}),
       })
     }
@@ -1742,6 +1750,10 @@ export function FreshAgentView({
             sessionId: paneContent.sessionId,
             sessionType: paneContent.sessionType,
             provider: paneContent.provider,
+            ...(paneContent.runtimeId && paneContent.runtimeGeneration !== undefined ? {
+              expectedRuntimeId: paneContent.runtimeId,
+              expectedGeneration: paneContent.runtimeGeneration,
+            } : {}),
             ...(cwd ? { cwd } : {}),
           })
         }
@@ -2392,6 +2404,10 @@ export function FreshAgentView({
         sessionId: paneContent.sessionId,
         sessionType: paneContent.sessionType,
         provider: paneContent.provider,
+        ...(paneContent.runtimeId && paneContent.runtimeGeneration !== undefined ? {
+          expectedRuntimeId: paneContent.runtimeId,
+          expectedGeneration: paneContent.runtimeGeneration,
+        } : {}),
         ...(freshOpenCodeRouteCwd ? { cwd: freshOpenCodeRouteCwd } : {}),
       })
     }

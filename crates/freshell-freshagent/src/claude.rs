@@ -653,7 +653,36 @@ impl FreshClaudeState {
             .resolve_session_key(&session_id)
             .await
             .unwrap_or_else(|| session_id.clone());
-        let removed = self.sessions.lock().await.remove(&map_key);
+        let removed = {
+            let mut sessions = self.sessions.lock().await;
+            match sessions.get(&map_key) {
+                Some(session)
+                    if crate::control_targets_runtime(
+                        msg.expected_runtime_id.as_deref(),
+                        msg.expected_generation,
+                        &session.runtime,
+                    ) =>
+                {
+                    sessions.remove(&map_key)
+                }
+                Some(_) => {
+                    drop(sessions);
+                    self.send_error(
+                        &None,
+                        "STALE_RUNTIME",
+                        "claude control targets a replaced runtime",
+                    );
+                    return;
+                }
+                None if msg.expected_runtime_id.is_some() || msg.expected_generation.is_some() => {
+                    drop(sessions);
+                    self.send_error(&None, "SESSION_NOT_FOUND", "claude session not found");
+                    return;
+                }
+                None => None,
+            }
+        };
+        let killed_runtime = removed.as_ref().map(|session| session.runtime.clone());
         if let Some(session) = removed {
             session.consumer.abort();
             let mut stdin = session.stdin;
@@ -688,6 +717,7 @@ impl FreshClaudeState {
             session_id,
             session_type: session_type.to_string(),
             success: true,
+            runtime: killed_runtime,
         }));
     }
 
@@ -897,6 +927,19 @@ impl FreshClaudeState {
             self.send_error(&None, "SESSION_NOT_FOUND", "claude session not found");
             return;
         };
+        if !crate::control_targets_runtime(
+            msg.expected_runtime_id.as_deref(),
+            msg.expected_generation,
+            &session.runtime,
+        ) {
+            drop(guard);
+            self.send_error(
+                &None,
+                "STALE_RUNTIME",
+                "claude control targets a replaced runtime",
+            );
+            return;
+        }
         // Address the sidecar by ITS id for this session (== the map key for created
         // sessions; differs for resumed-on-attach sessions, Task 6).
         let interrupt_req = json!({ "type": "interrupt", "sessionId": session.sidecar_session_id });
@@ -930,6 +973,19 @@ impl FreshClaudeState {
             self.send_error(&request_id, "SESSION_NOT_FOUND", "claude session not found");
             return;
         };
+        if !crate::control_targets_runtime(
+            msg.expected_runtime_id.as_deref(),
+            msg.expected_generation,
+            &session.runtime,
+        ) {
+            drop(guard);
+            self.send_error(
+                &request_id,
+                "STALE_RUNTIME",
+                "claude control targets a replaced runtime",
+            );
+            return;
+        }
         // Address the sidecar by ITS id for this session (== the map key for created
         // sessions; differs for resumed-on-attach sessions, Task 6).
         let send_req =
@@ -2909,6 +2965,8 @@ rl.on('line', (line) => {
 
     fn send_msg(session_id: &str, text: &str) -> FreshAgentSend {
         FreshAgentSend {
+            expected_runtime_id: None,
+            expected_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: session_id.to_string(),
             session_type: SessionType::Freshclaude,
@@ -3074,6 +3132,8 @@ rl.on('line', (line) => {
         let killed_session_id = created["sessionId"].as_str().unwrap().to_string();
 
         st.handle_kill(FreshAgentKill {
+            expected_runtime_id: None,
+            expected_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: killed_session_id.clone(),
             session_type: SessionType::Freshclaude,
@@ -3106,6 +3166,8 @@ rl.on('line', (line) => {
         let st = FreshClaudeState::new(Arc::new(tx));
 
         st.handle_kill(FreshAgentKill {
+            expected_runtime_id: None,
+            expected_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: "unknown-session".to_string(),
             session_type: SessionType::Freshclaude,
@@ -3117,6 +3179,78 @@ rl.on('line', (line) => {
         assert_eq!(frame["type"], "freshAgent.killed");
         assert_eq!(frame["success"], true);
         assert_eq!(frame["sessionId"], "unknown-session");
+    }
+
+    #[tokio::test]
+    async fn stale_kilroy_controls_cannot_mutate_a_replacement_runtime() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let st = FreshClaudeState::new(Arc::new(tx));
+        let mut create = dedup_create_msg("req-kilroy-stale-kill");
+        create.session_type = SessionType::Kilroy;
+        st.handle_create(create).await;
+        let created = await_claude_created(&mut rx, "req-kilroy-stale-kill").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+        let replacement = {
+            let mut sessions = st.sessions.lock().await;
+            let session = sessions.get_mut(&session_id).unwrap();
+            session.runtime.generation = 2;
+            session.runtime.clone()
+        };
+
+        let mut stale_send = send_msg(&session_id, "stale turn");
+        stale_send.expected_runtime_id = Some(replacement.runtime_id.clone());
+        stale_send.expected_generation = Some(1);
+        stale_send.request_id = Some("stale-kilroy-send".to_string());
+        st.handle_send(stale_send).await;
+        let send_error: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert!(send_error["message"]
+            .as_str()
+            .unwrap()
+            .contains("STALE_RUNTIME"));
+
+        st.handle_interrupt(FreshAgentInterrupt {
+            expected_runtime_id: Some(replacement.runtime_id.clone()),
+            expected_generation: Some(1),
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: session_id.clone(),
+            session_type: SessionType::Kilroy,
+            cwd: None,
+        })
+        .await;
+        let interrupt_error: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert!(interrupt_error["message"]
+            .as_str()
+            .unwrap()
+            .contains("STALE_RUNTIME"));
+
+        st.handle_kill(FreshAgentKill {
+            expected_runtime_id: Some(replacement.runtime_id.clone()),
+            expected_generation: Some(1),
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: session_id.clone(),
+            session_type: SessionType::Kilroy,
+            cwd: None,
+        })
+        .await;
+
+        assert!(st.sessions.lock().await.contains_key(&session_id));
+        let error: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(error["type"], "error");
+        assert!(error["message"].as_str().unwrap().contains("STALE_RUNTIME"));
+
+        st.handle_kill(FreshAgentKill {
+            expected_runtime_id: Some(replacement.runtime_id),
+            expected_generation: Some(replacement.generation),
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id,
+            session_type: SessionType::Kilroy,
+            cwd: None,
+        })
+        .await;
+        let killed: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(killed["runtime"]["generation"], 2);
     }
 
     // ── cliSessionId recording (restart-parity plan §2.8 item 2) ──────────────────
@@ -3162,6 +3296,8 @@ rl.on('line', (line) => {
         );
         // Kill evicts the index entry.
         st.handle_kill(FreshAgentKill {
+            expected_runtime_id: None,
+            expected_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: created.clone(),
             session_type: SessionType::Freshclaude,
@@ -3538,6 +3674,8 @@ rl.on('line', (line) => {
         let st = FreshClaudeState::new(Arc::new(tx));
 
         st.handle_interrupt(FreshAgentInterrupt {
+            expected_runtime_id: None,
+            expected_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: "does-not-exist".to_string(),
             session_type: SessionType::Freshclaude,
@@ -3575,6 +3713,8 @@ rl.on('line', (line) => {
         let session_id = created["sessionId"].as_str().unwrap().to_string();
 
         st.handle_interrupt(FreshAgentInterrupt {
+            expected_runtime_id: None,
+            expected_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: session_id.clone(),
             session_type: SessionType::Freshclaude,

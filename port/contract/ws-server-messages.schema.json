@@ -1220,6 +1220,22 @@
         "provider": {
           "type": "string"
         },
+        "runtime": {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "type": "number"
+            },
+            "runtimeId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "generation",
+            "runtimeId"
+          ],
+          "type": "object"
+        },
         "sessionId": {
           "type": "string"
         },
@@ -3283,6 +3299,22 @@
         },
         "oldTerminalId": {
           "type": "string"
+        },
+        "runtime": {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "type": "number"
+            },
+            "runtimeId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "generation",
+            "runtimeId"
+          ],
+          "type": "object"
         },
         "type": {
           "const": "terminal.replaced",

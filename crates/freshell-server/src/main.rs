@@ -211,11 +211,13 @@ async fn main() -> ExitCode {
             Err(error) => {
                 tracing::error!(
                     error = %error,
-                    "agent.restart.persistence.load_failed: restart transactions disabled"
+                    "agent.restart.persistence.load_failed: refusing startup"
                 );
-                freshell_ws::restart::RestartCoordinator::disabled_for_persistence(format!(
-                    "restart state could not be loaded: {error}"
-                ))
+                eprintln!(
+                    "freshell-server: restart transaction journal unavailable; \
+                     refusing to start: {error}"
+                );
+                return ExitCode::FAILURE;
             }
         },
         None => freshell_ws::restart::RestartCoordinator::disabled_for_persistence(
@@ -272,6 +274,7 @@ async fn main() -> ExitCode {
     // `with_shared_sessions_revision` unifies its `sessions.changed` emission onto the
     // SAME sequence as `ws_state.sessions_revision` below (SESSION-09 fix-forward).
     let restart_retirement_probe = restart.clone();
+    let restart_admission_gate = restart.clone();
     let fresh_agent_state =
         FreshAgentState::new(Arc::clone(&auth_token), Arc::clone(&broadcast_tx))
             .with_shared_sessions_revision(Arc::clone(&sessions_revision))
@@ -283,6 +286,17 @@ async fn main() -> ExitCode {
                         session_id,
                     ),
                 )
+            }))
+            .with_restart_admission_gate(Arc::new(move |provider, session_id| {
+                let restart = restart_admission_gate.clone();
+                Box::pin(async move {
+                    restart
+                        .acquire_session_admission(provider, session_id)
+                        .await
+                        .map(|permit| {
+                            Box::new(permit) as freshell_freshagent::RestartAdmissionPermit
+                        })
+                })
             }));
     // The freshopencode WS fresh-agent slice: the post-handshake loop dispatches
     // `freshAgent.create`/`send`/`kill`/`interrupt` (opencode) here.

@@ -92,14 +92,11 @@ fn fresh_agent_attach_restart_locator(
     };
     let session_id = match attach.provider {
         freshell_protocol::AgentProvider::Claude => attach
-            .resume_session_id
-            .as_deref()
-            .or_else(|| {
-                attach
-                    .session_ref
-                    .as_ref()
-                    .map(|session_ref| session_ref.session_id.as_str())
-            })
+            .session_ref
+            .as_ref()
+            .filter(|session_ref| session_ref.provider == provider)
+            .map(|session_ref| session_ref.session_id.as_str())
+            .or(attach.resume_session_id.as_deref())
             .filter(|session_id| !session_id.is_empty()),
         freshell_protocol::AgentProvider::Codex | freshell_protocol::AgentProvider::Opencode => {
             (!attach.session_id.is_empty()).then_some(attach.session_id.as_str())
@@ -819,60 +816,75 @@ async fn handle_client_text(
             });
             let durable_session_id = provider_name.and_then(|provider| {
                 create
-                    .resume_session_id
-                    .as_deref()
+                    .session_ref
+                    .as_ref()
+                    .filter(|session_ref| session_ref.provider == provider)
+                    .map(|session_ref| session_ref.session_id.as_str())
                     .filter(|session_id| !session_id.is_empty())
                     .or_else(|| {
                         create
-                            .session_ref
-                            .as_ref()
-                            .filter(|session_ref| session_ref.provider == provider)
-                            .map(|session_ref| session_ref.session_id.as_str())
+                            .resume_session_id
+                            .as_deref()
                             .filter(|session_id| !session_id.is_empty())
                     })
                     .map(str::to_owned)
             });
-            if let (Some(provider), Some(session_id)) = (provider_name, durable_session_id) {
-                let locator = crate::restart::RuntimeLocator::new(
-                    freshell_protocol::AgentRuntimeKind::FreshAgent,
-                    provider,
-                    &session_id,
-                );
-                if state.restart.retirement_pending_for(&locator) {
-                    tracing::warn!(
-                        target: "freshell_ws::restart",
-                        request_id = %create.request_id,
-                        provider,
-                        session_id,
-                        "freshAgent.create.blocked_by_pending_restart_retirement"
-                    );
-                    return send(
-                        ws_tx,
-                        &ServerMessage::FreshAgentCreateFailed(FreshAgentCreateFailed {
-                            code: "SESSION_RESERVED".to_string(),
-                            message: "Restart is still retiring the previous session runtime"
-                                .to_string(),
-                            request_id: create.request_id,
-                            retryable: Some(true),
-                        }),
-                    )
-                    .await;
+            let restart_admission = if let (Some(provider), Some(session_id)) =
+                (provider_name, durable_session_id)
+            {
+                match state
+                    .restart
+                    .acquire_session_admission(provider, &session_id)
+                    .await
+                {
+                    Ok(admission) => Some(admission),
+                    Err(()) => {
+                        tracing::warn!(
+                            target: "freshell_ws::restart",
+                            request_id = %create.request_id,
+                            provider,
+                            session_id,
+                            "freshAgent.create.blocked_by_pending_restart_recovery"
+                        );
+                        return send(
+                            ws_tx,
+                            &ServerMessage::FreshAgentCreateFailed(FreshAgentCreateFailed {
+                                code: "SESSION_RESERVED".to_string(),
+                                message: "Restart is still retiring the previous session runtime"
+                                    .to_string(),
+                                request_id: create.request_id,
+                                retryable: Some(true),
+                            }),
+                        )
+                        .await;
+                    }
                 }
-            }
+            } else {
+                None
+            };
             if state.fresh_codex.is_enabled() {
                 match create.provider {
                     Some(freshell_protocol::AgentProvider::Codex) => {
                         let fresh_codex = state.fresh_codex.clone();
-                        tokio::spawn(async move { fresh_codex.handle_create(create).await });
+                        tokio::spawn(async move {
+                            let _restart_admission = restart_admission;
+                            fresh_codex.handle_create(create).await
+                        });
                     }
                     Some(freshell_protocol::AgentProvider::Claude) => {
                         let fresh_claude = state.fresh_claude.clone();
-                        tokio::spawn(async move { fresh_claude.handle_create(create).await });
+                        tokio::spawn(async move {
+                            let _restart_admission = restart_admission;
+                            fresh_claude.handle_create(create).await
+                        });
                     }
                     // Batch D PR-2: freshopencode joins the codex/claude WS create path.
                     Some(freshell_protocol::AgentProvider::Opencode) => {
                         let fresh_opencode = state.fresh_opencode.clone();
-                        tokio::spawn(async move { fresh_opencode.handle_create(create).await });
+                        tokio::spawn(async move {
+                            let _restart_admission = restart_admission;
+                            fresh_opencode.handle_create(create).await
+                        });
                     }
                     _ => {}
                 }
@@ -889,30 +901,49 @@ async fn handle_client_text(
         // same pattern as the other `freshAgent.*` arms. `_` keeps swallowing only
         // `Amplifier` (no fresh-agent runtime, same as the `FreshAgentSend` arm).
         ClientMessage::FreshAgentAttach(attach) => {
-            if let Some(locator) = fresh_agent_attach_restart_locator(&attach) {
-                if state.restart.retirement_pending_for(&locator) {
-                    tracing::warn!(
-                        target: "freshell_ws::restart",
-                        provider = %locator.provider,
-                        session_id = %locator.session_id,
-                        client_session_id = %attach.session_id,
-                        "freshAgent.attach.blocked_by_pending_restart_retirement"
-                    );
-                    return send(ws_tx, &fresh_agent_attach_reserved_frame(&attach)).await;
-                }
-            }
+            let restart_admission =
+                if let Some(locator) = fresh_agent_attach_restart_locator(&attach) {
+                    match state
+                        .restart
+                        .acquire_session_admission(&locator.provider, &locator.session_id)
+                        .await
+                    {
+                        Ok(admission) => Some(admission),
+                        Err(()) => {
+                            tracing::warn!(
+                                target: "freshell_ws::restart",
+                                provider = %locator.provider,
+                                session_id = %locator.session_id,
+                                client_session_id = %attach.session_id,
+                                "freshAgent.attach.blocked_by_pending_restart_recovery"
+                            );
+                            return send(ws_tx, &fresh_agent_attach_reserved_frame(&attach)).await;
+                        }
+                    }
+                } else {
+                    None
+                };
             match attach.provider {
                 freshell_protocol::AgentProvider::Codex => {
                     let fresh_codex = state.fresh_codex.clone();
-                    tokio::spawn(async move { fresh_codex.handle_attach(attach).await });
+                    tokio::spawn(async move {
+                        let _restart_admission = restart_admission;
+                        fresh_codex.handle_attach(attach).await
+                    });
                 }
                 freshell_protocol::AgentProvider::Claude => {
                     let fresh_claude = state.fresh_claude.clone();
-                    tokio::spawn(async move { fresh_claude.handle_attach(attach).await });
+                    tokio::spawn(async move {
+                        let _restart_admission = restart_admission;
+                        fresh_claude.handle_attach(attach).await
+                    });
                 }
                 freshell_protocol::AgentProvider::Opencode => {
                     let fresh_opencode = state.fresh_opencode.clone();
-                    tokio::spawn(async move { fresh_opencode.handle_attach(attach).await });
+                    tokio::spawn(async move {
+                        let _restart_admission = restart_admission;
+                        fresh_opencode.handle_attach(attach).await
+                    });
                 }
                 _ => {}
             }
@@ -1395,28 +1426,71 @@ impl Drop for KeyedCreateGuard {
     }
 }
 
-/// The sessionRef a create claims at spawn time (council rule 7, D8), when
-/// resolvable from the create BODY alone: a non-shell mode whose session id
-/// comes from `sessionRef` (provider must match the mode — the same filter
-/// as the resume derivation in `handle_create`) or the legacy
-/// `resumeSessionId`. Later-resolved identities (fresh-claude preallocation,
-/// the P0.4 restore ladder) are freshly minted or single-source and carry no
-/// concurrent-duplicate shape, so they claim nothing.
-fn create_session_locator(create: &TerminalCreate) -> Option<SessionLocator> {
+/// Resolve the ONE effective terminal resume identity before any dedupe,
+/// lease, restart-admission, launch planning, or spawn work begins.
+///
+/// This includes Claude's durable restore ladder. Keeping the resolution at
+/// the admission boundary prevents a request with no client-supplied
+/// `sessionRef` from bypassing a pending restart fence and prevents later
+/// stages from leasing a different identity than the one actually spawned.
+fn resolve_create_resume_identity(
+    state: &WsState,
+    create: &TerminalCreate,
+) -> Result<(LaunchIntent, Option<String>), String> {
     if create.mode == "shell" {
-        return None;
+        return Ok((LaunchIntent::Resume, None));
     }
-    let session_id = create
+
+    let requested_ref = create
         .session_ref
         .as_ref()
-        .filter(|r| r.provider == create.mode)
-        .map(|r| r.session_id.clone())
+        .filter(|session_ref| session_ref.provider == create.mode);
+    let should_preallocate_fresh_claude = create.mode == "claude"
+        && create.restore != Some(true)
+        && create.session_ref.is_none()
+        && create
+            .resume_session_id
+            .as_deref()
+            .filter(|session_id| !session_id.is_empty())
+            .is_none();
+    let should_preallocate_fresh_amplifier = create.mode == "amplifier"
+        && create.restore != Some(true)
+        && create.session_ref.is_none()
+        && create
+            .resume_session_id
+            .as_deref()
+            .filter(|session_id| !session_id.is_empty())
+            .is_none();
+
+    if should_preallocate_fresh_claude {
+        return Ok((LaunchIntent::Start, Some(Uuid::new_v4().to_string())));
+    }
+    if should_preallocate_fresh_amplifier {
+        return Ok((LaunchIntent::Resume, Some(Uuid::new_v4().to_string())));
+    }
+
+    let mut resume_session_id = requested_ref
+        .map(|session_ref| session_ref.session_id.clone())
         .or_else(|| create.resume_session_id.clone())
-        .filter(|s| !s.is_empty())?;
-    Some(SessionLocator {
-        provider: create.mode.clone(),
-        session_id,
-    })
+        .filter(|session_id| !session_id.is_empty());
+
+    if create.mode == "claude" && create.restore == Some(true) {
+        if resume_session_id
+            .as_deref()
+            .is_some_and(|session_id| !is_canonical_claude_session_id(session_id))
+        {
+            resume_session_id = None;
+        }
+        if resume_session_id.is_none() {
+            resume_session_id = resolve_claude_restore_session_id(state, &create.request_id);
+        }
+        if resume_session_id.is_none() {
+            crate::invariants::error_claude_restore_unresolved(&create.request_id);
+            return Err("Restore requires a canonical session reference.".to_string());
+        }
+    }
+
+    Ok((LaunchIntent::Resume, resume_session_id))
 }
 
 /// RAII release of a D8 sessionRef lease claim
@@ -1693,28 +1767,55 @@ async fn handle_create_with_restart_launch(
     create_limiter: &mut crate::create_limit::CreateRateLimiter,
     restart_launch: Option<freshell_terminal::TerminalRestartLaunch>,
 ) -> bool {
-    if let Some(locator) = create_session_locator(&create) {
-        let restart_locator = crate::restart::RuntimeLocator::new(
-            freshell_protocol::AgentRuntimeKind::Terminal,
-            &locator.provider,
-            &locator.session_id,
-        );
-        if state.restart.retirement_pending_for(&restart_locator) {
-            tracing::warn!(
-                target: "freshell_ws::restart",
-                request_id = %create.request_id,
-                provider = %locator.provider,
-                session_id = %locator.session_id,
-                "terminal.create.blocked_by_pending_restart_retirement"
-            );
-            return send_session_reserved(
+    let mode = create.mode.clone();
+    let (launch_intent, resume_session_id) = match resolve_create_resume_identity(state, &create) {
+        Ok(resolved) => resolved,
+        Err(message) => {
+            return send_create_error(
                 out,
+                ErrorCode::RestoreUnavailable,
+                message,
                 &create.request_id,
-                freshell_terminal::registry::SESSION_RESERVED_RETRY_AFTER_MS,
             )
-            .await;
+            .await
         }
-    }
+    };
+    let effective_session_locator = resume_session_id.as_ref().map(|session_id| SessionLocator {
+        provider: mode.clone(),
+        session_id: session_id.clone(),
+    });
+    // A coordinator-owned replacement reaches this helper with
+    // `restart_launch` while `RestartCoordinator::execute` already holds the
+    // same session mutex. Re-acquiring here would self-deadlock. Every
+    // external create path has no restart launch and must acquire normally.
+    let _restart_admission = if restart_launch.is_some() {
+        None
+    } else if let Some(locator) = effective_session_locator.as_ref() {
+        match state
+            .restart
+            .acquire_session_admission(&locator.provider, &locator.session_id)
+            .await
+        {
+            Ok(admission) => Some(admission),
+            Err(()) => {
+                tracing::warn!(
+                    target: "freshell_ws::restart",
+                    request_id = %create.request_id,
+                    provider = %locator.provider,
+                    session_id = %locator.session_id,
+                    "terminal.create.blocked_by_pending_restart_recovery"
+                );
+                return send_session_reserved(
+                    out,
+                    &create.request_id,
+                    freshell_terminal::registry::SESSION_RESERVED_RETRY_AFTER_MS,
+                )
+                .await;
+            }
+        }
+    } else {
+        None
+    };
 
     // Single-flight create-dedupe (reconciliation design §5.4, the council's
     // two-tab double-respawn blocker): on `paneReconcileV1` connections ONLY,
@@ -1779,7 +1880,7 @@ async fn handle_create_with_restart_launch(
     // byte-for-byte unchanged (§11 fence).
     let mut session_ref_lease: Option<SessionRefLeaseGuard> = None;
     if pane_reconcile_v1 {
-        if let Some(locator) = create_session_locator(&create) {
+        if let Some(locator) = effective_session_locator.clone() {
             use freshell_terminal::registry::SessionRefClaim;
             // Bounded: at most one ExpiredNeedsKill kill→confirm→re-claim
             // round per create; a second expiry answers reserved instead.
@@ -1887,7 +1988,6 @@ async fn handle_create_with_restart_launch(
             .map(|launch| launch.shell)
             .unwrap_or(create.shell),
     );
-    let mode = create.mode.clone();
     // Reject modes that are neither 'shell' nor a registered coding CLI — the
     // reference throws `UnknownTerminalModeError` (`terminal-registry.ts:1073-1074`,
     // message `tr:160-165`), surfaced as an `error` frame with the generic
@@ -1920,103 +2020,6 @@ async fn handle_create_with_restart_launch(
         state.settings.default_cwd.as_deref(),
         host_os,
     );
-
-    // Spawn-time resume id + launch intent (`ws-handler.ts:2040-2067`; U7: only
-    // the spawn-time id is modeled here — the sessionRef binding/repair pipeline
-    // stays with specs/coding-cli.md). LIVE-PATH LAW (spec §2.1(3)): fresh claude
-    // ALWAYS gets a server-preallocated `--session-id` (`ws:2048-2064`).
-    let mut launch_intent = LaunchIntent::Resume;
-    let mut resume_session_id: Option<String> = None;
-    if mode != "shell" {
-        let requested_ref = create.session_ref.as_ref().filter(|r| r.provider == mode);
-        let should_preallocate_fresh_claude = mode == "claude"
-            && create.restore != Some(true)
-            && create.session_ref.is_none()
-            && create
-                .resume_session_id
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .is_none();
-        // Launcher-assigned amplifier identity (kata qmpk), the fresh-claude
-        // preallocation's sibling: a FRESH amplifier pane gets a
-        // server-minted session id, and (below, in the pre-create block) a
-        // pre-created stub dir — `amplifier resume <uuid>` of that stub IS
-        // the fresh launch. CRITICAL: `launch_intent` STAYS `Resume` —
-        // amplifier's manifest has resumeArgs only; `Start` without
-        // createSessionArgs is a hard StartIntentUnsupported error
-        // (cli_launch.rs:431-445; pinned by golden G-A4).
-        let should_preallocate_fresh_amplifier = mode == "amplifier"
-            && create.restore != Some(true)
-            && create.session_ref.is_none()
-            && create
-                .resume_session_id
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .is_none();
-        if should_preallocate_fresh_claude {
-            // `reserveClaudeFreshSessionId` → randomUUID() (`ws:969-975`); the
-            // per-requestId dedupe cache is a retry concern this single-shot
-            // handler does not have.
-            resume_session_id = Some(Uuid::new_v4().to_string());
-            launch_intent = LaunchIntent::Start;
-        } else if should_preallocate_fresh_amplifier {
-            resume_session_id = Some(Uuid::new_v4().to_string());
-        } else {
-            // `requestedSessionRef.provider === mode ? sessionRef.sessionId :
-            // m.resumeSessionId` (`ws:2040-2047`). This INCLUDES codex: legacy
-            // derives the codex resume id from the sessionRef too (the
-            // `durable_session_ref_resume` plan, `ws:2037-2040`). A former
-            // codex-special arm here read ONLY `create.resumeSessionId` -- but
-            // the frozen client carries identity ONLY in `sessionRef`
-            // (`TerminalView.tsx:2782-2795`), so every codex bounce-restore and
-            // sidebar reopen spawned plain `codex` with no resume args
-            // (2026-07-22 incident; regression test:
-            // `tests/codex_session_ref_resume.rs`). `launchIntent` stays
-            // 'resume' (`tr:1570-1571`).
-            resume_session_id = requested_ref
-                .map(|r| r.session_id.clone())
-                .or_else(|| create.resume_session_id.clone())
-                .filter(|s| !s.is_empty());
-            // P0.4 (campaign plan §2.2): a restore:true claude create with no
-            // client-supplied id must NEVER silently launch a bare `claude`
-            // (neither --resume nor --session-id => permanently un-resumable).
-            // Try the server-side ladder; auto-resume on success (never ask);
-            // reject loudly when nothing can resolve. Claude-only: gemini/kimi
-            // behavior is deliberately untouched, and fresh (non-restore)
-            // claude keeps the preallocation branch above.
-            if mode == "claude" && create.restore == Some(true) {
-                // Full Node reject-predicate parity (ws-handler.ts:2130-2139):
-                // a client-supplied claude id that is not canonical-UUID-shaped
-                // is NOT a usable restore identity -- treat it as unresolvable
-                // (fall to the ladder, then the loud reject). Scoped to the
-                // restore gate ONLY; non-restore resume derivation above is
-                // untouched.
-                if resume_session_id
-                    .as_deref()
-                    .is_some_and(|s| !is_canonical_claude_session_id(s))
-                {
-                    resume_session_id = None;
-                }
-                if resume_session_id.is_none() {
-                    resume_session_id =
-                        resolve_claude_restore_session_id(state, &create.request_id);
-                }
-                if resume_session_id.is_none() {
-                    crate::invariants::error_claude_restore_unresolved(&create.request_id);
-                    return send_create_error(
-                        out,
-                        ErrorCode::RestoreUnavailable,
-                        // Node parity (`server/ws-handler.ts:2130-2159`): the
-                        // frozen client's create-error handler shows
-                        // "[Restore failed] <this message>".
-                        "Restore requires a canonical session reference.".to_string(),
-                        &create.request_id,
-                    )
-                    .await;
-                }
-            }
-        }
-    }
 
     // D7 liveness guard on the DIRECT wire-sessionRef rung (recover-my-panes
     // Task 2b, defense-in-depth). Every other live-guard lives inside the
@@ -3719,24 +3722,31 @@ async fn handle_pane_reconcile(
             }
             _ => continue,
         };
-        let claimed_session = pane.session_ref.clone().or_else(|| {
-            let provider = pane.mode.as_deref().filter(|mode| !mode.is_empty())?;
-            let session_id = pane
-                .resume_session_id
-                .as_deref()
-                .filter(|session_id| !session_id.is_empty())?;
-            Some(SessionLocator {
-                provider: provider.to_string(),
-                session_id: session_id.to_string(),
-            })
-        });
-        let Some(claimed_session) = claimed_session else {
+        // The reconciler has already resolved lineage/supersession against
+        // server identity homes. Fence that authoritative answer first; only
+        // fall back to the client claim for verdicts that carry no ref.
+        let effective_session = verdict
+            .session_ref
+            .clone()
+            .or_else(|| pane.session_ref.clone())
+            .or_else(|| {
+                let provider = pane.mode.as_deref().filter(|mode| !mode.is_empty())?;
+                let session_id = pane
+                    .resume_session_id
+                    .as_deref()
+                    .filter(|session_id| !session_id.is_empty())?;
+                Some(SessionLocator {
+                    provider: provider.to_string(),
+                    session_id: session_id.to_string(),
+                })
+            });
+        let Some(effective_session) = effective_session else {
             continue;
         };
         let locator = crate::restart::RuntimeLocator::new(
             kind,
-            &claimed_session.provider,
-            &claimed_session.session_id,
+            &effective_session.provider,
+            &effective_session.session_id,
         );
         if !state.restart.retirement_pending_for(&locator) {
             continue;
@@ -3745,14 +3755,14 @@ async fn handle_pane_reconcile(
             target: "freshell_ws::restart",
             reconcile_id = %request.reconcile_id,
             pane_key = %pane.pane_key,
-            provider = %claimed_session.provider,
-            session_id = %claimed_session.session_id,
+            provider = %effective_session.provider,
+            session_id = %effective_session.session_id,
             kind = ?kind,
             "pane.reconcile.blocked_by_pending_restart_retirement"
         );
         verdict.verdict = freshell_protocol::ReconcileVerdict::Error;
         verdict.terminal_id = None;
-        verdict.session_ref = Some(claimed_session);
+        verdict.session_ref = Some(effective_session);
         verdict.corrected = None;
         verdict.reason = Some("restart_retirement_pending".to_string());
         verdict.duplicate = None;

@@ -506,6 +506,8 @@ export const FreshAgentSendSchema = z.object({
   sessionId: z.string().min(1),
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']),
+  expectedRuntimeId: z.string().min(1).optional(),
+  expectedGeneration: z.number().int().nonnegative().optional(),
   cwd: z.string().optional(),
   text: z.string().min(1),
   settings: z.object({
@@ -526,6 +528,8 @@ export const FreshAgentInterruptSchema = z.object({
   sessionId: z.string().min(1),
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']),
+  expectedRuntimeId: z.string().min(1).optional(),
+  expectedGeneration: z.number().int().nonnegative().optional(),
   cwd: z.string().optional(),
 })
 
@@ -563,6 +567,8 @@ export const FreshAgentKillSchema = z.object({
   sessionId: z.string().min(1),
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']),
+  expectedRuntimeId: z.string().min(1).optional(),
+  expectedGeneration: z.number().int().nonnegative().optional(),
   cwd: z.string().optional(),
 })
 
@@ -877,6 +883,8 @@ export type TerminalReplacedMessage = {
   exitCode: number
   attempt: number
   maxAttempts: number
+  /** Server-owned identity fence for the replacement generation. */
+  runtime?: RuntimeDescriptor
 }
 
 export type TerminalOutputMessage = {
@@ -1137,7 +1145,7 @@ export type FreshAgentServerMessage =
   | { type: 'freshAgent.event'; sessionId: string; sessionType: string; provider: string; event: unknown; runtime?: RuntimeDescriptor }
   | { type: 'freshAgent.session.materialized'; previousSessionId: string; sessionId: string; sessionType: string; provider: string; sessionRef?: { provider: string; sessionId: string }; runtime?: RuntimeDescriptor }
   | { type: 'freshAgent.forked'; requestId?: string; parentSessionId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string } }
-  | { type: 'freshAgent.killed'; sessionId: string; sessionType: string; provider: string; success: boolean }
+  | { type: 'freshAgent.killed'; sessionId: string; sessionType: string; provider: string; success: boolean; runtime?: RuntimeDescriptor }
 
 // -- Extensions --
 

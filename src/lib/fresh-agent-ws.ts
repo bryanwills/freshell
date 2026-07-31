@@ -68,6 +68,7 @@ type FreshAgentKilledMessage = {
   sessionType: FreshAgentSessionType
   provider: FreshAgentRuntimeProvider
   success: boolean
+  runtime?: RuntimeDescriptor
 }
 
 type FreshAgentClientMessage =
@@ -143,6 +144,10 @@ export function handleFreshAgentMessage(
             sessionId: created.sessionId,
             sessionType: created.sessionType,
             provider,
+            ...(created.runtime ? {
+              expectedRuntimeId: created.runtime.runtimeId,
+              expectedGeneration: created.runtime.generation,
+            } : {}),
             ...(route?.cwd ? { cwd: route.cwd } : {}),
           })
         }
@@ -200,10 +205,12 @@ export function handleFreshAgentMessage(
     }
     case 'freshAgent.killed': {
       const killed = msg as FreshAgentKilledMessage
+      if (!isFreshAgentKilledMessageCurrent(killed, getState?.())) return true
       dispatch(removeSession({
         sessionId: killed.sessionId,
         sessionType: killed.sessionType,
         provider: killed.provider,
+        runtime: killed.runtime,
       }))
       return true
     }
@@ -219,6 +226,38 @@ export function handleFreshAgentMessage(
     default:
       return false
   }
+}
+
+function isFreshAgentKilledMessageCurrent(
+  msg: FreshAgentKilledMessage,
+  state: FreshAgentTransportState | undefined,
+): boolean {
+  if (!state) return true
+
+  const fences: Array<{ runtimeId?: string, runtimeGeneration?: number }> = []
+  const session = state.freshAgent?.sessions?.[makeFreshAgentSessionKey({
+    sessionId: msg.sessionId,
+    sessionType: msg.sessionType,
+    provider: msg.provider,
+  })]
+  if (session && isRuntimeFenced(session)) fences.push(session)
+
+  for (const layout of Object.values(state.panes?.layouts ?? {})) {
+    if (!layout) continue
+    for (const content of collectPaneContents(layout)) {
+      if (
+        content.kind === 'fresh-agent'
+        && content.sessionId === msg.sessionId
+        && content.sessionType === msg.sessionType
+        && content.provider === msg.provider
+        && isRuntimeFenced(content)
+      ) {
+        fences.push(content)
+      }
+    }
+  }
+
+  return fences.every((fence) => matchesRuntimeFence(msg.runtime, fence))
 }
 
 function isRuntimeFenced(value: { runtimeId?: string, runtimeGeneration?: number }): boolean {

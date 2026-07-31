@@ -1106,6 +1106,26 @@ impl FreshCodexState {
         let mut session_id = msg.session_id.clone();
         let cwd = msg.cwd.clone();
 
+        {
+            let sessions = self.sessions.lock().await;
+            let Some(session) = sessions.get(&session_id) else {
+                self.send_error(&request_id, "SESSION_NOT_FOUND", "codex session not found");
+                return;
+            };
+            if !crate::control_targets_runtime(
+                msg.expected_runtime_id.as_deref(),
+                msg.expected_generation,
+                &session.runtime,
+            ) {
+                self.send_error(
+                    &request_id,
+                    "STALE_RUNTIME",
+                    "codex control targets a replaced runtime",
+                );
+                return;
+            }
+        }
+
         match self.ensure_session_alive(&session_id).await {
             Ok(EnsureAliveOutcome::AlreadyRunning) => {}
             // FIX-2: a resume-recovered session keeps its ORIGINAL id -- nothing for
@@ -1137,8 +1157,15 @@ impl FreshCodexState {
         // Look up the session; extract the client + settings under the lock (Child isn't Clone).
         let looked_up = {
             let guard = self.sessions.lock().await;
-            guard.get(&session_id).map(|s| {
-                (
+            guard.get(&session_id).and_then(|s| {
+                if !crate::control_targets_runtime(
+                    msg.expected_runtime_id.as_deref(),
+                    msg.expected_generation,
+                    &s.runtime,
+                ) {
+                    return None;
+                }
+                Some((
                     s.client.clone(),
                     s.model.clone(),
                     s.effort.clone(),
@@ -1146,13 +1173,17 @@ impl FreshCodexState {
                     s.sandbox.clone(),
                     s.permission_mode.clone(),
                     s.active_turn.clone(),
-                )
+                ))
             })
         };
         let Some((client, model, effort, turn_cwd, sandbox, permission_mode, active_turn)) =
             looked_up
         else {
-            self.send_error(&request_id, "SESSION_NOT_FOUND", "codex session not found");
+            self.send_error(
+                &request_id,
+                "STALE_RUNTIME",
+                "codex runtime changed before control dispatch",
+            );
             return;
         };
 
@@ -1242,12 +1273,21 @@ impl FreshCodexState {
 
         let looked_up = {
             let guard = self.sessions.lock().await;
-            guard
-                .get(&session_id)
-                .map(|s| (s.client.clone(), s.active_turn.clone()))
+            guard.get(&session_id).and_then(|s| {
+                crate::control_targets_runtime(
+                    msg.expected_runtime_id.as_deref(),
+                    msg.expected_generation,
+                    &s.runtime,
+                )
+                .then(|| (s.client.clone(), s.active_turn.clone()))
+            })
         };
         let Some((client, active_turn)) = looked_up else {
-            self.send_error(&None, "SESSION_NOT_FOUND", "codex session not found");
+            self.send_error(
+                &None,
+                "STALE_RUNTIME",
+                "codex control targets a missing or replaced runtime",
+            );
             return;
         };
 
@@ -1285,7 +1325,36 @@ impl FreshCodexState {
     pub async fn handle_kill(&self, msg: FreshAgentKill) {
         let session_id = msg.session_id.clone();
 
-        let removed = self.sessions.lock().await.remove(&session_id);
+        let removed = {
+            let mut sessions = self.sessions.lock().await;
+            match sessions.get(&session_id) {
+                Some(session)
+                    if crate::control_targets_runtime(
+                        msg.expected_runtime_id.as_deref(),
+                        msg.expected_generation,
+                        &session.runtime,
+                    ) =>
+                {
+                    sessions.remove(&session_id)
+                }
+                Some(_) => {
+                    drop(sessions);
+                    self.send_error(
+                        &None,
+                        "STALE_RUNTIME",
+                        "codex control targets a replaced runtime",
+                    );
+                    return;
+                }
+                None if msg.expected_runtime_id.is_some() || msg.expected_generation.is_some() => {
+                    drop(sessions);
+                    self.send_error(&None, "SESSION_NOT_FOUND", "codex session not found");
+                    return;
+                }
+                None => None,
+            }
+        };
+        let killed_runtime = removed.as_ref().map(|session| session.runtime.clone());
         let quiesced = match removed {
             Some(session) => stop_codex_session(session).await,
             None => true,
@@ -1311,6 +1380,7 @@ impl FreshCodexState {
             session_id,
             session_type: SESSION_TYPE.to_string(),
             success: true,
+            runtime: killed_runtime,
         }));
     }
 
@@ -4690,6 +4760,8 @@ pub(crate) mod tests {
             let st = st.clone();
             tokio::spawn(async move {
                 st.handle_interrupt(FreshAgentInterrupt {
+                    expected_runtime_id: None,
+                    expected_generation: None,
                     provider: freshell_protocol::AgentProvider::Codex,
                     session_id: "thread-1".to_string(),
                     session_type: freshell_protocol::SessionType::Freshcodex,
@@ -4740,6 +4812,8 @@ pub(crate) mod tests {
         )
         .await;
         st.handle_interrupt(FreshAgentInterrupt {
+            expected_runtime_id: None,
+            expected_generation: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: "thread-1".to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -4763,6 +4837,8 @@ pub(crate) mod tests {
         let (st, mut rx) = state_with_bus();
 
         st.handle_interrupt(FreshAgentInterrupt {
+            expected_runtime_id: None,
+            expected_generation: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: "does-not-exist".to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -4794,6 +4870,8 @@ pub(crate) mod tests {
         .await;
 
         st.handle_kill(FreshAgentKill {
+            expected_runtime_id: None,
+            expected_generation: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: "thread-1".to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -4817,6 +4895,80 @@ pub(crate) mod tests {
             !st.sessions.lock().await.contains_key("thread-1"),
             "session removed"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_codex_controls_cannot_mutate_or_stop_a_replacement_runtime() {
+        let (transport, _peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let (st, mut rx) = state_with_bus();
+        let child = spawn_sleeper();
+        let pid = child.id().expect("pid");
+        insert_fake_session(
+            &st,
+            "thread-replaced",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            child,
+            "codex-sidecar-test-stale-kill",
+        )
+        .await;
+        let replacement = {
+            let mut sessions = st.sessions.lock().await;
+            let session = sessions.get_mut("thread-replaced").unwrap();
+            session.runtime.generation = 2;
+            session.runtime.clone()
+        };
+
+        st.handle_send(FreshAgentSend {
+            expected_runtime_id: Some(replacement.runtime_id.clone()),
+            expected_generation: Some(1),
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: "thread-replaced".to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            text: "stale turn".to_string(),
+            cwd: None,
+            images: None,
+            request_id: Some("stale-codex-send".to_string()),
+            settings: None,
+        })
+        .await;
+        let send_error: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert!(send_error["message"]
+            .as_str()
+            .unwrap()
+            .contains("STALE_RUNTIME"));
+
+        st.handle_interrupt(FreshAgentInterrupt {
+            expected_runtime_id: Some(replacement.runtime_id.clone()),
+            expected_generation: Some(1),
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: "thread-replaced".to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+        let interrupt_error: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert!(interrupt_error["message"]
+            .as_str()
+            .unwrap()
+            .contains("STALE_RUNTIME"));
+
+        st.handle_kill(FreshAgentKill {
+            expected_runtime_id: Some(replacement.runtime_id.clone()),
+            expected_generation: Some(1),
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: "thread-replaced".to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+
+        assert!(st.sessions.lock().await.contains_key("thread-replaced"));
+        assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+        let error: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(error["type"], "error");
+        assert!(error["message"].as_str().unwrap().contains("STALE_RUNTIME"));
     }
 
     #[tokio::test]
@@ -5039,6 +5191,8 @@ while true; do read -r -t 1 _ || true; done
         let (st, mut rx) = state_with_bus();
 
         st.handle_kill(FreshAgentKill {
+            expected_runtime_id: None,
+            expected_generation: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: "does-not-exist".to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -5781,6 +5935,8 @@ while true; do read -r -t 1 _ || true; done
         let killed_session_id = created["sessionId"].as_str().unwrap().to_string();
 
         st.handle_kill(FreshAgentKill {
+            expected_runtime_id: None,
+            expected_generation: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: killed_session_id.clone(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -5864,6 +6020,8 @@ while true; do read -r -t 1 _ || true; done
 
             if let Some(session_id) = session_id {
                 st.handle_kill(FreshAgentKill {
+                    expected_runtime_id: None,
+                    expected_generation: None,
                     provider: freshell_protocol::AgentProvider::Codex,
                     session_id,
                     session_type: freshell_protocol::SessionType::Freshcodex,
@@ -6781,6 +6939,8 @@ while true; do read -r -t 1 _ || true; done
         configure_fake_codex_cmd("{}");
 
         st.handle_send(FreshAgentSend {
+            expected_runtime_id: None,
+            expected_generation: None,
             request_id: Some("req-2".to_string()),
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: thread_id.clone(),
@@ -6852,6 +7012,8 @@ while true; do read -r -t 1 _ || true; done
         );
 
         st.handle_send(FreshAgentSend {
+            expected_runtime_id: None,
+            expected_generation: None,
             request_id: Some("req-2".to_string()),
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: thread_id.clone(),
@@ -6934,6 +7096,8 @@ while true; do read -r -t 1 _ || true; done
         );
 
         st.handle_send(FreshAgentSend {
+            expected_runtime_id: None,
+            expected_generation: None,
             request_id: Some("req-2".to_string()),
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: thread_id.clone(),
@@ -7004,6 +7168,8 @@ while true; do read -r -t 1 _ || true; done
         );
 
         st.handle_send(FreshAgentSend {
+            expected_runtime_id: None,
+            expected_generation: None,
             request_id: Some("req-2".to_string()),
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: thread_id.clone(),
@@ -7110,6 +7276,8 @@ while true; do read -r -t 1 _ || true; done
         let send_task = tokio::spawn(async move {
             st_send
                 .handle_send(FreshAgentSend {
+                    expected_runtime_id: None,
+                    expected_generation: None,
                     request_id: Some("req-race-send".to_string()),
                     provider: freshell_protocol::AgentProvider::Codex,
                     session_id: send_thread_id,

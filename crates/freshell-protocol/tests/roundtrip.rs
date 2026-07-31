@@ -334,6 +334,37 @@ fn rich_client_messages() {
         }
         other => panic!("expected AgentRestart, got {other:?}"),
     }
+
+    for (wire, expected_type) in [
+        (
+            r#"{"type":"freshAgent.send","provider":"codex","sessionId":"durable-1","sessionType":"freshcodex","expectedRuntimeId":"runtime-7","expectedGeneration":7,"text":"hi"}"#,
+            "freshAgent.send",
+        ),
+        (
+            r#"{"type":"freshAgent.interrupt","provider":"claude","sessionId":"durable-1","sessionType":"kilroy","expectedRuntimeId":"runtime-7","expectedGeneration":7}"#,
+            "freshAgent.interrupt",
+        ),
+        (
+            r#"{"type":"freshAgent.kill","provider":"opencode","sessionId":"durable-1","sessionType":"freshopencode","expectedRuntimeId":"runtime-7","expectedGeneration":7}"#,
+            "freshAgent.kill",
+        ),
+    ] {
+        let message = client_roundtrip(wire, expected_type);
+        let (runtime_id, generation) = match message {
+            ClientMessage::FreshAgentSend(message) => {
+                (message.expected_runtime_id, message.expected_generation)
+            }
+            ClientMessage::FreshAgentInterrupt(message) => {
+                (message.expected_runtime_id, message.expected_generation)
+            }
+            ClientMessage::FreshAgentKill(message) => {
+                (message.expected_runtime_id, message.expected_generation)
+            }
+            other => panic!("expected runtime-fenced control, got {other:?}"),
+        };
+        assert_eq!(runtime_id.as_deref(), Some("runtime-7"));
+        assert_eq!(generation, Some(7));
+    }
 }
 
 #[test]
@@ -431,6 +462,14 @@ fn runtime_descriptors_roundtrip_on_lifecycle_surfaces() {
             assert_eq!(message.runtime.unwrap().generation, 4);
         }
         other => panic!("expected FreshAgentEvent, got {other:?}"),
+    }
+
+    let fresh_killed = r#"{"type":"freshAgent.killed","provider":"claude","sessionId":"live-1","sessionType":"freshclaude","success":true,"runtime":{"runtimeId":"live-1","generation":4}}"#;
+    match server_roundtrip(fresh_killed, "freshAgent.killed") {
+        ServerMessage::FreshAgentKilled(message) => {
+            assert_eq!(message.runtime.unwrap().generation, 4);
+        }
+        other => panic!("expected FreshAgentKilled, got {other:?}"),
     }
 
     let reconcile = r#"{"type":"pane.reconcile.result","reconcileId":"rec-1","bootId":"boot-1","serverInstanceId":"srv-1","verdicts":[{"paneKey":"pane-1","verdict":"attach","terminalId":"term-1","runtime":{"runtimeId":"term-1","generation":7}}]}"#;

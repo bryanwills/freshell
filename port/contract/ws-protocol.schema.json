@@ -1741,6 +1741,15 @@
             "cwd": {
               "type": "string"
             },
+            "expectedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "expectedRuntimeId": {
+              "minLength": 1,
+              "type": "string"
+            },
             "images": {
               "items": {
                 "additionalProperties": false,
@@ -1837,6 +1846,15 @@
           "additionalProperties": false,
           "properties": {
             "cwd": {
+              "type": "string"
+            },
+            "expectedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "expectedRuntimeId": {
+              "minLength": 1,
               "type": "string"
             },
             "provider": {
@@ -2047,6 +2065,15 @@
           "additionalProperties": false,
           "properties": {
             "cwd": {
+              "type": "string"
+            },
+            "expectedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "expectedRuntimeId": {
+              "minLength": 1,
               "type": "string"
             },
             "provider": {
@@ -2877,6 +2904,15 @@
             "cwd": {
               "type": "string"
             },
+            "expectedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "expectedRuntimeId": {
+              "minLength": 1,
+              "type": "string"
+            },
             "images": {
               "items": {
                 "additionalProperties": false,
@@ -2973,6 +3009,15 @@
           "additionalProperties": false,
           "properties": {
             "cwd": {
+              "type": "string"
+            },
+            "expectedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "expectedRuntimeId": {
+              "minLength": 1,
               "type": "string"
             },
             "provider": {
@@ -3183,6 +3228,15 @@
           "additionalProperties": false,
           "properties": {
             "cwd": {
+              "type": "string"
+            },
+            "expectedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "expectedRuntimeId": {
+              "minLength": 1,
               "type": "string"
             },
             "provider": {
@@ -3502,6 +3556,15 @@
         "cwd": {
           "type": "string"
         },
+        "expectedGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "expectedRuntimeId": {
+          "minLength": 1,
+          "type": "string"
+        },
         "provider": {
           "enum": [
             "claude",
@@ -3541,6 +3604,15 @@
       "additionalProperties": false,
       "properties": {
         "cwd": {
+          "type": "string"
+        },
+        "expectedGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "expectedRuntimeId": {
+          "minLength": 1,
           "type": "string"
         },
         "provider": {
@@ -3647,6 +3719,15 @@
       "additionalProperties": false,
       "properties": {
         "cwd": {
+          "type": "string"
+        },
+        "expectedGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "expectedRuntimeId": {
+          "minLength": 1,
           "type": "string"
         },
         "images": {

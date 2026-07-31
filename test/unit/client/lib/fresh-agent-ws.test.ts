@@ -405,6 +405,55 @@ describe('fresh-agent-ws', () => {
     expect(actionTypes).not.toContain('turnCompletion/recordTurnComplete')
   })
 
+  it('ignores untagged and stale killed acknowledgements once a pane is runtime-fenced', () => {
+    const store = createFreshAgentPaneStore()
+    const sessionId = 'ses-kill-fenced'
+    store.dispatch(initLayout({
+      tabId: 'tab-kill',
+      paneId: 'pane-kill',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        sessionId,
+        createRequestId: 'req-kill',
+        status: 'running',
+        runtimeId: 'runtime-current',
+        runtimeGeneration: 8,
+      },
+    }))
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId,
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      runtime: { runtimeId: 'runtime-current', generation: 8 },
+      event: {
+        type: 'freshAgent.session.snapshot',
+        sessionId,
+        latestTurnId: null,
+        status: 'idle',
+      },
+    }, undefined, store.getState)
+
+    const killed = (runtime?: { runtimeId: string, generation: number }) =>
+      handleFreshAgentMessage(store.dispatch, {
+        type: 'freshAgent.killed',
+        sessionId,
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        success: true,
+        ...(runtime ? { runtime } : {}),
+      }, undefined, store.getState)
+
+    expect(killed()).toBe(true)
+    expect(killed({ runtimeId: 'runtime-old', generation: 7 })).toBe(true)
+    expect(store.getState().freshAgent.sessions[`freshcodex:codex:${sessionId}`]).toBeDefined()
+
+    expect(killed({ runtimeId: 'runtime-current', generation: 8 })).toBe(true)
+    expect(store.getState().freshAgent.sessions[`freshcodex:codex:${sessionId}`]).toBeUndefined()
+  })
+
   it('projects Claude freshAgent.event snapshot and lost-session transport updates into fresh-agent session state', () => {
     const store = createFreshAgentStore()
 

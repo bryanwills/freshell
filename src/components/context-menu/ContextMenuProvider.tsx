@@ -1041,6 +1041,10 @@ export function ContextMenuProvider({
         sessionId: latest.content.sessionId,
         sessionType: latest.content.sessionType,
         provider: latest.content.provider,
+        ...(latest.content.runtimeId && latest.content.runtimeGeneration !== undefined ? {
+          expectedRuntimeId: latest.content.runtimeId,
+          expectedGeneration: latest.content.runtimeGeneration,
+        } : {}),
         ...(cwd ? { cwd } : {}),
       })
     }

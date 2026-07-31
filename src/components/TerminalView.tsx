@@ -4448,8 +4448,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             // for server-supplied rebinds (mirrors pane-reconcile.ts:428-436).
             // applyReconcileAttach unconditionally overwrites serverInstanceId
             // (panesSlice.ts:1904), so supply the current one. The replaced
-            // frame carries no verdict data, so sessionRef/corrected/duplicate
-            // stay unset — the reducer preserves the pane's sessionRef.
+            // frame carries no reconcile verdict data, so
+            // sessionRef/corrected/duplicate stay unset — the reducer
+            // preserves the pane's sessionRef. The runtime descriptor is
+            // load-bearing once the pane has negotiated generation fencing:
+            // omitting it would make applyReconcileAttach reject the rebind.
             // Bind-before-attach holds: the reducer's epoch bump re-fires the
             // create-or-attach effect after this rebind.
             dispatch(applyReconcileAttach({
@@ -4457,6 +4460,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               paneId: paneIdRef.current,
               terminalId: msg.newTerminalId,
               serverInstanceId: serverInstanceIdRef.current,
+              runtime: msg.runtime,
             }))
           }
           return

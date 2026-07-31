@@ -766,8 +766,32 @@ pub(crate) async fn spawn_terminal_pane(
 
     let (mut resume_session_id, accepted_session_ref) = derive_resume_identity(body, &mode)?;
 
-    if let Some(session_id) = resume_session_id.as_deref() {
-        if state
+    // Production uses the async gate: it serializes this complete spawn
+    // pipeline with explicit restart and every other resume for the same
+    // durable provider session. The read-only probe remains only as the
+    // compatibility fallback for isolated crate tests.
+    let _restart_admission = if let Some(session_id) = resume_session_id.as_deref() {
+        let denied = if let Some(gate) = &state.restart_admission_gate {
+            match gate(mode.clone(), session_id.to_string()).await {
+                Ok(permit) => Some(permit),
+                Err(()) => {
+                    tracing::warn!(
+                        event = "terminal.create.blocked_by_pending_restart_recovery",
+                        transport = "rest",
+                        provider = %mode,
+                        session_id,
+                        "terminal resume blocked by restart session admission"
+                    );
+                    return Err(fail_json_code(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "SESSION_RESERVED",
+                        format!(
+                            "Session {mode}/{session_id} is reserved by restart recovery; retry shortly"
+                        ),
+                    ));
+                }
+            }
+        } else if state
             .restart_retirement_probe
             .as_ref()
             .is_some_and(|probe| probe(&mode, session_id))
@@ -786,8 +810,13 @@ pub(crate) async fn spawn_terminal_pane(
                     "Session {mode}/{session_id} is still retiring its previous runtime; retry shortly"
                 ),
             ));
-        }
-    }
+        } else {
+            None
+        };
+        denied
+    } else {
+        None
+    };
 
     // Hoisted spawn-environment inputs, computed ONCE (Task 8's WS pattern,
     // REST twin): the amplifier windows-arm guard below and the spawn-spec
@@ -3721,12 +3750,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_restart_retirement_blocks_only_matching_rest_resume() {
+    async fn atomic_restart_admission_blocks_only_matching_rest_resume() {
         let argv_file = unique_argv_file("restart-retirement-rest-gate");
         let state = state_with_registry()
             .with_cli_commands(Arc::new(vec![recording_cli_spec("claude", &argv_file)]))
-            .with_restart_retirement_probe(Arc::new(|provider, session_id| {
-                provider == "claude" && session_id == LIVE_SESSION
+            .with_restart_admission_gate(Arc::new(|provider, session_id| {
+                Box::pin(async move {
+                    if provider == "claude" && session_id == LIVE_SESSION {
+                        Err(())
+                    } else {
+                        Ok(Box::new(()) as crate::RestartAdmissionPermit)
+                    }
+                })
             }));
         let registry = state.terminal_registry.clone().unwrap();
         let router = app(state);

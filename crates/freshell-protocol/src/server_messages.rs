@@ -764,6 +764,8 @@ pub struct FreshAgentKilled {
     pub session_id: String,
     pub session_type: String,
     pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1205,6 +1207,9 @@ pub struct TerminalReplaced {
     pub exit_code: i64,
     pub attempt: u32,
     pub max_attempts: u32,
+    /// Server-owned identity fence for the replacement generation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

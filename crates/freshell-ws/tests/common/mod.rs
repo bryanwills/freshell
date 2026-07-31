@@ -433,6 +433,22 @@ pub async fn spawn_server_with_ledger(
     freshell_terminal::TerminalRegistry,
     std::sync::Arc<freshell_ws::pane_ledger::PaneLedger>,
 ) {
+    let (url, registry, pane_ledger, _state) =
+        spawn_server_with_ledger_and_state(cli_commands, ledger_dir).await;
+    (url, registry, pane_ledger)
+}
+
+/// Ledger-backed server variant that also exposes the shared state for
+/// coordinator/recovery integration tests.
+pub async fn spawn_server_with_ledger_and_state(
+    cli_commands: Vec<freshell_platform::CliCommandSpec>,
+    ledger_dir: &std::path::Path,
+) -> (
+    String,
+    freshell_terminal::TerminalRegistry,
+    std::sync::Arc<freshell_ws::pane_ledger::PaneLedger>,
+    WsState,
+) {
     let auth_token = Arc::new(AUTH_TOKEN.to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
     let settings =
@@ -489,7 +505,7 @@ pub async fn spawn_server_with_ledger(
         fresh_agent_respawn_counts: Default::default(),
     };
 
-    let router = freshell_ws::router(state);
+    let router = freshell_ws::router(state.clone());
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral loopback port");
@@ -502,6 +518,7 @@ pub async fn spawn_server_with_ledger(
         format!("ws://{addr}/ws", addr = addr),
         registry,
         pane_ledger,
+        state,
     )
 }
 

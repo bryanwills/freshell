@@ -338,6 +338,78 @@ async fn runtime_generation_is_stable_across_attach_and_reconnect_and_changes_on
 }
 
 #[tokio::test]
+async fn terminal_admission_serializes_a_fresh_agent_restart_for_the_same_session() {
+    let coordinator = RestartCoordinator::new();
+    let fresh_locator =
+        RuntimeLocator::new(AgentRuntimeKind::FreshAgent, "claude", "durable-shared");
+    coordinator.register_initial(fresh_locator, "fresh-1");
+    let admission = coordinator
+        .acquire_session_admission("claude", "durable-shared")
+        .await
+        .expect("terminal create admission");
+    let runtime = Arc::new(FakeRuntime::resumable("fresh-2"));
+    let task_coordinator = coordinator.clone();
+    let task_runtime = Arc::clone(&runtime);
+    let task = tokio::spawn(async move {
+        task_coordinator
+            .execute(
+                AgentRestart {
+                    request_id: "cross-kind-restart".to_string(),
+                    provider: "claude".to_string(),
+                    session_id: "durable-shared".to_string(),
+                    kind: AgentRuntimeKind::FreshAgent,
+                    live_id: "fresh-1".to_string(),
+                    expected_generation: 1,
+                },
+                task_runtime.as_ref(),
+            )
+            .await
+    });
+
+    tokio::task::yield_now().await;
+    assert!(
+        !task.is_finished(),
+        "fresh-agent restart must wait for terminal admission on the same durable session"
+    );
+    drop(admission);
+
+    assert!(matches!(
+        task.await.unwrap().messages.last(),
+        Some(ServerMessage::AgentRestartReplaced(replaced))
+            if replaced.runtime.runtime_id == "fresh-2"
+    ));
+}
+
+#[tokio::test]
+async fn a_pending_terminal_recovery_reserves_the_session_across_runtime_kinds() {
+    let coordinator = RestartCoordinator::new();
+    coordinator.register_initial(locator(), "term-1");
+    coordinator
+        .execute(
+            restart("pending-cross-kind", "term-1", 1),
+            &ReplacementFails,
+        )
+        .await;
+
+    let fresh_locator = RuntimeLocator::new(AgentRuntimeKind::FreshAgent, "claude", "durable-1");
+    assert!(
+        coordinator.retirement_pending_for(&fresh_locator),
+        "the compatibility probe must ignore runtime kind"
+    );
+    assert!(
+        coordinator
+            .acquire_session_admission("claude", "durable-1")
+            .await
+            .is_err(),
+        "atomic admission must reject the same durable session"
+    );
+    coordinator
+        .acquire_session_admission("claude", "durable-unrelated")
+        .await
+        .expect("an unrelated durable session remains admissible");
+}
+
+#[tokio::test]
 async fn resend_after_requester_disconnect_replays_the_stored_terminal_result() {
     let coordinator = RestartCoordinator::new();
     coordinator.register_initial(locator(), "term-1");
@@ -404,6 +476,7 @@ async fn concurrent_distinct_requests_for_one_old_runtime_share_the_replacement(
         "distinct request ids for the same old generation must share one teardown"
     );
 
+    drop(coordinator);
     let reopened = RestartCoordinator::new_persistent(persistence_path).unwrap();
     let replay = reopened.execute(second_request, runtime.as_ref()).await;
     assert!(replay.replayed);
@@ -893,6 +966,144 @@ async fn terminal_result_replays_after_coordinator_reopens_from_disk() {
     assert_eq!(runtime.shutdowns.load(Ordering::SeqCst), 0);
 }
 
+#[test]
+fn persistent_coordinator_rejects_corrupt_truncated_and_unreadable_journals() {
+    for (case, bytes) in [
+        ("corrupt", b"not-json".as_slice()),
+        ("truncated", br#"{"generations":["#.as_slice()),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("restart-state.json");
+        std::fs::write(&path, bytes).unwrap();
+
+        let error = RestartCoordinator::new_persistent(&path)
+            .err()
+            .unwrap_or_else(|| panic!("{case} journal must fail closed"));
+
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::InvalidData,
+            "{case} journal must report invalid persisted state"
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("restart-state.json");
+        std::fs::write(&path, b"{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let error = RestartCoordinator::new_persistent(&path)
+            .err()
+            .expect("an unreadable journal must fail closed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[cfg(not(unix))]
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("restart-state.json");
+        std::fs::create_dir(&path).unwrap();
+        let error = RestartCoordinator::new_persistent(path)
+            .err()
+            .expect("an unreadable journal path must fail closed");
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+}
+
+#[test]
+fn persistent_coordinator_holds_an_exclusive_sibling_lock_for_clone_lifetime() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("restart-state.json");
+    let first = RestartCoordinator::new_persistent(path.clone()).unwrap();
+    let first_clone = first.clone();
+
+    let competing_error = RestartCoordinator::new_persistent(path.clone())
+        .err()
+        .expect("a second journal owner must fail closed");
+    assert!(
+        matches!(
+            competing_error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Other
+        ),
+        "unexpected lock failure: {competing_error}"
+    );
+    assert!(temp.path().join("restart-state.lock").exists());
+
+    drop(first);
+    assert!(
+        RestartCoordinator::new_persistent(path.clone()).is_err(),
+        "a coordinator clone must retain journal ownership"
+    );
+    drop(first_clone);
+    RestartCoordinator::new_persistent(path)
+        .expect("the journal lock must be released with the final coordinator clone");
+}
+
+#[test]
+fn cross_process_journal_lock_is_exclusive() {
+    if let Ok(path) = std::env::var("FRESHELL_TEST_RESTART_LOCK_PATH") {
+        let ready = std::env::var("FRESHELL_TEST_RESTART_LOCK_READY").unwrap();
+        let release = std::env::var("FRESHELL_TEST_RESTART_LOCK_RELEASE").unwrap();
+        let _coordinator =
+            RestartCoordinator::new_persistent(path).expect("helper acquires journal lock");
+        std::fs::write(&ready, b"ready").unwrap();
+        for _ in 0..500 {
+            if std::path::Path::new(&release).exists() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("parent never released journal lock helper");
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("restart-state.json");
+    let ready = temp.path().join("ready");
+    let release = temp.path().join("release");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "cross_process_journal_lock_is_exclusive",
+            "--nocapture",
+        ])
+        .env("FRESHELL_TEST_RESTART_LOCK_PATH", &path)
+        .env("FRESHELL_TEST_RESTART_LOCK_READY", &ready)
+        .env("FRESHELL_TEST_RESTART_LOCK_RELEASE", &release)
+        .spawn()
+        .expect("spawn lock helper");
+    for _ in 0..200 {
+        if ready.exists() {
+            break;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "journal lock helper exited before acquiring the lock"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(ready.exists(), "journal lock helper never became ready");
+
+    let error = RestartCoordinator::new_persistent(path.clone())
+        .err()
+        .expect("a different process must exclude this journal owner");
+    assert!(
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Other
+        ),
+        "unexpected cross-process lock failure: {error}"
+    );
+
+    std::fs::write(&release, b"release").unwrap();
+    assert!(child.wait().unwrap().success());
+    RestartCoordinator::new_persistent(path)
+        .expect("the child process release must make the journal available");
+}
+
 struct ReplacementFails;
 
 #[async_trait::async_trait]
@@ -921,6 +1132,39 @@ impl RestartRuntime for ReplacementFails {
             "replacement failed",
             true,
         ))
+    }
+}
+
+struct PreflightReservation {
+    aborted: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl RestartRuntime for PreflightReservation {
+    type ResumePlan = ();
+
+    async fn preflight(&self, _request: &AgentRestart) -> Result<(), RestartFailure> {
+        Ok(())
+    }
+
+    async fn abort_preflight(&self, _request: &AgentRestart, _plan: &()) {
+        self.aborted.fetch_add(1, Ordering::SeqCst);
+    }
+
+    async fn shutdown_for_restart(
+        &self,
+        _request: &AgentRestart,
+        _plan: &(),
+    ) -> Result<(), RestartFailure> {
+        panic!("journal failure must prevent teardown")
+    }
+
+    async fn create_replacement(
+        &self,
+        _request: &AgentRestart,
+        _plan: (),
+    ) -> Result<String, RestartFailure> {
+        panic!("journal failure must prevent replacement")
     }
 }
 
@@ -1600,6 +1844,96 @@ async fn pending_retirement_blocks_only_the_matching_terminal_create() {
 }
 
 #[tokio::test]
+async fn reconcile_fences_the_server_authoritative_session_not_a_stale_client_claim() {
+    let (url, registry, state) =
+        common::spawn_server_with_specs_and_state(vec![common::sleeper_cli_spec("claude")]).await;
+    let (mut ws, _) = common::connect_and_capture_inventory_with_capabilities(
+        &url,
+        Some(serde_json::json!({ "paneReconcileV1": true })),
+    )
+    .await;
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "terminal.create",
+            "requestId": "authoritative-reconcile-create",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir(),
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let created = common::next_frame_of_type(&mut ws, "terminal.created").await;
+    let terminal_id = created["terminalId"].as_str().unwrap().to_string();
+    let authoritative_session = created["sessionRef"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Model a historical fresh-agent predecessor still retiring for the
+    // same durable transcript. The live terminal itself remains available
+    // so reconciliation produces an authoritative corrected sessionRef.
+    let old = state.restart.register_initial(
+        RuntimeLocator::new(
+            AgentRuntimeKind::FreshAgent,
+            "claude",
+            &authoritative_session,
+        ),
+        "fresh-historical-predecessor",
+    );
+    state
+        .restart
+        .execute(
+            AgentRestart {
+                request_id: "authoritative-reconcile-retirement".to_string(),
+                provider: "claude".to_string(),
+                session_id: authoritative_session.clone(),
+                kind: AgentRuntimeKind::FreshAgent,
+                live_id: old.runtime_id,
+                expected_generation: old.generation,
+            },
+            &ConcurrentRetirementGate {
+                shutdowns: AtomicUsize::new(0),
+                allow_retirement: AtomicBool::new(false),
+                retry_entered: tokio::sync::Barrier::new(2),
+                retry_release: tokio::sync::Notify::new(),
+            },
+        )
+        .await;
+
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "pane.reconcile.request",
+            "reconcileId": "authoritative-reconcile",
+            "panes": [{
+                "paneKey": "authoritative-pane",
+                "kind": "terminal",
+                "mode": "claude",
+                "terminalId": terminal_id,
+                "createRequestId": "authoritative-reconcile-create",
+                "sessionRef": {
+                    "provider": "claude",
+                    "sessionId": "stale-client-session"
+                }
+            }]
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let result = common::next_frame_of_type(&mut ws, "pane.reconcile.result").await;
+    let verdict = &result["verdicts"][0];
+    assert_eq!(verdict["verdict"], "error");
+    assert_eq!(verdict["reason"], "restart_retirement_pending");
+    assert_eq!(
+        verdict["sessionRef"]["sessionId"], authoritative_session,
+        "the restart fence must follow the server-corrected identity"
+    );
+    registry.kill_all();
+}
+
+#[tokio::test]
 async fn pending_retirement_blocks_only_the_matching_fresh_agent_create() {
     let (url, registry, state) = common::spawn_server_with_specs_and_state(vec![]).await;
     state.fresh_codex.set_enabled(true);
@@ -2042,6 +2376,29 @@ async fn persistence_failure_before_shutdown_fails_closed() {
             if message.retryable
                 && message.code == AgentRestartFailureCode::PreflightFailed
     ));
+}
+
+#[tokio::test]
+async fn persistence_failure_releases_the_non_destructive_preflight_reservation() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("restart-state.json");
+    let coordinator = RestartCoordinator::new_persistent(path.clone()).unwrap();
+    coordinator.register_initial(locator(), "term-1");
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    let runtime = PreflightReservation {
+        aborted: AtomicUsize::new(0),
+    };
+
+    coordinator
+        .execute(restart("abort-preflight-r1", "term-1", 1), &runtime)
+        .await;
+
+    assert_eq!(
+        runtime.aborted.load(Ordering::SeqCst),
+        1,
+        "a failed durable boundary must release provider preflight state"
+    );
 }
 
 #[tokio::test]
@@ -3911,6 +4268,8 @@ async fn production_fresh_boot_recovery_reuses_the_persisted_kilroy_plan() {
         Some(ServerMessage::AgentRestartFailed(failed)) if failed.retryable
     ));
 
+    drop(production);
+    drop(state);
     let reopened = RestartCoordinator::new_persistent(path).unwrap();
     let (_url, recovery_registry, mut recovery_state) =
         common::spawn_server_with_specs_and_state(vec![]).await;

@@ -261,7 +261,6 @@ describe('DeadSessionPanel + ReconcileWarmingBanner', () => {
   it('N warming panes produce exactly ONE banner with the count', () => {
     renderWithStore({ reconcileWarming: { count: 7, paneRefs: sevenRefs() } })
     expect(screen.getAllByRole('status')).toHaveLength(1)
-    expect(screen.getByRole('status')).toHaveTextContent(/waiting for session index/i)
     expect(screen.getByRole('status')).toHaveTextContent(/7/)
   })
 

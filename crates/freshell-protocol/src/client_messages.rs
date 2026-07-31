@@ -571,6 +571,10 @@ pub struct FreshAgentSend {
     pub provider: AgentProvider,
     pub session_id: String,
     pub session_type: SessionType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_runtime_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_generation: Option<u64>,
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
@@ -588,6 +592,10 @@ pub struct FreshAgentInterrupt {
     pub provider: AgentProvider,
     pub session_id: String,
     pub session_type: SessionType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_runtime_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_generation: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
 }
@@ -638,6 +646,10 @@ pub struct FreshAgentKill {
     pub provider: AgentProvider,
     pub session_id: String,
     pub session_type: SessionType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_runtime_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_generation: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
 }

@@ -696,6 +696,8 @@ describe('FreshAgentView', () => {
             provider: 'opencode',
             createRequestId: 'req-stop-route',
             sessionId: 'ses_stop_route',
+            runtimeId: 'runtime-stop-route',
+            runtimeGeneration: 4,
             initialCwd: '/repo/route-aware',
             status: 'running',
           }}
@@ -710,6 +712,8 @@ describe('FreshAgentView', () => {
       sessionId: 'ses_stop_route',
       sessionType: 'freshopencode',
       provider: 'opencode',
+      expectedRuntimeId: 'runtime-stop-route',
+      expectedGeneration: 4,
       cwd: '/repo/route-aware',
     })
   })
@@ -1506,6 +1510,8 @@ describe('FreshAgentView', () => {
       sessionId: 'thread-1',
       sessionType: 'freshcodex',
       provider: 'codex',
+      expectedRuntimeId: 'runtime-current',
+      expectedGeneration: 8,
       text: 'Ship it',
       settings: {
         cwd: '/repo',
@@ -3663,6 +3669,8 @@ describe('FreshAgentView', () => {
         provider: 'codex',
         createRequestId: 'req-reset-alias',
         sessionId: 'thread-reset-alias',
+        runtimeId: 'runtime-reset-alias',
+        runtimeGeneration: 3,
         status: 'idle',
       },
     }))
@@ -3686,6 +3694,8 @@ describe('FreshAgentView', () => {
       sessionId: 'thread-reset-alias',
       sessionType: 'freshcodex',
       provider: 'codex',
+      expectedRuntimeId: 'runtime-reset-alias',
+      expectedGeneration: 3,
     })
     await waitFor(() => {
       expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
@@ -3795,6 +3805,8 @@ describe('FreshAgentView', () => {
       sessionId: 'ses_new_route',
       sessionType: 'freshopencode',
       provider: 'opencode',
+      expectedRuntimeId: 'runtime-before-new',
+      expectedGeneration: 10,
       cwd: '/repo/route-aware',
     })
     await waitFor(() => {
