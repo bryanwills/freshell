@@ -88,11 +88,11 @@ describe('ResumeSessionDialog', () => {
     expect(screen.getByTestId('resume-note').textContent).toContain('codex')
   })
 
-  it('evidence wins over the picker, with a note', async () => {
+  it('server evidence decides the agent even when the parse hint disagrees', async () => {
     apiPost.mockReturnValue(ok([match({ provider: 'opencode', sessionId: SES, sessionType: undefined })]))
     renderDialog()
-    fireEvent.change(screen.getByTestId('resume-agent-picker'), { target: { value: 'claude' } })
-    typeAndResolve(SES)
+    // "claude --resume" hints claude, but the session store says opencode.
+    typeAndResolve(`claude --resume ${SES}`)
     await waitFor(() => expect(resumeSessionInTab).toHaveBeenCalled())
     expect(resumeSessionInTab.mock.calls[0][2]).toMatchObject({ provider: 'opencode' })
     expect(screen.getByTestId('resume-note').textContent).toContain('opencode')
@@ -116,22 +116,37 @@ describe('ResumeSessionDialog', () => {
     })
   })
 
-  it('zero matches: inline error, input preserved, resume-anyway uses picker agent', async () => {
+  it('zero matches: inline error, input preserved, resume-anyway uses the parse-hint agent', async () => {
     apiPost.mockReturnValue(ok([]))
     renderDialog()
     typeAndResolve(V4)
     await screen.findByTestId('resume-error')
     expect((screen.getByTestId('resume-input') as HTMLTextAreaElement).value).toBe(V4)
-    // hint pre-filled the picker to claude (v4 shape); user switches to amplifier
-    fireEvent.change(screen.getByTestId('resume-agent-picker'), { target: { value: 'amplifier' } })
+    // The v4 id shape hints claude; the button discloses that guess before launch.
+    expect(screen.getByTestId('resume-anyway-button').textContent).toBe('Resume anyway with claude')
     expect((screen.getByTestId('resume-anyway-cwd') as HTMLInputElement).value).toBe('~')
     fireEvent.click(screen.getByTestId('resume-anyway-button'))
     expect(resumeSessionInTab).toHaveBeenCalledTimes(1)
     expect(resumeSessionInTab.mock.calls[0][2]).toMatchObject({
-      provider: 'amplifier',
+      provider: 'claude',
       sessionId: V4,
-      sessionType: 'amplifier',
+      sessionType: 'claude',
       cwd: undefined, // '~' means server default (home directory)
+    })
+  })
+
+  it('the command form steers the guess: "codex resume <id>" discloses codex on the escape hatch', async () => {
+    apiPost.mockReturnValue(ok([]))
+    renderDialog()
+    typeAndResolve('codex resume abc123def0')
+    await screen.findByTestId('resume-error')
+    expect(screen.getByTestId('resume-anyway-button').textContent).toBe('Resume anyway with codex')
+    fireEvent.click(screen.getByTestId('resume-anyway-button'))
+    expect(resumeSessionInTab).toHaveBeenCalledTimes(1)
+    expect(resumeSessionInTab.mock.calls[0][2]).toMatchObject({
+      provider: 'codex',
+      sessionId: 'abc123def0',
+      sessionType: 'codex',
     })
   })
 
@@ -174,12 +189,11 @@ describe('ResumeSessionDialog', () => {
     expect(resumeSessionInTab).not.toHaveBeenCalled()
   })
 
-  it('pre-fills the agent picker from the hint', async () => {
+  it('renders NO always-visible agent picker or unverified-guess hint (kata 1ffd removal)', () => {
     renderDialog()
-    fireEvent.change(screen.getByTestId('resume-input'), {
-      target: { value: `codex resume ${V7}` },
-    })
-    expect((screen.getByTestId('resume-agent-picker') as HTMLSelectElement).value).toBe('codex')
+    expect(screen.queryByTestId('resume-agent-picker')).toBeNull()
+    expect(screen.queryByLabelText(/agent/i)).toBeNull()
+    expect(screen.queryByText(/unverified guess/i)).toBeNull()
   })
 
   it('closes on Escape', () => {

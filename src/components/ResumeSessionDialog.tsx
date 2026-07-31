@@ -68,7 +68,6 @@ export function ResumeSessionDialog({ open, onClose, onNavigate }: ResumeSession
   const store = useStore<RootState>()
   const [input, setInput] = useState('')
   const [agent, setAgent] = useState<string>(providers[0])
-  const [agentTouched, setAgentTouched] = useState(false)
   const [anywayCwd, setAnywayCwd] = useState('~')
   const [phase, setPhase] = useState<Phase>({ kind: 'idle' })
   // Inline error for confirming a cwd-less match with a blank cwd field.
@@ -82,12 +81,14 @@ export function ResumeSessionDialog({ open, onClose, onNavigate }: ResumeSession
   // homeDir prefill never overwrites a USER-edited working directory.
   const cwdTouchedRef = useRef(false)
 
-  // Advisory hint pre-fills the picker; never overrides a manual choice.
+  // Advisory parse hint drives the internal agent guess. There is no visible
+  // picker (kata 1ffd): the guess surfaces only on the no-match escape hatch's
+  // "Resume anyway with {agent}" button, which is the disclosure point.
   useEffect(() => {
-    if (agentTouched || !input) return
+    if (!input) return
     const { hint } = parseResumeInput(input)
     if (hint && providers.includes(hint.provider)) setAgent(hint.provider)
-  }, [input, agentTouched])
+  }, [input])
 
   const finishResume = useCallback(
     (target: ResumeTarget, note: string) => {
@@ -344,30 +345,6 @@ export function ResumeSessionDialog({ open, onClose, onNavigate }: ResumeSession
             }, 0)
           }}
         />
-        <div className="flex items-center gap-2">
-          <label className="text-xs text-muted-foreground" htmlFor="resume-agent-picker">
-            Agent
-          </label>
-          <select
-            id="resume-agent-picker"
-            data-testid="resume-agent-picker"
-            value={agent}
-            onChange={(event) => {
-              setAgent(event.target.value)
-              setAgentTouched(true)
-            }}
-            className={controlClass}
-          >
-            {providers.map((provider) => (
-              <option key={provider} value={provider}>
-                {provider}
-              </option>
-            ))}
-          </select>
-        </div>
-        <p className="text-[10px] text-muted-foreground">
-          Unverified guess — the session store decides the agent.
-        </p>
         <button
           type="button"
           data-testid="resume-resolve-button"
