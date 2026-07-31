@@ -408,6 +408,9 @@ impl AutoResumeDriver for WsAutoResumeDriver {
     /// the entry before the CrashEvent is handled), pane-ledger binding as
     /// the fallback home.
     fn resumable_session_ref(&self, terminal_id: &str) -> Option<(String, String, Option<String>)> {
+        if self.state.registry.is_restart_retiring(terminal_id) {
+            return None;
+        }
         if let Some(entry) = self.state.identity.get(terminal_id) {
             if let (Some(provider), Some(session_id)) = (entry.provider, entry.session_id) {
                 return Some((provider, session_id, entry.cwd));
@@ -433,6 +436,12 @@ impl AutoResumeDriver for WsAutoResumeDriver {
         session_id: &str,
         old_terminal_id: &str,
     ) -> Option<&'static str> {
+        // A restart may begin after the CrashEvent was dequeued but before
+        // this post-backoff check. Its boot-scoped tombstone survives removal
+        // of the predecessor registry row.
+        if self.state.registry.is_restart_retiring(old_terminal_id) {
+            return Some("restart_retiring");
+        }
         // The user already relaunched this session during the backoff.
         if self
             .state
@@ -1218,6 +1227,51 @@ mod tests {
         assert!(fake.respawn_calls().is_empty());
         assert!(fake.claim_calls().is_empty());
         assert_eq!(fake.settled_reasons(), vec!["pane_closed".to_string()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn restart_retiring_terminal_is_rejected_after_backoff_without_affecting_unrelated_crash()
+    {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let fake = FakeDriver::healthy();
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, vec![2_000, 10_000]);
+
+        tx.send(crash(
+            "t-restart-retiring",
+            137,
+            "codex",
+            Some("cr-restart"),
+            1_000,
+        ))
+        .unwrap();
+        drain().await;
+        // The proxy-triggered non-zero exit entered the queue before the
+        // restart transaction marked its predecessor. Teardown remains slow
+        // beyond the auto-resume delay, so the post-backoff guard is the
+        // load-bearing fence.
+        fake.set_guard(Some("restart_retiring"));
+        tokio::time::advance(std::time::Duration::from_millis(2_000)).await;
+        drain().await;
+        assert!(fake.respawn_calls().is_empty());
+        assert!(fake.claim_calls().is_empty());
+        assert_eq!(fake.settled_reasons(), vec!["restart_retiring".to_string()]);
+
+        // The fence is locator/terminal scoped: an unrelated crash still
+        // follows the ordinary auto-resume path.
+        fake.set_guard(None);
+        tx.send(crash(
+            "t-unrelated",
+            1,
+            "claude",
+            Some("cr-unrelated"),
+            1_000,
+        ))
+        .unwrap();
+        drain().await;
+        tokio::time::advance(std::time::Duration::from_millis(2_000)).await;
+        drain().await;
+        assert_eq!(fake.respawn_calls().len(), 1);
+        assert_eq!(fake.respawn_calls()[0].create_request_id, "cr-unrelated");
     }
 
     #[tokio::test(start_paused = true)]

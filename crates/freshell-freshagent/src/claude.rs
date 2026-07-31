@@ -146,6 +146,10 @@ struct ClaudeSession {
     /// Authoritative launch flavour for restart/recovery (`freshclaude` vs
     /// `kilroy`). Provider alone cannot reconstruct this value.
     session_type: SessionType,
+    /// Exact settings sent to the live sidecar. Kept independently from the
+    /// best-effort identity sink so a nonfatal ledger write failure cannot
+    /// make restart launder these values through defaults.
+    settings: crate::FreshAgentSettings,
     /// stdin of the Node sidecar (write `create`/`send`/`shutdown` requests).
     stdin: ChildStdin,
     /// The owned Node sidecar child (SIGKILL backstop; `kill_on_drop`).
@@ -474,7 +478,7 @@ impl FreshClaudeState {
             created.clone(),
             session_type.to_string(),
             created.clone(),
-            Some(settings),
+            Some(settings.clone()),
             Arc::clone(&broadcast_id),
             runtime.clone(),
         );
@@ -495,6 +499,7 @@ impl FreshClaudeState {
             ClaudeSession {
                 runtime: runtime.clone(),
                 session_type: msg.session_type,
+                settings,
                 stdin,
                 child,
                 ownership_id: ownership_id.clone(),
@@ -1000,6 +1005,25 @@ impl FreshClaudeState {
             .map(|session| session.session_type)
     }
 
+    /// Provider-authoritative flavour and settings for the currently-live
+    /// Claude/Kilroy sidecar.
+    pub async fn capture_restart_resume_plan(
+        &self,
+        session_id: &str,
+        expected_runtime_id: &str,
+    ) -> Option<crate::FreshAgentRestartResumePlan> {
+        let key = self.resolve_session_key(session_id).await?;
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(&key)?;
+        if session.runtime.runtime_id != expected_runtime_id {
+            return None;
+        }
+        Some(crate::FreshAgentRestartResumePlan {
+            session_type: session.session_type,
+            settings: session.settings.clone(),
+        })
+    }
+
     /// Resolve a client-addressed session id to the sessions-map key (Task 10b): the id
     /// itself when tracked, else through [`Self::cli_index`] (durable UUID -> map key).
     /// The map is never re-keyed (in-flight consumers hold the placeholder key);
@@ -1264,6 +1288,13 @@ impl FreshClaudeState {
                 json!(msg.cwd.clone().or_else(|| rec.cwd.clone())),
             ),
         };
+        let live_settings = crate::FreshAgentSettings {
+            model: rec.model.clone(),
+            sandbox: None,
+            permission_mode: rec.permission_mode.clone(),
+            effort: rec.effort.clone(),
+            cwd: resume_cwd.as_str().map(str::to_string),
+        };
 
         let (mut child, mut stdin, stdout, ownership_id) = spawn_sidecar()
             .await
@@ -1281,9 +1312,9 @@ impl FreshClaudeState {
             "cwd": resume_cwd,
             // Recovered from the ledger record (Task 10); `json!` serializes `None`
             // as `null`, preserving today's fallback wire shape exactly on a miss.
-            "model": rec.model,
-            "permissionMode": rec.permission_mode,
-            "effort": rec.effort,
+            "model": rec.model.clone(),
+            "permissionMode": rec.permission_mode.clone(),
+            "effort": rec.effort.clone(),
             "resumeSessionId": resume_value,
         });
         if let Err(err) = write_line(&mut stdin, &create_req).await {
@@ -1326,6 +1357,7 @@ impl FreshClaudeState {
             ClaudeSession {
                 runtime: runtime.clone(),
                 session_type: msg.session_type,
+                settings: live_settings,
                 stdin,
                 child,
                 ownership_id,
@@ -1926,6 +1958,7 @@ pub(crate) mod tests {
                     generation: 1,
                 },
                 session_type: SessionType::Freshclaude,
+                settings: crate::FreshAgentSettings::default(),
                 stdin,
                 child,
                 ownership_id: format!("test-{session_id}"),
@@ -2104,6 +2137,7 @@ wait
             ClaudeSession {
                 runtime,
                 session_type: SessionType::Freshclaude,
+                settings: crate::FreshAgentSettings::default(),
                 stdin,
                 child,
                 ownership_id,
@@ -2227,6 +2261,7 @@ exit 0
             ClaudeSession {
                 runtime,
                 session_type: SessionType::Kilroy,
+                settings: crate::FreshAgentSettings::default(),
                 stdin,
                 child,
                 ownership_id,
@@ -3192,6 +3227,87 @@ rl.on('line', (line) => {
         assert_eq!(b.settings.permission_mode.as_deref(), Some("plan"));
         assert_eq!(b.settings.effort.as_deref(), Some("high"));
         assert!(b.settings.cwd.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restart_plan_keeps_live_kilroy_settings_after_ledger_write_failure() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (state, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        fake.fail_writes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        state.set_identity_sink(fake.clone());
+
+        let cwd = env.dir.to_string_lossy().to_string();
+        let mut msg = dedup_create_msg("req-restart-ledger-failure");
+        msg.session_type = SessionType::Kilroy;
+        msg.model = Some("opus-restart".to_string());
+        msg.permission_mode = Some("plan".to_string());
+        msg.effort = Some("high".to_string());
+        msg.cwd = Some(cwd.clone());
+        state.handle_create(msg).await;
+        await_claude_created(&mut rx, "req-restart-ledger-failure").await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["event"]["code"] == "LEDGER_WRITE_FAILED" {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the failed durable write is surfaced");
+
+        let durable = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        assert!(
+            !fake
+                .settings
+                .lock()
+                .unwrap()
+                .contains_key(&("claude".to_string(), durable.to_string())),
+            "the failed write must leave no fallback ledger row"
+        );
+        let map_key = state
+            .cli_index
+            .lock()
+            .await
+            .get(durable)
+            .cloned()
+            .expect("durable session index");
+        let runtime_id = state
+            .sessions
+            .lock()
+            .await
+            .get(&map_key)
+            .expect("live Kilroy session")
+            .runtime
+            .runtime_id
+            .clone();
+        assert_eq!(
+            state
+                .capture_restart_resume_plan(durable, &runtime_id)
+                .await
+                .expect("live Claude runtime remains authoritative"),
+            crate::FreshAgentRestartResumePlan {
+                session_type: SessionType::Kilroy,
+                settings: crate::FreshAgentSettings {
+                    model: Some("opus-restart".to_string()),
+                    sandbox: None,
+                    permission_mode: Some("plan".to_string()),
+                    effort: Some("high".to_string()),
+                    cwd: Some(cwd),
+                },
+            }
+        );
+        assert!(
+            state
+                .capture_restart_resume_plan(durable, "stale-runtime")
+                .await
+                .is_none(),
+            "restart preflight must not borrow settings from a newer live runtime"
+        );
     }
 
     /// No-laundering guard (V7/A10, parity with codex's `record_codex_binding`):

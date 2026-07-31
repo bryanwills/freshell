@@ -1509,6 +1509,34 @@ impl FreshCodexState {
             .is_some_and(|s| !s.exited.load(Ordering::SeqCst))
     }
 
+    /// Provider-authoritative restart inputs for the live Codex runtime.
+    /// These values are the normalized settings actually retained by
+    /// `handle_send`; a failed identity-sink write must never make restart
+    /// substitute mutable server defaults.
+    pub async fn capture_restart_resume_plan(
+        &self,
+        session_id: &str,
+        expected_runtime_id: &str,
+    ) -> Option<crate::FreshAgentRestartResumePlan> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(session_id)?;
+        if session.runtime.runtime_id != expected_runtime_id
+            || session.exited.load(Ordering::SeqCst)
+        {
+            return None;
+        }
+        Some(crate::FreshAgentRestartResumePlan {
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            settings: crate::FreshAgentSettings {
+                model: Some(session.model.clone()),
+                sandbox: session.sandbox.clone(),
+                permission_mode: session.permission_mode.clone(),
+                effort: session.effort.clone(),
+                cwd: session.cwd.clone(),
+            },
+        })
+    }
+
     /// Snapshot the sidecar and every currently-readable descendant before
     /// restart closes its transport or transfers the child to quarantine.
     /// The immutable spawn identity follows transparent respawns, so this is
@@ -6628,15 +6656,15 @@ while true; do read -r -t 1 _ || true; done
                 request_id: "req-ledger-fail".to_string(),
                 session_type: freshell_protocol::SessionType::Freshcodex,
                 provider: Some(freshell_protocol::AgentProvider::Codex),
-                cwd: None,
+                cwd: Some("/tmp".to_string()),
                 legacy_restore_context: None,
                 resume_session_id: None,
                 session_ref: None,
                 model: Some("gpt-5.3-codex-spark".to_string()),
                 model_selection: None,
-                permission_mode: None,
-                sandbox: None,
-                effort: None,
+                permission_mode: Some("on-request".to_string()),
+                sandbox: Some(freshell_protocol::Sandbox::WorkspaceWrite),
+                effort: Some("high".to_string()),
                 plugins: None,
             })
             .await;
@@ -6677,10 +6705,50 @@ while true; do read -r -t 1 _ || true; done
         // The create still succeeded: the session exists under the created id.
         let created = created_frame.expect("the create still succeeded");
         let thread_id = created["sessionId"].as_str().unwrap().to_string();
-        let guard = state.sessions.lock().await;
         assert!(
-            guard.contains_key(&thread_id),
+            state.sessions.lock().await.contains_key(&thread_id),
             "a write failure never blocks the identity event"
+        );
+        assert!(
+            !fake
+                .settings
+                .lock()
+                .unwrap()
+                .contains_key(&("codex".to_string(), thread_id.clone())),
+            "the fixture must reproduce the missing-ledger-row condition"
+        );
+        let runtime_id = state
+            .sessions
+            .lock()
+            .await
+            .get(&thread_id)
+            .expect("live session")
+            .runtime
+            .runtime_id
+            .clone();
+        let plan = state
+            .capture_restart_resume_plan(&thread_id, &runtime_id)
+            .await
+            .expect("the live runtime remains authoritative after the ledger failure");
+        assert_eq!(
+            plan,
+            crate::FreshAgentRestartResumePlan {
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                settings: crate::FreshAgentSettings {
+                    model: Some("gpt-5.3-codex-spark".to_string()),
+                    sandbox: Some("workspace-write".to_string()),
+                    permission_mode: Some("on-request".to_string()),
+                    effort: Some("high".to_string()),
+                    cwd: Some("/tmp".to_string()),
+                },
+            }
+        );
+        assert!(
+            state
+                .capture_restart_resume_plan(&thread_id, "stale-runtime")
+                .await
+                .is_none(),
+            "restart preflight must stay fenced to the selected runtime"
         );
     }
 

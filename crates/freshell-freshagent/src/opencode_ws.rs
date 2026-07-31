@@ -683,10 +683,11 @@ impl FreshOpencodeState {
 
         session.model = model.clone();
         session.effort = effort.clone();
+        session.cwd = cwd.clone();
 
         // P1.13: settings-change refresh -- once durable, every send's committed
-        // model/effort re-snapshot the binding row (AWAITED BEFORE send.accepted --
-        // durable-before-answer). No pending resolution or supersession here.
+        // model/effort/cwd re-snapshot the binding row (AWAITED BEFORE send.accepted
+        // -- durable-before-answer). No pending resolution or supersession here.
         if acked_session_id.starts_with("ses_") {
             if let Some(sink) = self.identity_sink() {
                 if let Err(e) = sink
@@ -796,6 +797,31 @@ impl FreshOpencodeState {
     /// resolves the same record.
     pub async fn has_live_session(&self, session_id: &str) -> bool {
         self.sessions.lock().await.contains_key(session_id)
+    }
+
+    /// Provider-authoritative restart inputs for the exact live OpenCode
+    /// session object. Both placeholder and durable aliases resolve the same
+    /// record, whose fields are refreshed after every settings-bearing send.
+    pub async fn capture_restart_resume_plan(
+        &self,
+        session_id: &str,
+        expected_runtime_id: &str,
+    ) -> Option<crate::FreshAgentRestartResumePlan> {
+        let session = self.sessions.lock().await.get(session_id).cloned()?;
+        let session = session.lock().await;
+        if session.runtime.runtime_id != expected_runtime_id {
+            return None;
+        }
+        Some(crate::FreshAgentRestartResumePlan {
+            session_type: freshell_protocol::SessionType::Freshopencode,
+            settings: crate::FreshAgentSettings {
+                model: session.model.clone(),
+                sandbox: None,
+                permission_mode: None,
+                effort: session.effort.clone(),
+                cwd: session.cwd.clone(),
+            },
+        })
     }
 
     /// Capture the exact remote-session abort needed if restart crosses a
@@ -2926,6 +2952,86 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .starts_with("freshopencode-"));
+    }
+
+    #[tokio::test]
+    async fn restart_plan_keeps_live_opencode_settings_after_ledger_write_failure() {
+        let (state, _killed) = state().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        fake.fail_writes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        state.set_identity_sink(fake.clone());
+
+        let mut create = create_msg("restart-ledger-failure");
+        create.cwd = Some("/tmp/restart-ledger-failure-opencode".to_string());
+        create.model = Some("provider/nondefault".to_string());
+        create.effort = Some("high".to_string());
+        state.handle_create(create).await;
+        state
+            .handle_send(send_msg(
+                "freshopencode-restart-ledger-failure",
+                "materialize",
+            ))
+            .await;
+        let mut reconfigured = send_msg(
+            "freshopencode-restart-ledger-failure",
+            "reconfigure-live-route",
+        );
+        reconfigured.settings = Some(freshell_protocol::FreshAgentSendSettings {
+            cwd: Some("/tmp/restart-live-route-opencode".to_string()),
+            effort: Some("low".to_string()),
+            model: Some("provider/reconfigured".to_string()),
+            permission_mode: None,
+            sandbox: None,
+        });
+        state.handle_send(reconfigured).await;
+
+        let (durable, runtime_id) = state
+            .sessions
+            .lock()
+            .await
+            .values()
+            .find_map(|session| {
+                session.try_lock().ok().and_then(|session| {
+                    session
+                        .real_session_id
+                        .clone()
+                        .map(|durable| (durable, session.runtime.runtime_id.clone()))
+                })
+            })
+            .expect("materialized durable session");
+        assert!(
+            !fake
+                .settings
+                .lock()
+                .unwrap()
+                .contains_key(&("opencode".to_string(), durable.clone())),
+            "the failed write must leave no fallback ledger row"
+        );
+        let plan = state
+            .capture_restart_resume_plan(&durable, &runtime_id)
+            .await
+            .expect("the live OpenCode runtime remains authoritative");
+        assert_eq!(plan.session_type, SessionType::Freshopencode);
+        assert_eq!(
+            plan.settings.model.as_deref(),
+            Some("provider/reconfigured")
+        );
+        assert_eq!(plan.settings.effort.as_deref(), Some("low"));
+        assert_eq!(
+            plan.settings.cwd.as_deref(),
+            Some("/tmp/restart-live-route-opencode"),
+            "restart must capture the exact current route, not the create-time cwd"
+        );
+        assert_eq!(plan.settings.sandbox, None);
+        assert_eq!(plan.settings.permission_mode, None);
+        assert!(
+            state
+                .capture_restart_resume_plan(&durable, "stale-runtime")
+                .await
+                .is_none(),
+            "restart preflight must stay fenced to the selected runtime"
+        );
     }
 
     #[tokio::test]

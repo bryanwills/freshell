@@ -602,6 +602,13 @@ pub struct TerminalRegistry {
     /// KNOWN dead (registered but not Running) is pruned instead of
     /// answering `BoundElsewhere`, so a dead winner never strands losers.
     session_ref_bindings: Arc<Mutex<HashMap<String, String>>>,
+    /// Boot-scoped tombstones for terminals whose PTY exit is owned by an
+    /// explicit `agent.restart` transaction. These intentionally outlive the
+    /// registry row: a natural-exit CrashEvent may already be queued when the
+    /// restart begins and wake after `kill()` removes the predecessor. Terminal
+    /// ids are never reused within a boot, so retaining the id is the only
+    /// fail-closed answer; the set resets with the process.
+    restart_retiring_terminals: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl Default for TerminalRegistry {
@@ -679,6 +686,7 @@ impl TerminalRegistry {
             resume_create_inflight: Arc::new(Mutex::new(std::collections::HashSet::new())),
             session_ref_leases: Arc::new(Mutex::new(HashMap::new())),
             session_ref_bindings: Arc::new(Mutex::new(HashMap::new())),
+            restart_retiring_terminals: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -1505,6 +1513,38 @@ impl TerminalRegistry {
             .expect("registry lock")
             .terminals
             .contains_key(terminal_id)
+    }
+
+    /// Classify this terminal's next PTY exit as restart-owned before any
+    /// action (such as closing a managed Codex proxy) can make the PTY exit.
+    ///
+    /// Returns `false` only for an unknown terminal. The row may already have
+    /// reached `Exited` in a natural-exit race; it is still fenced because its
+    /// CrashEvent may be waiting in the auto-resume queue.
+    pub fn mark_restart_retiring(&self, terminal_id: &str) -> bool {
+        let exists = self
+            .inner
+            .lock()
+            .expect("registry lock")
+            .terminals
+            .contains_key(terminal_id);
+        if !exists {
+            return false;
+        }
+        self.restart_retiring_terminals
+            .lock()
+            .expect("restart-retiring terminals lock")
+            .insert(terminal_id.to_string());
+        true
+    }
+
+    /// Whether auto-resume and the PTY exit hook must treat `terminal_id` as
+    /// owned by an explicit restart transaction rather than a natural crash.
+    pub fn is_restart_retiring(&self, terminal_id: &str) -> bool {
+        self.restart_retiring_terminals
+            .lock()
+            .expect("restart-retiring terminals lock")
+            .contains(terminal_id)
     }
 
     /// `finishTerminalPtyExit` (`terminal-registry.ts:1479-1510`), non-codex core —
@@ -3242,6 +3282,31 @@ mod tests {
         assert!(got_exit);
         // Killing an unknown terminal is a no-op false.
         assert!(!reg.kill("T"));
+    }
+
+    #[test]
+    fn restart_retirement_fence_survives_terminal_removal_without_affecting_siblings() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T-restarting", "S-restarting");
+        reg.insert_headless("T-unrelated", "S-unrelated");
+
+        assert!(
+            reg.mark_restart_retiring("T-restarting"),
+            "a live terminal must accept the restart-retiring fence"
+        );
+        assert!(reg.is_restart_retiring("T-restarting"));
+        assert!(
+            !reg.is_restart_retiring("T-unrelated"),
+            "the fence must be terminal-scoped"
+        );
+
+        assert!(reg.kill("T-restarting"));
+        assert!(
+            reg.is_restart_retiring("T-restarting"),
+            "the tombstone must outlive row removal so a crash event already queued \
+             before restart cannot auto-resume after the backoff"
+        );
+        assert!(!reg.mark_restart_retiring("T-missing"));
     }
 
     #[test]

@@ -624,6 +624,22 @@ impl RestartCoordinator {
             .collect()
     }
 
+    /// Whether this exact durable runtime is still fenced by an unfinished
+    /// predecessor retirement. Create/reconcile admission uses this to keep a
+    /// blocked boot recovery session-scoped: the affected locator cannot gain
+    /// a second writer, while unrelated sessions remain available.
+    pub fn retirement_pending_for(&self, locator: &RuntimeLocator) -> bool {
+        self.ownership
+            .lock()
+            .expect("restart ownership lock")
+            .pending_recoveries
+            .values()
+            .any(|pending| {
+                pending.retirement_pending
+                    && RuntimeLocator::from_request(&pending.request) == *locator
+            })
+    }
+
     pub fn set_runtime(
         &self,
         runtime: Arc<dyn RestartRuntime<ResumePlan = ()>>,
@@ -1040,6 +1056,31 @@ impl RestartCoordinator {
             .cloned()
     }
 
+    fn adoptable_registered_replacement(
+        &self,
+        request: &AgentRestart,
+        pending: &PendingRestartRecovery,
+    ) -> Option<RuntimeDescriptor> {
+        let replacement = self
+            .runtime_for_locator(&RuntimeLocator::from_request(request))
+            .filter(|current| {
+                current.runtime_id != pending.old_runtime.runtime_id
+                    && current.generation > pending.old_runtime.generation
+            });
+        if replacement.is_some() && pending.retirement_pending {
+            tracing::info!(
+                request_id = %request.request_id,
+                provider = %request.provider,
+                session_id = %request.session_id,
+                old_runtime_id = %pending.old_runtime.runtime_id,
+                old_generation = pending.old_runtime.generation,
+                "agent.restart.recovery.registered_replacement_waiting_for_retirement"
+            );
+            return None;
+        }
+        replacement
+    }
+
     /// Stamp one typed lifecycle frame with this registry's descriptor. This
     /// is the single enrichment path used by handshake, direct terminal
     /// frames, registry fan-out, reconciliation, and fresh-agent broadcasts.
@@ -1381,10 +1422,7 @@ impl RestartCoordinator {
                 emit(&outcome.messages[0]);
                 return outcome;
             }
-            if let Some(replacement) = self.runtime_for_locator(&locator).filter(|current| {
-                current.runtime_id != pending.old_runtime.runtime_id
-                    && current.generation > pending.old_runtime.generation
-            }) {
+            if let Some(replacement) = self.adoptable_registered_replacement(&request, &pending) {
                 return self
                     .adopt_pending_replacement_with_events(request, pending, replacement, emit)
                     .await;
@@ -1419,10 +1457,7 @@ impl RestartCoordinator {
                 emit(&outcome.messages[0]);
                 return outcome;
             }
-            if let Some(replacement) = self.runtime_for_locator(&locator).filter(|current| {
-                current.runtime_id != pending.old_runtime.runtime_id
-                    && current.generation > pending.old_runtime.generation
-            }) {
+            if let Some(replacement) = self.adoptable_registered_replacement(&request, &pending) {
                 return self
                     .adopt_pending_replacement_with_events(request, pending, replacement, emit)
                     .await;
@@ -1921,6 +1956,47 @@ impl RestartCoordinator {
                 };
             }
         }
+        if let Some(replacement) = self
+            .runtime_for_locator(&RuntimeLocator::from_request(&request))
+            .filter(|current| {
+                current.runtime_id != pending.old_runtime.runtime_id
+                    && current.generation > pending.old_runtime.generation
+            })
+        {
+            tracing::info!(
+                request_id = %request.request_id,
+                provider = %request.provider,
+                session_id = %request.session_id,
+                old_runtime_id = %pending.old_runtime.runtime_id,
+                old_generation = pending.old_runtime.generation,
+                runtime_id = %replacement.runtime_id,
+                generation = replacement.generation,
+                "agent.restart.recovery.adopting_registered_replacement_after_retirement"
+            );
+            let terminal = match self.commit_replacement(
+                &request,
+                &pending.old_runtime,
+                replacement.runtime_id,
+            ) {
+                Ok((_replacement, terminal)) => terminal,
+                Err(error) => {
+                    let terminal = self
+                        .persistence_failure_with_phase(&request, pending.old_runtime, error, true)
+                        .messages
+                        .remove(0);
+                    emit(&terminal);
+                    return RestartOutcome {
+                        messages: vec![started, terminal],
+                        replayed: false,
+                    };
+                }
+            };
+            emit(&terminal);
+            return RestartOutcome {
+                messages: vec![started, terminal],
+                replayed: false,
+            };
+        }
         {
             let locator = RuntimeLocator::from_request(&request);
             let mut ownership = self.ownership.lock().expect("restart ownership lock");
@@ -2152,7 +2228,12 @@ impl RestartCoordinator {
             old_runtime: OldRuntimeDescriptor::from(old_runtime.clone()),
             runtime: replacement.clone(),
         });
-        self.try_update_ownership("commit_replacement", |ownership| {
+        let committed = self.try_update_ownership("commit_replacement", |ownership| {
+            if ownership.pending_recoveries.values().any(|pending| {
+                pending.retirement_pending && Self::same_restart_target(&pending.request, request)
+            }) {
+                return false;
+            }
             let pending_keys = ownership
                 .pending_recoveries
                 .iter()
@@ -2194,7 +2275,22 @@ impl RestartCoordinator {
                 );
             }
             Self::prune_ownership_locked(ownership, self.ownership_limit);
+            true
         })?;
+        if !committed {
+            tracing::error!(
+                request_id = %request.request_id,
+                provider = %request.provider,
+                session_id = %request.session_id,
+                old_runtime_id = %old_runtime.runtime_id,
+                old_generation = old_runtime.generation,
+                "agent.restart.recovery.adoption_blocked_by_pending_retirement"
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "replacement adoption is blocked until predecessor retirement completes",
+            ));
+        }
         tracing::info!(
             request_id = %request.request_id,
             provider = %request.provider,
@@ -2353,9 +2449,10 @@ struct ProductionResumePlan {
 }
 
 /// Exact fresh-agent creation inputs captured while the selected runtime is
-/// still live. The production implementation joins the live manager's flavour
-/// with the durable pane-ledger settings; test adapters provide the same
-/// contract without launching external providers.
+/// still live. The production implementation reads every field from the live
+/// provider manager and only cross-checks the pane ledger; a nonfatal ledger
+/// write failure can therefore never reset restart settings. Test adapters
+/// provide the same contract without launching external providers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProductionFreshResumePlan {
     pub session_type: freshell_protocol::SessionType,
@@ -2406,6 +2503,7 @@ pub trait ProductionFreshRuntime: Send + Sync {
         &self,
         provider: freshell_protocol::AgentProvider,
         session_id: &str,
+        expected_runtime_id: &str,
     ) -> Option<ProductionFreshResumePlan>;
 
     /// Capture provider-specific retirement work while the exact runtime is
@@ -2450,6 +2548,15 @@ fn provider_name(provider: freshell_protocol::AgentProvider) -> &'static str {
         freshell_protocol::AgentProvider::Codex => "codex",
         freshell_protocol::AgentProvider::Opencode => "opencode",
         freshell_protocol::AgentProvider::Amplifier => "amplifier",
+    }
+}
+
+fn session_type_name(session_type: freshell_protocol::SessionType) -> &'static str {
+    match session_type {
+        freshell_protocol::SessionType::Freshclaude => "freshclaude",
+        freshell_protocol::SessionType::Freshcodex => "freshcodex",
+        freshell_protocol::SessionType::Kilroy => "kilroy",
+        freshell_protocol::SessionType::Freshopencode => "freshopencode",
     }
 }
 
@@ -2520,33 +2627,62 @@ impl ProductionFreshRuntime for WsStateFreshRuntime {
         &self,
         provider: freshell_protocol::AgentProvider,
         session_id: &str,
+        expected_runtime_id: &str,
     ) -> Option<ProductionFreshResumePlan> {
-        let session_type = match provider {
+        // The live provider manager is authoritative. Pane-ledger writes are
+        // intentionally nonfatal at create/send time, so reconstructing from a
+        // missing row would silently replace a real model/cwd/security policy
+        // with defaults during restart.
+        let live = match provider {
             freshell_protocol::AgentProvider::Claude => {
                 self.state
                     .fresh_claude
-                    .live_session_type(session_id)
+                    .capture_restart_resume_plan(session_id, expected_runtime_id)
                     .await?
             }
-            freshell_protocol::AgentProvider::Codex => self
-                .state
-                .fresh_codex
-                .has_live_session(session_id)
-                .await
-                .then_some(freshell_protocol::SessionType::Freshcodex)?,
-            freshell_protocol::AgentProvider::Opencode => self
-                .state
-                .fresh_opencode
-                .has_live_session(session_id)
-                .await
-                .then_some(freshell_protocol::SessionType::Freshopencode)?,
+            freshell_protocol::AgentProvider::Codex => {
+                self.state
+                    .fresh_codex
+                    .capture_restart_resume_plan(session_id, expected_runtime_id)
+                    .await?
+            }
+            freshell_protocol::AgentProvider::Opencode => {
+                self.state
+                    .fresh_opencode
+                    .capture_restart_resume_plan(session_id, expected_runtime_id)
+                    .await?
+            }
             freshell_protocol::AgentProvider::Amplifier => return None,
         };
         let binding = self
             .state
             .pane_ledger
             .load_binding(provider_name(provider), session_id);
-        let sandbox = match binding.as_ref().and_then(|row| row.sandbox.as_deref()) {
+        if let Some(binding) = binding.as_ref() {
+            let settings = &live.settings;
+            if binding.mode != session_type_name(live.session_type)
+                || binding.cwd != settings.cwd
+                || binding.model != settings.model
+                || binding.effort != settings.effort
+                || binding.permission_mode != settings.permission_mode
+                || binding.sandbox != settings.sandbox
+            {
+                tracing::warn!(
+                    provider = provider_name(provider),
+                    session_id,
+                    live_session_type = session_type_name(live.session_type),
+                    ledger_mode = %binding.mode,
+                    "agent.restart.preflight.ledger_settings_stale"
+                );
+            }
+        } else {
+            tracing::warn!(
+                provider = provider_name(provider),
+                session_id,
+                "agent.restart.preflight.ledger_settings_missing_using_live_authority"
+            );
+        }
+        let sandbox = match live.settings.sandbox.as_deref() {
             None => None,
             Some("read-only") => Some(freshell_protocol::Sandbox::ReadOnly),
             Some("workspace-write") => Some(freshell_protocol::Sandbox::WorkspaceWrite),
@@ -2562,11 +2698,11 @@ impl ProductionFreshRuntime for WsStateFreshRuntime {
             }
         };
         Some(ProductionFreshResumePlan {
-            session_type,
-            cwd: binding.as_ref().and_then(|row| row.cwd.clone()),
-            model: binding.as_ref().and_then(|row| row.model.clone()),
-            effort: binding.as_ref().and_then(|row| row.effort.clone()),
-            permission_mode: binding.as_ref().and_then(|row| row.permission_mode.clone()),
+            session_type: live.session_type,
+            cwd: live.settings.cwd,
+            model: live.settings.model,
+            effort: live.settings.effort,
+            permission_mode: live.settings.permission_mode,
             sandbox,
         })
     }
@@ -2984,7 +3120,7 @@ impl RestartRuntime for ProductionRestartRuntime {
                 }
                 let plan = self
                     .fresh_runtime
-                    .capture_resume_plan(provider, &request.session_id)
+                    .capture_resume_plan(provider, &request.session_id, &request.live_id)
                     .await
                     .ok_or_else(|| {
                         RestartFailure::new(

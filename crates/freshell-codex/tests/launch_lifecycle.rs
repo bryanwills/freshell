@@ -475,6 +475,65 @@ async fn manager_restart_teardown_is_awaitable_through_proxy_close_and_runtime_d
 }
 
 #[tokio::test]
+async fn manager_restart_quarantines_and_marks_expected_exit_before_proxy_shutdown() {
+    let runtime = FakeRuntime::start().await;
+    let release_shutdown = runtime.block_shutdown();
+    let factory_runtime = runtime.clone();
+    let manager = Arc::new(CodexTerminalLaunchManager::new(Box::new(move || {
+        factory_runtime.clone() as Arc<dyn CodexLaunchRuntime>
+    })));
+
+    let launch = manager
+        .plan_create_with_retry(&CodexLaunchPlanInput::default(), 5)
+        .await
+        .unwrap();
+    let remote_ws_url = launch.remote_ws_url.clone();
+    manager
+        .adopt("term-expected-exit", launch, 11)
+        .await
+        .unwrap();
+    let (_tui, _) = connect_async(&remote_ws_url).await.unwrap();
+
+    let expected_exit_marked = Arc::new(AtomicBool::new(false));
+    let teardown = {
+        let manager = Arc::clone(&manager);
+        let expected_exit_marked = Arc::clone(&expected_exit_marked);
+        tokio::spawn(async move {
+            manager
+                .shutdown_terminal_for_restart_with_expected_exit("term-expected-exit", || {
+                    expected_exit_marked.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+        })
+    };
+
+    let deadline = tokio::time::Instant::now() + RECV_TIMEOUT;
+    while runtime.shutdown_calls.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "restart teardown never reached the managed runtime"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        expected_exit_marked.load(Ordering::SeqCst),
+        "the terminal exit must be classified before proxy close/runtime shutdown"
+    );
+    assert!(
+        manager.is_terminal_restart_retiring("term-expected-exit"),
+        "the manager must quarantine ownership throughout slow teardown"
+    );
+
+    release_shutdown.notify_waiters();
+    assert!(timeout(RECV_TIMEOUT, teardown)
+        .await
+        .expect("restart teardown timed out")
+        .expect("restart teardown task panicked")
+        .expect("restart teardown failed"));
+}
+
+#[tokio::test]
 async fn manager_restart_teardown_retains_failed_retirement_for_same_terminal_retry() {
     let runtime = FakeRuntime::start().await;
     runtime.fail_next_shutdown();
@@ -491,14 +550,23 @@ async fn manager_restart_teardown_retains_failed_retirement_for_same_terminal_re
         .await
         .unwrap();
 
+    let expected_exit_marked = AtomicBool::new(false);
     let first = manager
-        .shutdown_terminal_for_restart("term-restart-retry")
+        .shutdown_terminal_for_restart_with_expected_exit("term-restart-retry", || {
+            expected_exit_marked.store(true, Ordering::SeqCst);
+            Ok(())
+        })
         .await;
     assert!(
         first.is_err(),
         "the injected incomplete barrier must be retryable"
     );
     assert_eq!(runtime.shutdown_calls.load(Ordering::SeqCst), 1);
+    assert!(expected_exit_marked.load(Ordering::SeqCst));
+    assert!(
+        manager.is_terminal_restart_retiring("term-restart-retry"),
+        "failed teardown must retain expected-exit quarantine"
+    );
 
     assert!(
         manager
@@ -509,6 +577,7 @@ async fn manager_restart_teardown_retains_failed_retirement_for_same_terminal_re
     );
     assert_eq!(runtime.shutdown_calls.load(Ordering::SeqCst), 2);
     assert!(runtime.shutdown_finished.load(Ordering::SeqCst));
+    assert!(!manager.is_terminal_restart_retiring("term-restart-retry"));
 }
 
 #[tokio::test]

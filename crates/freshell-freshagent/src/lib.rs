@@ -78,6 +78,15 @@ pub enum RestartShutdownOutcome {
     RetirementIncomplete { message: String },
 }
 
+/// Exact provider-owned inputs for restarting one currently-live fresh-agent
+/// runtime. This is deliberately captured from the live manager, not inferred
+/// from server defaults or reconstructed from a best-effort pane-ledger write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreshAgentRestartResumePlan {
+    pub session_type: freshell_protocol::SessionType,
+    pub settings: FreshAgentSettings,
+}
+
 /// Task 13b: the injected cross-kind liveness probe -- `(provider, session_id) -> bool`,
 /// true when a live terminal PTY currently owns that session. Constructed by
 /// `freshell-server`'s `main.rs` over the SAME probes the terminal D7 create-rung guard
@@ -135,6 +144,11 @@ const OPENCODE_PLACEHOLDER_PREFIX: &str = "freshopencode-";
 /// generous Kimi budget; the request always supplies one in the oracle path).
 const DEFAULT_TURN_TIMEOUT: Duration = Duration::from_secs(180);
 
+/// Read-only admission probe for a restart transaction whose old runtime has
+/// not yet been retired. The provider/session pair is already normalized by
+/// the terminal create pipeline before this seam is called.
+pub type RestartRetirementProbe = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
+
 /// Shared, cheaply-cloneable fresh-agent REST state (mergeable into the server app).
 #[derive(Clone)]
 pub struct FreshAgentState {
@@ -163,6 +177,12 @@ pub struct FreshAgentState {
     /// narrows the guard to the registry-row arm.
     pub(crate) session_identity:
         Option<Arc<dyn freshell_terminal::registry::SessionIdentityLookup>>,
+    /// Restart transaction admission probe, wired by `freshell-server` to the
+    /// same coordinator used by WS create/reconcile. A matching terminal
+    /// resume must not spawn while the retired generation may still write.
+    /// `None` keeps isolated crate tests that do not construct a coordinator
+    /// usable.
+    pub(crate) restart_retirement_probe: Option<RestartRetirementProbe>,
     /// paneId -> terminal pane record (Slice 1 `mode:'shell'` terminals
     /// created via `POST /api/tabs`). Disjoint from `panes` (fresh-agent-only)
     /// and `content_panes` (browser/editor) -- a pane id appears in exactly
@@ -292,6 +312,7 @@ impl FreshAgentState {
             sessions_revision: Arc::new(AtomicI64::new(0)),
             terminal_registry: None,
             session_identity: None,
+            restart_retirement_probe: None,
             terminal_panes: Arc::new(Mutex::new(HashMap::new())),
             content_panes: Arc::new(Mutex::new(HashMap::new())),
             tabs: Arc::new(Mutex::new(HashMap::new())),
@@ -474,6 +495,13 @@ impl FreshAgentState {
         identity: Arc<dyn freshell_terminal::registry::SessionIdentityLookup>,
     ) -> Self {
         self.session_identity = Some(identity);
+        self
+    }
+
+    /// Wire the restart coordinator's session-scoped retirement admission
+    /// probe into REST terminal create/split/respawn.
+    pub fn with_restart_retirement_probe(mut self, probe: RestartRetirementProbe) -> Self {
+        self.restart_retirement_probe = Some(probe);
         self
     }
 

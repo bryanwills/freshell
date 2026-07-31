@@ -1294,6 +1294,51 @@ impl RestartRuntime for RetirementRetries {
     }
 }
 
+struct ConcurrentRetirementGate {
+    shutdowns: AtomicUsize,
+    allow_retirement: AtomicBool,
+    retry_entered: tokio::sync::Barrier,
+    retry_release: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl RestartRuntime for ConcurrentRetirementGate {
+    type ResumePlan = ();
+
+    async fn preflight(&self, _request: &AgentRestart) -> Result<(), RestartFailure> {
+        Ok(())
+    }
+
+    async fn shutdown_for_restart(
+        &self,
+        _request: &AgentRestart,
+        _plan: &(),
+    ) -> Result<(), RestartFailure> {
+        let attempt = self.shutdowns.fetch_add(1, Ordering::SeqCst);
+        if attempt == 1 {
+            self.retry_entered.wait().await;
+            self.retry_release.notified().await;
+        }
+        if self.allow_retirement.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err(RestartFailure::new(
+                AgentRestartFailureCode::ShutdownFailed,
+                "retirement barrier remains active",
+                true,
+            ))
+        }
+    }
+
+    async fn create_replacement(
+        &self,
+        _request: &AgentRestart,
+        _plan: (),
+    ) -> Result<String, RestartFailure> {
+        panic!("the already-registered replacement must be adopted after retirement")
+    }
+}
+
 #[tokio::test]
 async fn retryable_retirement_finishes_before_replacement() {
     let coordinator = RestartCoordinator::new();
@@ -1327,6 +1372,450 @@ async fn retryable_retirement_finishes_before_replacement() {
     ));
     assert_eq!(runtime.shutdowns.load(Ordering::SeqCst), 2);
     assert!(coordinator.pending_recoveries().is_empty());
+}
+
+/// Regression for the boot/reconcile race: a newly observed runtime for the
+/// same durable locator is not proof that the persisted predecessor stopped.
+/// The retirement journal must remain authoritative until its provider fence
+/// succeeds, even when reconciliation registers a higher generation before a
+/// client (or boot recovery) retries the original request.
+#[tokio::test]
+async fn registered_replacement_waits_for_pending_retirement_before_adoption() {
+    let coordinator = RestartCoordinator::new();
+    coordinator.register_initial(locator(), "term-1");
+    let request = restart("retirement-adoption-r1", "term-1", 1);
+    let runtime = Arc::new(ConcurrentRetirementGate {
+        shutdowns: AtomicUsize::new(0),
+        allow_retirement: AtomicBool::new(false),
+        retry_entered: tokio::sync::Barrier::new(2),
+        retry_release: tokio::sync::Notify::new(),
+    });
+
+    let first = coordinator.execute(request.clone(), runtime.as_ref()).await;
+    assert!(matches!(
+        first.messages.last(),
+        Some(ServerMessage::AgentRestartFailed(message))
+            if message.code == AgentRestartFailureCode::ShutdownFailed
+                && message.retryable
+                && message.recovery_pending
+    ));
+
+    let retry_coordinator = coordinator.clone();
+    let retry_request = request.clone();
+    let retry_runtime = Arc::clone(&runtime);
+    let retry = tokio::spawn(async move {
+        retry_coordinator
+            .execute(retry_request, retry_runtime.as_ref())
+            .await
+    });
+    runtime.retry_entered.wait().await;
+
+    // A create/reconcile observation arrives while retirement recovery is
+    // actively blocked inside its provider fence.
+    let observed = coordinator.register_initial(locator(), "term-observed-during-retirement");
+    assert!(observed.generation > request.expected_generation);
+    assert!(
+        !retry.is_finished(),
+        "runtime observation must not bypass the in-flight retirement fence"
+    );
+    runtime.retry_release.notify_one();
+
+    let (events, _trace_guard) = capture_traces();
+    let still_blocked = retry.await.unwrap();
+
+    assert_eq!(
+        runtime.shutdowns.load(Ordering::SeqCst),
+        2,
+        "the provider retirement fence must run before adopting an observed runtime"
+    );
+    assert!(matches!(
+        still_blocked.messages.last(),
+        Some(ServerMessage::AgentRestartFailed(message))
+            if message.code == AgentRestartFailureCode::ShutdownFailed
+                && message.retryable
+                && message.recovery_pending
+    ));
+    assert_eq!(
+        coordinator.pending_recoveries().len(),
+        1,
+        "a blocked fence must retain the durable journal despite the observed runtime"
+    );
+    assert_eq!(
+        coordinator
+            .runtime_for_locator(&locator())
+            .map(|runtime| runtime.runtime_id),
+        Some("term-observed-during-retirement".to_string())
+    );
+    runtime.allow_retirement.store(true, Ordering::SeqCst);
+    let recovered = coordinator.execute(request, runtime.as_ref()).await;
+    assert_eq!(runtime.shutdowns.load(Ordering::SeqCst), 3);
+    assert!(matches!(
+        recovered.messages.last(),
+        Some(ServerMessage::AgentRestartReplaced(message))
+            if message.runtime.runtime_id == "term-observed-during-retirement"
+    ));
+    assert!(coordinator.pending_recoveries().is_empty());
+    assert!(
+        events.lock().unwrap().iter().any(|event| {
+            event.message == "agent.restart.recovery.registered_replacement_waiting_for_retirement"
+                && event.fields.get("request_id") == Some(&"retirement-adoption-r1".to_string())
+        }),
+        "the safety deferral must be visible in structured logs"
+    );
+}
+
+/// A blocked boot retirement is a session-scoped create fence: retrying that
+/// durable locator cannot start a second writer, while an unrelated locator
+/// continues to use the normal create path.
+#[tokio::test]
+async fn pending_retirement_blocks_only_the_matching_terminal_create() {
+    let (url, registry, state) = common::spawn_server_with_specs_and_state(vec![
+        common::sleeper_cli_spec("claude"),
+        common::sleeper_cli_spec("amplifier"),
+    ])
+    .await;
+    let blocked_session = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let old = state.restart.register_initial(
+        RuntimeLocator::new(AgentRuntimeKind::Terminal, "claude", blocked_session),
+        "term-blocked-predecessor",
+    );
+    let runtime = ConcurrentRetirementGate {
+        shutdowns: AtomicUsize::new(0),
+        allow_retirement: AtomicBool::new(false),
+        retry_entered: tokio::sync::Barrier::new(2),
+        retry_release: tokio::sync::Notify::new(),
+    };
+    state
+        .restart
+        .execute(
+            AgentRestart {
+                request_id: "blocked-create-retirement".to_string(),
+                provider: "claude".to_string(),
+                session_id: blocked_session.to_string(),
+                kind: AgentRuntimeKind::Terminal,
+                live_id: old.runtime_id,
+                expected_generation: old.generation,
+            },
+            &runtime,
+        )
+        .await;
+    assert!(state.restart.pending_recoveries()[0].retirement_pending);
+
+    let (mut ws, _) = common::connect_and_capture_inventory_with_capabilities(
+        &url,
+        Some(serde_json::json!({ "paneReconcileV1": true })),
+    )
+    .await;
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "pane.reconcile.request",
+            "reconcileId": "blocked-retirement-reconcile",
+            "panes": [
+                {
+                    "paneKey": "blocked-pane",
+                    "kind": "terminal",
+                    "mode": "claude",
+                    "createRequestId": "blocked-matching-create",
+                    "resumeSessionId": blocked_session,
+                    "sessionRef": {
+                        "provider": "claude",
+                        "sessionId": blocked_session
+                    }
+                },
+                {
+                    "paneKey": "unrelated-pane",
+                    "kind": "terminal",
+                    "mode": "amplifier",
+                    "createRequestId": "allowed-unrelated-create",
+                    "resumeSessionId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                    "sessionRef": {
+                        "provider": "amplifier",
+                        "sessionId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+                    }
+                }
+            ]
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let reconciled = common::next_frame_of_type(&mut ws, "pane.reconcile.result").await;
+    let verdicts = reconciled["verdicts"].as_array().unwrap();
+    assert_eq!(verdicts[0]["paneKey"], "blocked-pane");
+    assert_eq!(verdicts[0]["verdict"], "error");
+    assert_eq!(verdicts[0]["reason"], "restart_retirement_pending");
+    assert_ne!(
+        verdicts[1]["reason"], "restart_retirement_pending",
+        "unrelated reconciliation remains available"
+    );
+
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "terminal.create",
+            "requestId": "blocked-matching-create",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir(),
+            "restore": true,
+            "resumeSessionId": blocked_session,
+            "sessionRef": {
+                "provider": "claude",
+                "sessionId": blocked_session
+            }
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let blocked = common::next_frame_of_type(&mut ws, "error").await;
+    assert_eq!(blocked["code"], "SESSION_RESERVED");
+    assert_eq!(blocked["requestId"], "blocked-matching-create");
+    assert!(
+        registry.inventory().is_empty(),
+        "the matching durable create must not spawn a replacement writer"
+    );
+
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "terminal.create",
+            "requestId": "allowed-unrelated-create",
+            "mode": "amplifier",
+            "shell": "system",
+            "cwd": std::env::temp_dir(),
+            "restore": true,
+            "resumeSessionId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "sessionRef": {
+                "provider": "amplifier",
+                "sessionId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+            }
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let created = common::next_frame_of_type(&mut ws, "terminal.created").await;
+    assert_eq!(created["requestId"], "allowed-unrelated-create");
+    assert_eq!(registry.inventory().len(), 1);
+    registry.kill_all();
+}
+
+#[tokio::test]
+async fn pending_retirement_blocks_only_the_matching_fresh_agent_create() {
+    let (url, registry, state) = common::spawn_server_with_specs_and_state(vec![]).await;
+    state.fresh_codex.set_enabled(true);
+    let blocked_session = "ses_blocked_restart_retirement";
+    let old = state.restart.register_initial(
+        RuntimeLocator::new(AgentRuntimeKind::FreshAgent, "opencode", blocked_session),
+        "fresh-opencode-blocked-predecessor",
+    );
+    let runtime = ConcurrentRetirementGate {
+        shutdowns: AtomicUsize::new(0),
+        allow_retirement: AtomicBool::new(false),
+        retry_entered: tokio::sync::Barrier::new(2),
+        retry_release: tokio::sync::Notify::new(),
+    };
+    state
+        .restart
+        .execute(
+            AgentRestart {
+                request_id: "blocked-fresh-create-retirement".to_string(),
+                provider: "opencode".to_string(),
+                session_id: blocked_session.to_string(),
+                kind: AgentRuntimeKind::FreshAgent,
+                live_id: old.runtime_id,
+                expected_generation: old.generation,
+            },
+            &runtime,
+        )
+        .await;
+    let (mut ws, _) = common::connect_and_capture_inventory(&url).await;
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "freshAgent.create",
+            "requestId": "blocked-matching-fresh-create",
+            "sessionType": "freshopencode",
+            "provider": "opencode",
+            "resumeSessionId": blocked_session,
+            "sessionRef": {
+                "provider": "opencode",
+                "sessionId": blocked_session
+            }
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let blocked = common::next_frame_of_type(&mut ws, "freshAgent.create.failed").await;
+    assert_eq!(blocked["code"], "SESSION_RESERVED");
+    assert_eq!(blocked["requestId"], "blocked-matching-fresh-create");
+
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "freshAgent.create",
+            "requestId": "allowed-unrelated-fresh-create",
+            "sessionType": "freshopencode",
+            "provider": "opencode"
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let created = common::next_frame_of_type(&mut ws, "freshAgent.created").await;
+    assert_eq!(created["requestId"], "allowed-unrelated-fresh-create");
+    assert_eq!(
+        created["sessionId"],
+        "freshopencode-allowed-unrelated-fresh-create"
+    );
+    registry.kill_all();
+}
+
+#[tokio::test]
+async fn pending_retirement_blocks_matching_fresh_agent_attach_without_blocking_unrelated_attach() {
+    let (url, registry, state) = common::spawn_server_with_specs_and_state(vec![]).await;
+    state.fresh_codex.set_enabled(true);
+    let blocked_session = "7f8e9d0c-1b2a-43d4-85e6-f708192a3b4c";
+    let old = state.restart.register_initial(
+        RuntimeLocator::new(AgentRuntimeKind::FreshAgent, "claude", blocked_session),
+        "fresh-claude-blocked-predecessor",
+    );
+    let runtime = ConcurrentRetirementGate {
+        shutdowns: AtomicUsize::new(0),
+        allow_retirement: AtomicBool::new(false),
+        retry_entered: tokio::sync::Barrier::new(2),
+        retry_release: tokio::sync::Notify::new(),
+    };
+    state
+        .restart
+        .execute(
+            AgentRestart {
+                request_id: "blocked-fresh-attach-retirement".to_string(),
+                provider: "claude".to_string(),
+                session_id: blocked_session.to_string(),
+                kind: AgentRuntimeKind::FreshAgent,
+                live_id: old.runtime_id,
+                expected_generation: old.generation,
+            },
+            &runtime,
+        )
+        .await;
+    let blocked_opencode_session = "ses_blocked_opencode_attach_retirement";
+    let old_opencode = state.restart.register_initial(
+        RuntimeLocator::new(
+            AgentRuntimeKind::FreshAgent,
+            "opencode",
+            blocked_opencode_session,
+        ),
+        "fresh-opencode-attach-blocked-predecessor",
+    );
+    let opencode_runtime = ConcurrentRetirementGate {
+        shutdowns: AtomicUsize::new(0),
+        allow_retirement: AtomicBool::new(false),
+        retry_entered: tokio::sync::Barrier::new(2),
+        retry_release: tokio::sync::Notify::new(),
+    };
+    state
+        .restart
+        .execute(
+            AgentRestart {
+                request_id: "blocked-opencode-attach-retirement".to_string(),
+                provider: "opencode".to_string(),
+                session_id: blocked_opencode_session.to_string(),
+                kind: AgentRuntimeKind::FreshAgent,
+                live_id: old_opencode.runtime_id,
+                expected_generation: old_opencode.generation,
+            },
+            &opencode_runtime,
+        )
+        .await;
+
+    let (mut ws, _) = common::connect_and_capture_inventory(&url).await;
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "freshAgent.attach",
+            "provider": "claude",
+            "sessionId": "blocked-attach-client-pane",
+            "sessionType": "freshclaude",
+            "resumeSessionId": blocked_session,
+            "sessionRef": {
+                "provider": "claude",
+                "sessionId": blocked_session
+            }
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let blocked = common::next_frame_of_type(&mut ws, "freshAgent.event").await;
+    assert_eq!(blocked["provider"], "claude");
+    assert_eq!(blocked["sessionId"], "blocked-attach-client-pane");
+    assert_eq!(blocked["event"]["type"], "freshAgent.error");
+    assert_eq!(blocked["event"]["code"], "SESSION_RESERVED");
+    assert!(
+        !state
+            .fresh_claude
+            .has_live_session("blocked-attach-client-pane")
+            .await,
+        "blocked attach must not register or spawn a replacement runtime"
+    );
+
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "freshAgent.attach",
+            "provider": "opencode",
+            "sessionId": blocked_opencode_session,
+            "sessionType": "freshopencode"
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let blocked_opencode = common::next_frame_of_type(&mut ws, "freshAgent.event").await;
+    assert_eq!(blocked_opencode["provider"], "opencode");
+    assert_eq!(blocked_opencode["sessionId"], blocked_opencode_session);
+    assert_eq!(blocked_opencode["event"]["type"], "freshAgent.error");
+    assert_eq!(blocked_opencode["event"]["code"], "SESSION_RESERVED");
+    assert!(
+        !state
+            .fresh_opencode
+            .has_live_session(blocked_opencode_session)
+            .await,
+        "blocked OpenCode attach must not cold-start or register a replacement runtime"
+    );
+
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "freshAgent.create",
+            "requestId": "allowed-unrelated-attach",
+            "sessionType": "freshopencode",
+            "provider": "opencode"
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let created = common::next_frame_of_type(&mut ws, "freshAgent.created").await;
+    let unrelated_session = created["sessionId"]
+        .as_str()
+        .expect("created session id")
+        .to_string();
+
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "freshAgent.attach",
+            "provider": "opencode",
+            "sessionId": unrelated_session,
+            "sessionType": "freshopencode"
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let unrelated = common::next_frame_of_type(&mut ws, "freshAgent.event").await;
+    assert_eq!(unrelated["provider"], "opencode");
+    assert_eq!(unrelated["sessionId"], unrelated_session);
+    assert_eq!(unrelated["event"]["type"], "freshAgent.session.snapshot");
+    assert_ne!(unrelated["event"]["code"], "SESSION_RESERVED");
+    registry.kill_all();
 }
 
 #[tokio::test]
@@ -2668,6 +3157,7 @@ impl ProductionFreshRuntime for UnrelatedTrafficFreshRuntime {
         &self,
         provider: freshell_protocol::AgentProvider,
         _session_id: &str,
+        _expected_runtime_id: &str,
     ) -> Option<ProductionFreshResumePlan> {
         Some(ProductionFreshResumePlan {
             session_type: match provider {
@@ -2748,6 +3238,7 @@ impl ProductionFreshRuntime for FaithfulFreshRuntime {
         &self,
         provider: freshell_protocol::AgentProvider,
         session_id: &str,
+        _expected_runtime_id: &str,
     ) -> Option<ProductionFreshResumePlan> {
         let provider = provider_name(provider).to_string();
         self.plans
@@ -2867,6 +3358,7 @@ impl ProductionFreshRuntime for BootFenceFreshRuntime {
         &self,
         _provider: freshell_protocol::AgentProvider,
         _session_id: &str,
+        _expected_runtime_id: &str,
     ) -> Option<ProductionFreshResumePlan> {
         Some(ProductionFreshResumePlan {
             session_type: self.session_type,

@@ -804,7 +804,8 @@ pub enum ReconcileVerdict {
     DeadSession,
     Invalid,
     /// Terminal per-pane error state (replaces the deleted `retry`):
-    /// reason is one of "index_warming" | "provider_unavailable".
+    /// reason is one of "index_warming" | "provider_unavailable" |
+    /// "restart_retirement_pending".
     Error,
 }
 
@@ -824,7 +825,9 @@ pub struct PaneVerdict {
     /// Present iff the server overrode a differing client claim.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub corrected: Option<bool>,
-    /// fresh / dead_session / error / invalid: machine-readable code.
+    /// fresh / dead_session / error / invalid: machine-readable code. Error
+    /// reasons include `index_warming`, `provider_unavailable`, and
+    /// `restart_retirement_pending`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// Row 2b (invariant I6): a newer duplicate generation exists for the same

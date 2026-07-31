@@ -407,6 +407,9 @@ pub struct CodexTerminalLaunchManager {
     /// queue-and-forget teardown, and a failed barrier stays retryable by the
     /// same terminal/runtime key.
     restart_retirements: Mutex<HashMap<String, AdoptedTerminalLaunch>>,
+    /// Classification fence kept independently while shutdown owns the
+    /// retirement value across awaits.
+    restart_retiring_terminal_ids: Mutex<std::collections::HashSet<String>>,
     teardown_tx: OnceLock<mpsc::UnboundedSender<AdoptedTerminalLaunch>>,
 }
 
@@ -416,6 +419,7 @@ impl CodexTerminalLaunchManager {
             planner: CodexLaunchPlanner::new(runtime_factory),
             adopted: Mutex::new(HashMap::new()),
             restart_retirements: Mutex::new(HashMap::new()),
+            restart_retiring_terminal_ids: Mutex::new(std::collections::HashSet::new()),
             teardown_tx: OnceLock::new(),
         }
     }
@@ -487,17 +491,104 @@ impl CodexTerminalLaunchManager {
     /// replacement until the old proxy has closed and the sidecar runtime has
     /// confirmed its captured process tree dead.
     pub async fn shutdown_terminal_for_restart(&self, terminal_id: &str) -> Result<bool, String> {
-        let entry = self
+        self.shutdown_terminal_for_restart_with_expected_exit(terminal_id, || Ok(()))
+            .await
+    }
+
+    /// Restart-only teardown with an atomic expected-exit classification.
+    ///
+    /// The adopted launch is removed from the ordinary PTY-exit path while
+    /// that path's mutex is held, then `mark_expected_exit` runs before the
+    /// launch becomes available to asynchronous shutdown. Consequently a
+    /// proxy close cannot make the TUI report a natural crash before the
+    /// terminal registry knows the exit belongs to restart.
+    pub async fn shutdown_terminal_for_restart_with_expected_exit<F>(
+        &self,
+        terminal_id: &str,
+        mark_expected_exit: F,
+    ) -> Result<bool, String>
+    where
+        F: FnOnce() -> Result<(), String>,
+    {
+        if !self.quarantine_terminal_for_restart(terminal_id, mark_expected_exit)? {
+            return Ok(false);
+        }
+        self.continue_terminal_restart_shutdown(terminal_id).await
+    }
+
+    fn quarantine_terminal_for_restart<F>(
+        &self,
+        terminal_id: &str,
+        mark_expected_exit: F,
+    ) -> Result<bool, String>
+    where
+        F: FnOnce() -> Result<(), String>,
+    {
+        if self
             .restart_retirements
             .lock()
             .unwrap()
-            .remove(terminal_id)
-            .or_else(|| self.adopted.lock().unwrap().remove(terminal_id));
+            .contains_key(terminal_id)
+        {
+            mark_expected_exit()?;
+            self.restart_retiring_terminal_ids
+                .lock()
+                .unwrap()
+                .insert(terminal_id.to_string());
+            return Ok(true);
+        }
+
+        // Keep this lock across classification. The ordinary exit callback
+        // blocks in `notify_terminal_exit` until the entry has moved and the
+        // registry marker is visible.
+        let mut adopted = self.adopted.lock().unwrap();
+        let Some(entry) = adopted.remove(terminal_id) else {
+            // A concurrent retry may have completed the move after our first
+            // check but before we obtained the adopted lock.
+            drop(adopted);
+            if self
+                .restart_retirements
+                .lock()
+                .unwrap()
+                .contains_key(terminal_id)
+            {
+                mark_expected_exit()?;
+                self.restart_retiring_terminal_ids
+                    .lock()
+                    .unwrap()
+                    .insert(terminal_id.to_string());
+                return Ok(true);
+            }
+            return Ok(false);
+        };
+        if let Err(error) = mark_expected_exit() {
+            adopted.insert(terminal_id.to_string(), entry);
+            return Err(error);
+        }
+        self.restart_retirements
+            .lock()
+            .unwrap()
+            .insert(terminal_id.to_string(), entry);
+        self.restart_retiring_terminal_ids
+            .lock()
+            .unwrap()
+            .insert(terminal_id.to_string());
+        Ok(true)
+    }
+
+    async fn continue_terminal_restart_shutdown(&self, terminal_id: &str) -> Result<bool, String> {
+        let entry = self.restart_retirements.lock().unwrap().remove(terminal_id);
         let Some(entry) = entry else {
             return Ok(false);
         };
         match entry.sidecar.shutdown().await {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                self.restart_retiring_terminal_ids
+                    .lock()
+                    .unwrap()
+                    .remove(terminal_id);
+                Ok(true)
+            }
             Err(error) => {
                 self.restart_retirements
                     .lock()
@@ -508,6 +599,15 @@ impl CodexTerminalLaunchManager {
         }
     }
 
+    /// Read-only classification used while shutdown owns the retirement value
+    /// across an await.
+    pub fn is_terminal_restart_retiring(&self, terminal_id: &str) -> bool {
+        self.restart_retiring_terminal_ids
+            .lock()
+            .unwrap()
+            .contains(terminal_id)
+    }
+
     /// Capture the adopted app-server's exact tree without moving ownership.
     /// The terminal PTY has a separate process-group barrier; managed Codex
     /// restart persists both before either owner is torn down.
@@ -515,19 +615,23 @@ impl CodexTerminalLaunchManager {
         &self,
         terminal_id: &str,
     ) -> Result<Option<OwnedProcessTreeBarrier>, String> {
-        let sidecar = self
-            .restart_retirements
+        // Read the two ownership maps in separate lock scopes. Restart
+        // quarantine moves an entry while holding `adopted` and then
+        // `restart_retirements`; nesting these in the reverse order here would
+        // make concurrent preflight and quarantine deadlock.
+        let adopted_sidecar = self
+            .adopted
             .lock()
             .unwrap()
             .get(terminal_id)
-            .map(|entry| Arc::clone(&entry.sidecar))
-            .or_else(|| {
-                self.adopted
-                    .lock()
-                    .unwrap()
-                    .get(terminal_id)
-                    .map(|entry| Arc::clone(&entry.sidecar))
-            });
+            .map(|entry| Arc::clone(&entry.sidecar));
+        let sidecar = adopted_sidecar.or_else(|| {
+            self.restart_retirements
+                .lock()
+                .unwrap()
+                .get(terminal_id)
+                .map(|entry| Arc::clone(&entry.sidecar))
+        });
         match sidecar {
             Some(sidecar) => sidecar.capture_restart_barrier().await,
             None => Ok(None),
@@ -550,6 +654,7 @@ impl CodexTerminalLaunchManager {
             let mut map = self.restart_retirements.lock().unwrap();
             map.drain().map(|(_, entry)| entry).collect()
         };
+        self.restart_retiring_terminal_ids.lock().unwrap().clear();
         for entry in adopted.into_iter().chain(retiring) {
             let _ = entry.sidecar.shutdown().await;
         }

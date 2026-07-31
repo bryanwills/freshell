@@ -59,10 +59,11 @@ use freshell_platform::{
     RealFileProbe, ShellType,
 };
 use freshell_protocol::{
-    AgentRestartFailed, AgentRestartFailureCode, ClientMessage, ErrorCode, ErrorMsg, Pong,
-    RuntimeDescriptor, ServerMessage, SessionLocator, Shell, TerminalAttach, TerminalCreate,
-    TerminalCreated, TerminalIdOnly, TerminalInputBlocked, TerminalInputBlockedReason,
-    TerminalKill, TerminalMetaRecord, TerminalMetaUpdated, TerminalResize,
+    AgentRestartFailed, AgentRestartFailureCode, ClientMessage, ErrorCode, ErrorMsg,
+    FreshAgentAttach, FreshAgentCreateFailed, FreshAgentEvent, Pong, RuntimeDescriptor,
+    ServerMessage, SessionLocator, Shell, TerminalAttach, TerminalCreate, TerminalCreated,
+    TerminalIdOnly, TerminalInputBlocked, TerminalInputBlockedReason, TerminalKill,
+    TerminalMetaRecord, TerminalMetaUpdated, TerminalResize,
 };
 use freshell_terminal::{build_child_env_from_process, FrameSink};
 
@@ -78,6 +79,65 @@ pub(crate) async fn send(ws_tx: &mut WsSink, msg: &ServerMessage) -> bool {
         Ok(json) => ws_tx.send(Message::Text(json.into())).await.is_ok(),
         Err(_) => false,
     }
+}
+
+fn fresh_agent_attach_restart_locator(
+    attach: &FreshAgentAttach,
+) -> Option<crate::restart::RuntimeLocator> {
+    let provider = match attach.provider {
+        freshell_protocol::AgentProvider::Claude => "claude",
+        freshell_protocol::AgentProvider::Codex => "codex",
+        freshell_protocol::AgentProvider::Opencode => "opencode",
+        freshell_protocol::AgentProvider::Amplifier => return None,
+    };
+    let session_id = match attach.provider {
+        freshell_protocol::AgentProvider::Claude => attach
+            .resume_session_id
+            .as_deref()
+            .or_else(|| {
+                attach
+                    .session_ref
+                    .as_ref()
+                    .map(|session_ref| session_ref.session_id.as_str())
+            })
+            .filter(|session_id| !session_id.is_empty()),
+        freshell_protocol::AgentProvider::Codex | freshell_protocol::AgentProvider::Opencode => {
+            (!attach.session_id.is_empty()).then_some(attach.session_id.as_str())
+        }
+        freshell_protocol::AgentProvider::Amplifier => None,
+    }?;
+    Some(crate::restart::RuntimeLocator::new(
+        freshell_protocol::AgentRuntimeKind::FreshAgent,
+        provider,
+        session_id,
+    ))
+}
+
+fn fresh_agent_attach_reserved_frame(attach: &FreshAgentAttach) -> ServerMessage {
+    let provider = match attach.provider {
+        freshell_protocol::AgentProvider::Claude => "claude",
+        freshell_protocol::AgentProvider::Codex => "codex",
+        freshell_protocol::AgentProvider::Opencode => "opencode",
+        freshell_protocol::AgentProvider::Amplifier => "amplifier",
+    };
+    let session_type = match attach.session_type {
+        freshell_protocol::SessionType::Freshclaude => "freshclaude",
+        freshell_protocol::SessionType::Freshcodex => "freshcodex",
+        freshell_protocol::SessionType::Kilroy => "kilroy",
+        freshell_protocol::SessionType::Freshopencode => "freshopencode",
+    };
+    ServerMessage::FreshAgentEvent(FreshAgentEvent {
+        event: serde_json::json!({
+            "type": "freshAgent.error",
+            "sessionId": attach.session_id,
+            "code": "SESSION_RESERVED",
+            "message": "Restart is still retiring the previous session runtime",
+        }),
+        provider: provider.to_string(),
+        session_id: attach.session_id.clone(),
+        session_type: session_type.to_string(),
+        runtime: None,
+    })
 }
 
 /// `Date.now()` — epoch milliseconds (`terminal.created.createdAt`). Also
@@ -751,6 +811,54 @@ async fn handle_client_text(
         // the broadcast bus so the provider `freshAgent.*` frames reach the client).
         // The create gate is the SHARED `settings.freshAgent.enabled` flag.
         ClientMessage::FreshAgentCreate(create) => {
+            let provider_name = create.provider.map(|provider| match provider {
+                freshell_protocol::AgentProvider::Claude => "claude",
+                freshell_protocol::AgentProvider::Codex => "codex",
+                freshell_protocol::AgentProvider::Opencode => "opencode",
+                freshell_protocol::AgentProvider::Amplifier => "amplifier",
+            });
+            let durable_session_id = provider_name.and_then(|provider| {
+                create
+                    .resume_session_id
+                    .as_deref()
+                    .filter(|session_id| !session_id.is_empty())
+                    .or_else(|| {
+                        create
+                            .session_ref
+                            .as_ref()
+                            .filter(|session_ref| session_ref.provider == provider)
+                            .map(|session_ref| session_ref.session_id.as_str())
+                            .filter(|session_id| !session_id.is_empty())
+                    })
+                    .map(str::to_owned)
+            });
+            if let (Some(provider), Some(session_id)) = (provider_name, durable_session_id) {
+                let locator = crate::restart::RuntimeLocator::new(
+                    freshell_protocol::AgentRuntimeKind::FreshAgent,
+                    provider,
+                    &session_id,
+                );
+                if state.restart.retirement_pending_for(&locator) {
+                    tracing::warn!(
+                        target: "freshell_ws::restart",
+                        request_id = %create.request_id,
+                        provider,
+                        session_id,
+                        "freshAgent.create.blocked_by_pending_restart_retirement"
+                    );
+                    return send(
+                        ws_tx,
+                        &ServerMessage::FreshAgentCreateFailed(FreshAgentCreateFailed {
+                            code: "SESSION_RESERVED".to_string(),
+                            message: "Restart is still retiring the previous session runtime"
+                                .to_string(),
+                            request_id: create.request_id,
+                            retryable: Some(true),
+                        }),
+                    )
+                    .await;
+                }
+            }
             if state.fresh_codex.is_enabled() {
                 match create.provider {
                     Some(freshell_protocol::AgentProvider::Codex) => {
@@ -781,6 +889,18 @@ async fn handle_client_text(
         // same pattern as the other `freshAgent.*` arms. `_` keeps swallowing only
         // `Amplifier` (no fresh-agent runtime, same as the `FreshAgentSend` arm).
         ClientMessage::FreshAgentAttach(attach) => {
+            if let Some(locator) = fresh_agent_attach_restart_locator(&attach) {
+                if state.restart.retirement_pending_for(&locator) {
+                    tracing::warn!(
+                        target: "freshell_ws::restart",
+                        provider = %locator.provider,
+                        session_id = %locator.session_id,
+                        client_session_id = %attach.session_id,
+                        "freshAgent.attach.blocked_by_pending_restart_retirement"
+                    );
+                    return send(ws_tx, &fresh_agent_attach_reserved_frame(&attach)).await;
+                }
+            }
             match attach.provider {
                 freshell_protocol::AgentProvider::Codex => {
                     let fresh_codex = state.fresh_codex.clone();
@@ -1453,6 +1573,12 @@ pub(crate) fn build_pty_exit_hook(
         // handle to the manager's async teardown worker.
         freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
             .notify_terminal_exit(&terminal_id);
+        // A managed proxy close can make the TUI exit non-zero while the
+        // explicit restart transaction is still awaiting sidecar teardown.
+        // The manager's quarantine holds its ordinary-exit mutex until this
+        // registry marker is visible, so reading it after notification closes
+        // the race without classifying an unrelated natural crash.
+        let restart_retiring = deps.registry.is_restart_retiring(&terminal_id);
         deps.identity.retire(&terminal_id);
         // P1.8: an observed PTY exit in this epoch ends any
         // identity-in-flight window — the marker's job (distinguishing
@@ -1509,7 +1635,7 @@ pub(crate) fn build_pty_exit_hook(
             }
         }
         // Lane D1: genuine natural exits only (kill removed the row → false).
-        if finished {
+        if finished && !restart_retiring {
             // Missing probe: i64::MAX is a deliberate "treat as healthy /
             // fresh attempt budget" sentinel (the healthy-lifetime check
             // reads it as a long-lived process), NOT "unknown".
@@ -1524,6 +1650,12 @@ pub(crate) fn build_pty_exit_hook(
                 create_request_id,
                 lifetime_ms,
             });
+        } else if finished {
+            tracing::info!(
+                terminal_id = %terminal_id,
+                exit_code,
+                "terminal.restart_expected_exit"
+            );
         }
     })
 }
@@ -1561,6 +1693,29 @@ async fn handle_create_with_restart_launch(
     create_limiter: &mut crate::create_limit::CreateRateLimiter,
     restart_launch: Option<freshell_terminal::TerminalRestartLaunch>,
 ) -> bool {
+    if let Some(locator) = create_session_locator(&create) {
+        let restart_locator = crate::restart::RuntimeLocator::new(
+            freshell_protocol::AgentRuntimeKind::Terminal,
+            &locator.provider,
+            &locator.session_id,
+        );
+        if state.restart.retirement_pending_for(&restart_locator) {
+            tracing::warn!(
+                target: "freshell_ws::restart",
+                request_id = %create.request_id,
+                provider = %locator.provider,
+                session_id = %locator.session_id,
+                "terminal.create.blocked_by_pending_restart_retirement"
+            );
+            return send_session_reserved(
+                out,
+                &create.request_id,
+                freshell_terminal::registry::SESSION_RESERVED_RETRY_AFTER_MS,
+            )
+            .await;
+        }
+    }
+
     // Single-flight create-dedupe (reconciliation design §5.4, the council's
     // two-tab double-respawn blocker): on `paneReconcileV1` connections ONLY,
     // a create whose `createRequestId` already has a live terminal ADOPTS it —
@@ -3553,6 +3708,56 @@ async fn handle_pane_reconcile(
             }
         };
     }
+    for (pane, verdict) in request.panes.iter().zip(&mut verdicts) {
+        if verdict.verdict == freshell_protocol::ReconcileVerdict::Invalid {
+            continue;
+        }
+        let kind = match pane.kind.as_deref() {
+            Some("terminal") => freshell_protocol::AgentRuntimeKind::Terminal,
+            Some("fresh-agent") if pane_reconcile_fresh_agent_v1 => {
+                freshell_protocol::AgentRuntimeKind::FreshAgent
+            }
+            _ => continue,
+        };
+        let claimed_session = pane.session_ref.clone().or_else(|| {
+            let provider = pane.mode.as_deref().filter(|mode| !mode.is_empty())?;
+            let session_id = pane
+                .resume_session_id
+                .as_deref()
+                .filter(|session_id| !session_id.is_empty())?;
+            Some(SessionLocator {
+                provider: provider.to_string(),
+                session_id: session_id.to_string(),
+            })
+        });
+        let Some(claimed_session) = claimed_session else {
+            continue;
+        };
+        let locator = crate::restart::RuntimeLocator::new(
+            kind,
+            &claimed_session.provider,
+            &claimed_session.session_id,
+        );
+        if !state.restart.retirement_pending_for(&locator) {
+            continue;
+        }
+        tracing::warn!(
+            target: "freshell_ws::restart",
+            reconcile_id = %request.reconcile_id,
+            pane_key = %pane.pane_key,
+            provider = %claimed_session.provider,
+            session_id = %claimed_session.session_id,
+            kind = ?kind,
+            "pane.reconcile.blocked_by_pending_restart_retirement"
+        );
+        verdict.verdict = freshell_protocol::ReconcileVerdict::Error;
+        verdict.terminal_id = None;
+        verdict.session_ref = Some(claimed_session);
+        verdict.corrected = None;
+        verdict.reason = Some("restart_retirement_pending".to_string());
+        verdict.duplicate = None;
+        verdict.runtime = None;
+    }
     let mut result = ServerMessage::PaneReconcileResult(freshell_protocol::PaneReconcileResult {
         reconcile_id: request.reconcile_id,
         boot_id: state.boot_id.as_ref().clone(),
@@ -4005,23 +4210,39 @@ pub(crate) async fn shutdown_terminal_for_restart(
     state: &WsState,
     terminal_id: &str,
 ) -> Result<bool, String> {
-    // Detach and await any managed Codex sidecar before killing the PTY. The
-    // normal exit hook queues teardown in the background; restart needs the
-    // stronger barrier so replacement launch cannot overlap the old proxy or
-    // app-server process tree.
+    // Quarantine a managed Codex sidecar and classify the PTY's expected exit
+    // in one manager critical section BEFORE closing its proxy. Restart then
+    // awaits the stronger sidecar barrier before removing the PTY row.
     let managed_codex = state
         .registry
         .probe(terminal_id)
         .and_then(|row| row.restart_launch)
         .and_then(|launch| launch.codex_managed)
         == Some(true);
-    let managed_retired = freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
-        .shutdown_terminal_for_restart(terminal_id)
-        .await?;
-    if managed_codex && !managed_retired {
-        return Err(format!(
-            "managed Codex launch ownership was unavailable for terminal {terminal_id}"
-        ));
+    if managed_codex {
+        let registry = state.registry.clone();
+        let terminal_id_owned = terminal_id.to_string();
+        let managed_retired =
+            freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+                .shutdown_terminal_for_restart_with_expected_exit(terminal_id, move || {
+                    registry
+                        .mark_restart_retiring(&terminal_id_owned)
+                        .then_some(())
+                        .ok_or_else(|| {
+                            format!(
+                                "managed Codex terminal disappeared before restart quarantine: \
+                                 {terminal_id_owned}"
+                            )
+                        })
+                })
+                .await?;
+        if !managed_retired {
+            return Err(format!(
+                "managed Codex launch ownership was unavailable for terminal {terminal_id}"
+            ));
+        }
+    } else if !state.registry.mark_restart_retiring(terminal_id) {
+        return Ok(false);
     }
     Ok(kill_and_broadcast(state, terminal_id))
 }
@@ -4932,6 +5153,70 @@ mod cli_create_helper_tests {
             restart_uses_managed_codex_launch("codex", None, Some(&snapshot)),
             "restart follows the captured managed route after a boot"
         );
+    }
+
+    #[test]
+    fn restart_expected_exit_suppresses_crash_event_but_unrelated_exit_still_reports() {
+        let registry = freshell_terminal::TerminalRegistry::new();
+        registry.register_headless(freshell_terminal::registry::HeadlessTerminal {
+            terminal_id: "T-restarting".to_string(),
+            stream_id: "S-restarting".to_string(),
+            mode: "codex".to_string(),
+            create_request_id: Some("cr-restarting".to_string()),
+            ..Default::default()
+        });
+        registry.register_headless(freshell_terminal::registry::HeadlessTerminal {
+            terminal_id: "T-unrelated".to_string(),
+            stream_id: "S-unrelated".to_string(),
+            mode: "claude".to_string(),
+            create_request_id: Some("cr-unrelated".to_string()),
+            ..Default::default()
+        });
+        assert!(registry.mark_restart_retiring("T-restarting"));
+        let (auto_resume_tx, mut auto_resume_rx) = tokio::sync::mpsc::unbounded_channel();
+        let identity = crate::identity::TerminalIdentityRegistry::new();
+        let ledger = std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled());
+
+        let restarting_hook = build_pty_exit_hook(
+            ExitHookDeps {
+                registry: registry.clone(),
+                identity: identity.clone(),
+                pane_ledger: std::sync::Arc::clone(&ledger),
+                opencode_locator: None,
+                codex_locator: None,
+                auto_resume_tx: auto_resume_tx.clone(),
+                amplifier_stub_gc: None,
+            },
+            "T-restarting".to_string(),
+            "codex".to_string(),
+            None,
+        );
+        restarting_hook(137);
+        assert!(
+            auto_resume_rx.try_recv().is_err(),
+            "a proxy-triggered expected exit during restart must not become a CrashEvent"
+        );
+
+        let unrelated_hook = build_pty_exit_hook(
+            ExitHookDeps {
+                registry,
+                identity,
+                pane_ledger: ledger,
+                opencode_locator: None,
+                codex_locator: None,
+                auto_resume_tx,
+                amplifier_stub_gc: None,
+            },
+            "T-unrelated".to_string(),
+            "claude".to_string(),
+            None,
+        );
+        unrelated_hook(1);
+        let unrelated = auto_resume_rx
+            .try_recv()
+            .expect("an unrelated natural crash must still report");
+        assert_eq!(unrelated.terminal_id, "T-unrelated");
+        assert_eq!(unrelated.exit_code, 1);
     }
 
     #[test]

@@ -374,7 +374,7 @@ function foldFreshAgentVerdict(
     case 'error': {
       // Fresh-agent verdicts never emit 'error' today, but the fold must
       // not crash if one arrives — identical handling to the terminal arm.
-      if (verdict.reason === 'index_warming') {
+      if (verdict.reason === 'index_warming' || verdict.reason === 'restart_retirement_pending') {
         warmingRefs.push({ tabId, paneId })
         outcome.warming++
       } else {
@@ -528,7 +528,7 @@ export function foldVerdicts(
         break
       }
       case 'error': {
-        if (verdict.reason === 'index_warming') {
+        if (verdict.reason === 'index_warming' || verdict.reason === 'restart_retirement_pending') {
           warmingRefs.push({ tabId, paneId })
           outcome.warming++
         } else {
