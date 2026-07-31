@@ -14,6 +14,8 @@ use freshell_protocol::{
 };
 use serde::{Deserialize, Serialize};
 
+const RESTART_REPLACEMENT_OWNERSHIP_ENV: &str = "FRESHELL_RESTART_REPLACEMENT_ID";
+
 /// Canonical durable identity of one restartable runtime.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RuntimeLocator {
@@ -97,6 +99,12 @@ pub struct PendingRestartRecovery {
     /// writer for the durable session.
     #[serde(default)]
     pub retirement_fence: Option<RestartRetirementFence>,
+    /// Persisted before replacement creation begins. If the server dies after
+    /// spawning a writer but before committing its runtime descriptor, boot
+    /// recovery uses this ownership token to quiesce the ambiguous process (or
+    /// remote session) before attempting another resume.
+    #[serde(default)]
+    pub replacement_fence: Option<RestartReplacementFence>,
     pub last_failure: Option<AgentRestartFailed>,
 }
 
@@ -156,6 +164,18 @@ pub enum RestartRetirementAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
     },
+}
+
+/// Durable identity assigned before a replacement spawn is allowed to begin.
+///
+/// The provider adapter stamps `ownership_id` onto every process that can
+/// continue writing the resumed session. Recovery can therefore discover and
+/// retire a replacement even when the server crashed before learning its
+/// runtime id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestartReplacementFence {
+    pub ownership_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -249,6 +269,24 @@ pub trait RestartRuntime: Send + Sync {
         plan: Self::ResumePlan,
     ) -> Result<String, RestartFailure>;
 
+    /// Whether this adapter can leave an external writer alive across a hard
+    /// server crash and therefore requires a durable pre-spawn ownership
+    /// fence. Test-only/in-memory adapters may keep the default.
+    fn requires_replacement_fence(&self) -> bool {
+        false
+    }
+
+    /// Spawn using the ownership identity that was durably recorded before
+    /// this call. The default preserves lightweight test adapter behavior.
+    async fn create_replacement_fenced(
+        &self,
+        request: &AgentRestart,
+        plan: Self::ResumePlan,
+        _fence: Option<&RestartReplacementFence>,
+    ) -> Result<String, RestartFailure> {
+        self.create_replacement(request, plan).await
+    }
+
     /// Capture the small provider context required to resume after process
     /// restart. Called after preflight and persisted before teardown.
     fn persisted_resume_context(
@@ -283,6 +321,27 @@ pub trait RestartRuntime: Send + Sync {
     ) -> Result<String, RestartFailure> {
         let plan = self.preflight(request).await?;
         self.create_replacement(request, plan).await
+    }
+
+    /// Quiesce a replacement whose spawn may have completed before a hard
+    /// crash prevented its durable commit. This always runs before retrying a
+    /// persisted pre-spawn fence.
+    async fn recover_ambiguous_replacement(
+        &self,
+        _request: &AgentRestart,
+        _context: Option<&RestartResumeContext>,
+        _fence: &RestartReplacementFence,
+    ) -> Result<(), RestartFailure> {
+        Ok(())
+    }
+
+    async fn recover_replacement_fenced(
+        &self,
+        request: &AgentRestart,
+        context: Option<&RestartResumeContext>,
+        _fence: Option<&RestartReplacementFence>,
+    ) -> Result<String, RestartFailure> {
+        self.recover_replacement(request, context).await
     }
 
     /// Continue a teardown that was durably recorded before provider
@@ -733,6 +792,9 @@ impl RestartCoordinator {
                         .any(|follower| follower.request_id == entry.request_id)
             })
         });
+        if persisted_results.len() > ownership_limit {
+            persisted_results.drain(..persisted_results.len().saturating_sub(ownership_limit));
+        }
         let result_order = persisted_results
             .iter()
             .map(|entry| entry.request_id.clone())
@@ -857,11 +919,17 @@ impl RestartCoordinator {
                 terminal,
             },
         );
-        // A terminal restart result is the server's durable reply to a request
-        // that may have lost its socket before delivery. Do not evict it based
-        // on local cache pressure: there is no client acknowledgement or
-        // negotiated expiry protocol yet, so eviction would make an identical
-        // reconnect retry indistinguishable from a brand-new transaction.
+        // Keep a durable recent replay window so a lost terminal frame remains
+        // idempotently recoverable across a crash without letting adversarial
+        // unique request ids grow the journal forever. An evicted successful
+        // request is still safe to retry: generation validation observes the
+        // committed replacement and refuses to tear down that newer runtime.
+        while ownership.result_order.len() > self.ownership_limit {
+            let Some(expired) = ownership.result_order.pop_front() else {
+                break;
+            };
+            ownership.results.remove(&expired);
+        }
     }
 
     pub fn pending_recoveries(&self) -> Vec<PendingRestartRecovery> {
@@ -1813,6 +1881,13 @@ impl RestartCoordinator {
                         .iter()
                         .any(|follower| follower.request_id == request.request_id)
                     {
+                        // Followers are replay conveniences, not ownership
+                        // authority. Keep the durable correlation window
+                        // bounded just like terminal results so unique client
+                        // request ids cannot inflate an unfinished journal.
+                        if canonical.followers.len() >= self.ownership_limit {
+                            canonical.followers.remove(0);
+                        }
                         canonical.followers.push(request.clone());
                     }
                     pending = canonical.clone();
@@ -1931,6 +2006,7 @@ impl RestartCoordinator {
                     retirement_pending: true,
                     resume_context,
                     retirement_fence,
+                    replacement_fence: None,
                     last_failure: None,
                 },
             );
@@ -2013,6 +2089,17 @@ impl RestartCoordinator {
             return outcome;
         }
 
+        let replacement_fence = match self.ensure_replacement_fence(&request.request_id, runtime) {
+            Ok((fence, _already_persisted)) => fence,
+            Err(error) => {
+                let mut outcome =
+                    self.persistence_failure_with_phase(&request, expected, error, true);
+                emit(&outcome.messages[0]);
+                outcome.messages.insert(0, started);
+                return outcome;
+            }
+        };
+
         {
             let mut ownership = self.ownership.lock().expect("restart ownership lock");
             if ownership
@@ -2028,7 +2115,10 @@ impl RestartCoordinator {
             }
         }
 
-        let replacement_id = match runtime.create_replacement(&request, plan).await {
+        let replacement_id = match runtime
+            .create_replacement_fenced(&request, plan, replacement_fence.as_ref())
+            .await
+        {
             Ok(runtime_id) => runtime_id,
             Err(failure) => {
                 if failure.retryable {
@@ -2167,6 +2257,47 @@ impl RestartCoordinator {
 
     fn same_durable_session(left: &AgentRestart, right: &AgentRestart) -> bool {
         left.provider == right.provider && left.session_id == right.session_id
+    }
+
+    fn ensure_replacement_fence<R: RestartRuntime + ?Sized>(
+        &self,
+        owner_request_id: &str,
+        runtime: &R,
+    ) -> std::io::Result<(Option<RestartReplacementFence>, bool)> {
+        let existing = self
+            .ownership
+            .lock()
+            .expect("restart ownership lock")
+            .pending_recoveries
+            .get(owner_request_id)
+            .and_then(|pending| pending.replacement_fence.clone());
+        if let Some(existing) = existing {
+            return Ok((Some(existing), true));
+        }
+        if !runtime.requires_replacement_fence() {
+            return Ok((None, false));
+        }
+
+        let fence = RestartReplacementFence {
+            ownership_id: uuid::Uuid::new_v4().to_string(),
+        };
+        let persisted =
+            self.try_update_ownership("record_replacement_spawn_fence", |ownership| {
+                let pending = ownership
+                    .pending_recoveries
+                    .get_mut(owner_request_id)
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "pending restart disappeared before replacement fencing",
+                        )
+                    })?;
+                if pending.replacement_fence.is_none() {
+                    pending.replacement_fence = Some(fence.clone());
+                }
+                Ok::<_, std::io::Error>(pending.replacement_fence.clone())
+            })??;
+        Ok((persisted, false))
     }
 
     fn join_completed_replacement(&self, request: &AgentRestart) -> Option<RestartOutcome> {
@@ -2428,6 +2559,74 @@ impl RestartCoordinator {
                 replayed: false,
             };
         }
+
+        let (replacement_fence, fence_previously_persisted) =
+            match self.ensure_replacement_fence(&pending.request_id, runtime) {
+                Ok(fence) => fence,
+                Err(error) => {
+                    let terminal = self
+                        .persistence_failure_with_phase(&request, pending.old_runtime, error, true)
+                        .messages
+                        .remove(0);
+                    emit(&terminal);
+                    return RestartOutcome {
+                        messages: vec![started, terminal],
+                        replayed: false,
+                    };
+                }
+            };
+        if fence_previously_persisted {
+            if let Some(fence) = replacement_fence.as_ref() {
+                if let Err(failure) = runtime
+                    .recover_ambiguous_replacement(&request, pending.resume_context.as_ref(), fence)
+                    .await
+                {
+                    let safe_failure = RestartFailure::new(
+                        AgentRestartFailureCode::ShutdownFailed,
+                        format!(
+                            "ambiguous replacement ownership could not be quiesced: {}",
+                            failure.message
+                        ),
+                        true,
+                    );
+                    let failed = self.failure_frame(
+                        &request,
+                        pending.old_runtime.clone(),
+                        &safe_failure,
+                        true,
+                    );
+                    let owner_request_id = pending.request_id.clone();
+                    let persisted = self.try_update_ownership(
+                        "record_ambiguous_replacement_quiesce_failure",
+                        |ownership| {
+                            if let Some(recovery) =
+                                ownership.pending_recoveries.get_mut(&owner_request_id)
+                            {
+                                recovery.last_failure = Some(failed.clone());
+                            }
+                        },
+                    );
+                    let terminal = match persisted {
+                        Ok(()) => ServerMessage::AgentRestartFailed(failed),
+                        Err(error) => self
+                            .persistence_failure_with_phase(
+                                &request,
+                                pending.old_runtime,
+                                error,
+                                true,
+                            )
+                            .messages
+                            .remove(0),
+                    };
+                    emit(&terminal);
+                    return RestartOutcome {
+                        messages: vec![started, terminal],
+                        replayed: false,
+                    };
+                }
+            }
+        }
+
         {
             let locator = RuntimeLocator::from_request(&request);
             let mut ownership = self.ownership.lock().expect("restart ownership lock");
@@ -2444,7 +2643,11 @@ impl RestartCoordinator {
             }
         }
         let replacement_id = match runtime
-            .recover_replacement(&request, pending.resume_context.as_ref())
+            .recover_replacement_fenced(
+                &request,
+                pending.resume_context.as_ref(),
+                replacement_fence.as_ref(),
+            )
             .await
         {
             Ok(runtime_id) => runtime_id,
@@ -2700,19 +2903,32 @@ impl RestartCoordinator {
                 replacement.clone(),
             );
             for (correlated_request, correlated_old_runtime) in correlated_requests {
-                let correlated_terminal = AgentRestartReplaced {
-                    request_id: correlated_request.request_id.clone(),
-                    provider: correlated_request.provider.clone(),
-                    session_id: correlated_request.session_id.clone(),
-                    kind: correlated_request.kind,
-                    old_runtime: OldRuntimeDescriptor::from(correlated_old_runtime),
-                    runtime: replacement.clone(),
+                let correlated_terminal = if correlated_request.kind == request.kind {
+                    ServerMessage::AgentRestartReplaced(AgentRestartReplaced {
+                        request_id: correlated_request.request_id.clone(),
+                        provider: correlated_request.provider.clone(),
+                        session_id: correlated_request.session_id.clone(),
+                        kind: correlated_request.kind,
+                        old_runtime: OldRuntimeDescriptor::from(correlated_old_runtime),
+                        runtime: replacement.clone(),
+                    })
+                } else {
+                    ServerMessage::AgentRestartFailed(AgentRestartFailed {
+                        request_id: correlated_request.request_id.clone(),
+                        provider: correlated_request.provider.clone(),
+                        session_id: correlated_request.session_id.clone(),
+                        kind: correlated_request.kind,
+                        runtime: correlated_old_runtime,
+                        code: AgentRestartFailureCode::ReplacementFailed,
+                        message: format!(
+                            "restart recovery was superseded by a {:?} replacement for the same durable session",
+                            request.kind
+                        ),
+                        retryable: false,
+                        recovery_pending: false,
+                    })
                 };
-                self.insert_result_locked(
-                    ownership,
-                    &correlated_request,
-                    ServerMessage::AgentRestartReplaced(correlated_terminal),
-                );
+                self.insert_result_locked(ownership, &correlated_request, correlated_terminal);
             }
             Self::prune_ownership_locked(ownership, self.ownership_limit);
             true
@@ -3027,6 +3243,15 @@ pub trait ProductionFreshRuntime: Send + Sync {
         provider: freshell_protocol::AgentProvider,
         create: freshell_protocol::FreshAgentCreate,
     );
+
+    async fn handle_create_fenced(
+        &self,
+        provider: freshell_protocol::AgentProvider,
+        create: freshell_protocol::FreshAgentCreate,
+        _replacement_ownership_id: Option<&str>,
+    ) {
+        self.handle_create(provider, create).await;
+    }
 }
 
 struct WsStateFreshRuntime {
@@ -3354,6 +3579,29 @@ impl ProductionFreshRuntime for WsStateFreshRuntime {
             freshell_protocol::AgentProvider::Amplifier => {}
         }
     }
+
+    async fn handle_create_fenced(
+        &self,
+        provider: freshell_protocol::AgentProvider,
+        create: freshell_protocol::FreshAgentCreate,
+        replacement_ownership_id: Option<&str>,
+    ) {
+        match (provider, replacement_ownership_id) {
+            (freshell_protocol::AgentProvider::Claude, Some(ownership_id)) => {
+                self.state
+                    .fresh_claude
+                    .handle_create_for_restart(create, ownership_id)
+                    .await
+            }
+            (freshell_protocol::AgentProvider::Codex, Some(ownership_id)) => {
+                self.state
+                    .fresh_codex
+                    .handle_create_for_restart(create, ownership_id)
+                    .await
+            }
+            _ => self.handle_create(provider, create).await,
+        }
+    }
 }
 
 /// Production adapter that deliberately delegates to the same built-in
@@ -3462,12 +3710,9 @@ impl ProductionRestartRuntime {
         request: &AgentRestart,
         provider: freshell_protocol::AgentProvider,
         plan: &RestartResumeContext,
+        replacement_fence: Option<&RestartReplacementFence>,
     ) -> Result<String, RestartFailure> {
-        let create_request_id = format!(
-            "agent-restart:{}:{}",
-            request.request_id,
-            uuid::Uuid::new_v4()
-        );
+        let create_request_id = format!("agent-restart:{}", request.request_id);
         let mut receiver = self.state.broadcast_tx.subscribe();
         let create = freshell_protocol::FreshAgentCreate {
             request_id: create_request_id.clone(),
@@ -3493,7 +3738,13 @@ impl ProductionRestartRuntime {
                 session_id: request.session_id.clone(),
             }),
         };
-        self.fresh_runtime.handle_create(provider, create).await;
+        self.fresh_runtime
+            .handle_create_fenced(
+                provider,
+                create,
+                replacement_fence.map(|fence| fence.ownership_id.as_str()),
+            )
+            .await;
         let result_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             let frame = tokio::time::timeout_at(result_deadline, receiver.recv())
@@ -3558,6 +3809,7 @@ impl ProductionRestartRuntime {
         &self,
         request: &AgentRestart,
         context: RestartResumeContext,
+        replacement_fence: Option<&RestartReplacementFence>,
     ) -> Result<String, RestartFailure> {
         let (provider, _) = Self::provider(request)?;
         match request.kind {
@@ -3574,13 +3826,14 @@ impl ProductionRestartRuntime {
                     sandbox: context.terminal_sandbox.clone(),
                     codex_managed: context.terminal_codex_managed,
                 },
+                replacement_fence.map(|fence| fence.ownership_id.clone()),
             )
             .await
             .map_err(|message| {
                 RestartFailure::new(AgentRestartFailureCode::ReplacementFailed, message, true)
             }),
             AgentRuntimeKind::FreshAgent => {
-                self.create_fresh_replacement(request, provider, &context)
+                self.create_fresh_replacement(request, provider, &context, replacement_fence)
                     .await
             }
         }
@@ -3874,7 +4127,41 @@ impl RestartRuntime for ProductionRestartRuntime {
                     true,
                 )
             })?;
-        self.create_from_builtin_path(request, plan.context).await
+        self.create_from_builtin_path(request, plan.context, None)
+            .await
+    }
+
+    fn requires_replacement_fence(&self) -> bool {
+        true
+    }
+
+    async fn create_replacement_fenced(
+        &self,
+        request: &AgentRestart,
+        _plan: (),
+        fence: Option<&RestartReplacementFence>,
+    ) -> Result<String, RestartFailure> {
+        let fence = fence.ok_or_else(|| {
+            RestartFailure::new(
+                AgentRestartFailureCode::ReplacementFailed,
+                "durable replacement ownership fence is unavailable",
+                true,
+            )
+        })?;
+        let plan = self
+            .plans
+            .lock()
+            .expect("production restart plans")
+            .remove(&request.request_id)
+            .ok_or_else(|| {
+                RestartFailure::new(
+                    AgentRestartFailureCode::ReplacementFailed,
+                    "restart resume plan disappeared before replacement",
+                    true,
+                )
+            })?;
+        self.create_from_builtin_path(request, plan.context, Some(fence))
+            .await
     }
 
     fn persisted_resume_context(
@@ -3917,6 +4204,103 @@ impl RestartRuntime for ProductionRestartRuntime {
                     false,
                 )
             })?,
+            None,
+        )
+        .await
+    }
+
+    async fn recover_ambiguous_replacement(
+        &self,
+        request: &AgentRestart,
+        context: Option<&RestartResumeContext>,
+        fence: &RestartReplacementFence,
+    ) -> Result<(), RestartFailure> {
+        Self::provider(request)?;
+        match request.kind {
+            AgentRuntimeKind::Terminal => {
+                let mut barrier =
+                    freshell_codex::transport::OwnedProcessTreeBarrier::capture_by_ownership(
+                        RESTART_REPLACEMENT_OWNERSHIP_ENV,
+                        &fence.ownership_id,
+                    );
+                if barrier.terminate_and_confirm().await {
+                    Ok(())
+                } else {
+                    Err(RestartFailure::new(
+                        AgentRestartFailureCode::ShutdownFailed,
+                        "ambiguous terminal replacement process tree is not confirmed quiescent",
+                        true,
+                    ))
+                }
+            }
+            AgentRuntimeKind::FreshAgent if request.provider == "opencode" => {
+                match self
+                    .fresh_runtime
+                    .recover_opencode_remote_abort(
+                        &request.session_id,
+                        context.and_then(|context| context.fresh_cwd.as_deref()),
+                    )
+                    .await
+                {
+                    freshell_freshagent::RestartShutdownOutcome::Stopped => Ok(()),
+                    freshell_freshagent::RestartShutdownOutcome::Stale => Err(RestartFailure::new(
+                        AgentRestartFailureCode::ShutdownFailed,
+                        "ambiguous OpenCode replacement could not be confirmed aborted",
+                        true,
+                    )),
+                    freshell_freshagent::RestartShutdownOutcome::RetirementIncomplete {
+                        message,
+                    } => Err(RestartFailure::new(
+                        AgentRestartFailureCode::ShutdownFailed,
+                        message,
+                        true,
+                    )),
+                }
+            }
+            AgentRuntimeKind::FreshAgent => {
+                let mut barrier =
+                    freshell_codex::transport::OwnedProcessTreeBarrier::capture_by_ownership(
+                        RESTART_REPLACEMENT_OWNERSHIP_ENV,
+                        &fence.ownership_id,
+                    );
+                if barrier.terminate_and_confirm().await {
+                    Ok(())
+                } else {
+                    Err(RestartFailure::new(
+                        AgentRestartFailureCode::ShutdownFailed,
+                        "ambiguous fresh-agent replacement process tree is not confirmed quiescent",
+                        true,
+                    ))
+                }
+            }
+        }
+    }
+
+    async fn recover_replacement_fenced(
+        &self,
+        request: &AgentRestart,
+        context: Option<&RestartResumeContext>,
+        fence: Option<&RestartReplacementFence>,
+    ) -> Result<String, RestartFailure> {
+        Self::provider(request)?;
+        self.validate_durable(request)?;
+        let fence = fence.ok_or_else(|| {
+            RestartFailure::new(
+                AgentRestartFailureCode::ReplacementFailed,
+                "durable replacement ownership fence is unavailable",
+                true,
+            )
+        })?;
+        self.create_from_builtin_path(
+            request,
+            context.cloned().ok_or_else(|| {
+                RestartFailure::new(
+                    AgentRestartFailureCode::ReplacementFailed,
+                    "persisted restart resume plan is unavailable",
+                    false,
+                )
+            })?,
+            Some(fence),
         )
         .await
     }
@@ -4218,6 +4602,7 @@ mod persistence_tests {
                         retirement_pending: true,
                         resume_context: None,
                         retirement_fence: None,
+                        replacement_fence: None,
                         last_failure: None,
                     },
                 );
@@ -4237,16 +4622,27 @@ mod persistence_tests {
         assert_eq!(runtime.replacements.load(Ordering::SeqCst), 1);
         assert!(coordinator.pending_recoveries().is_empty());
 
-        for request in [older, newer] {
-            let replay = coordinator.execute(request.clone(), runtime.as_ref()).await;
-            assert!(replay.replayed);
-            assert!(matches!(
-                replay.messages.as_slice(),
-                [ServerMessage::AgentRestartReplaced(replaced)]
-                    if replaced.request_id == request.request_id
-                        && replaced.old_runtime.old_runtime_id == request.live_id
-                        && replaced.runtime.runtime_id == "replacement-for-fresh-b"
-            ));
-        }
+        let older_replay = coordinator.execute(older.clone(), runtime.as_ref()).await;
+        assert!(older_replay.replayed);
+        assert!(matches!(
+            older_replay.messages.as_slice(),
+            [ServerMessage::AgentRestartFailed(failed)]
+                if failed.request_id == older.request_id
+                    && failed.kind == AgentRuntimeKind::Terminal
+                    && failed.runtime.runtime_id == older.live_id
+                    && failed.code == AgentRestartFailureCode::ReplacementFailed
+                    && !failed.retryable
+                    && !failed.recovery_pending
+        ));
+
+        let newer_replay = coordinator.execute(newer.clone(), runtime.as_ref()).await;
+        assert!(newer_replay.replayed);
+        assert!(matches!(
+            newer_replay.messages.as_slice(),
+            [ServerMessage::AgentRestartReplaced(replaced)]
+                if replaced.request_id == newer.request_id
+                    && replaced.old_runtime.old_runtime_id == newer.live_id
+                    && replaced.runtime.runtime_id == "replacement-for-fresh-b"
+        ));
     }
 }

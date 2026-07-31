@@ -1369,6 +1369,7 @@ async fn plan_codex_managed_launch(
     raw_cwd: Option<&str>,
     resume_session_id: Option<&str>,
     restart_launch: Option<&freshell_terminal::TerminalRestartLaunch>,
+    replacement_ownership_id: Option<&str>,
 ) -> Result<Option<freshell_codex::launch_lifecycle::CodexTerminalLaunch>, String> {
     let managed_flag =
         std::env::var(freshell_codex::launch_plan::FRESHELL_CODEX_MANAGED_LAUNCH_ENV).ok();
@@ -1402,9 +1403,10 @@ async fn plan_codex_managed_launch(
         approval_policy: plan_approval.as_deref(),
     };
     freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
-        .plan_create_with_retry(
+        .plan_create_with_retry_fenced(
             &input,
             freshell_codex::launch_plan::CODEX_INITIAL_LAUNCH_ATTEMPTS,
+            replacement_ownership_id,
         )
         .await
         .map(Some)
@@ -1753,6 +1755,7 @@ pub(crate) async fn handle_create(
         pane_reconcile_v1,
         create_limiter,
         None,
+        None,
     )
     .await
 }
@@ -1766,6 +1769,7 @@ async fn handle_create_with_restart_launch(
     pane_reconcile_v1: bool,
     create_limiter: &mut crate::create_limit::CreateRateLimiter,
     restart_launch: Option<freshell_terminal::TerminalRestartLaunch>,
+    replacement_ownership_id: Option<String>,
 ) -> bool {
     let mode = create.mode.clone();
     let (launch_intent, resume_session_id) = match resolve_create_resume_identity(state, &create) {
@@ -2320,6 +2324,7 @@ async fn handle_create_with_restart_launch(
         create.cwd.as_deref(),
         resume_session_id.as_deref(),
         restart_launch.as_ref(),
+        replacement_ownership_id.as_deref(),
     )
     .await
     {
@@ -2419,12 +2424,18 @@ async fn handle_create_with_restart_launch(
     // FRESHELL_TERMINAL_ID/+TAB/PANE. U6 resolution: the Rust server's canonical
     // port/token plumbing IS `PORT`/`AUTH_TOKEN` (main.rs), so the reference's
     // env-derived computation carries over verbatim.
-    let overrides = build_terminal_base_env(
+    let mut overrides = build_terminal_base_env(
         &RealEnv,
         &terminal_id,
         create.tab_id.as_deref(),
         create.pane_id.as_deref(),
     );
+    if let Some(replacement_ownership_id) = replacement_ownership_id {
+        overrides.insert(
+            freshell_freshagent::RESTART_REPLACEMENT_OWNERSHIP_ENV.to_string(),
+            replacement_ownership_id,
+        );
+    }
 
     // (`effective_shell`/`windows_like` are hoisted above the amplifier
     // pre-create block so its windows-arm reject evaluates the same predicate
@@ -2991,6 +3002,7 @@ pub async fn respawn_agent_terminal(
         &mode,
         req.cwd.as_deref(),
         resume_session_id.as_deref(),
+        None,
         None,
     )
     .await
@@ -4262,6 +4274,7 @@ pub(crate) async fn create_terminal_replacement(
     request: &freshell_protocol::AgentRestart,
     cwd: Option<String>,
     launch: freshell_terminal::TerminalRestartLaunch,
+    replacement_ownership_id: Option<String>,
 ) -> Result<String, String> {
     let create = TerminalCreate {
         request_id: format!(
@@ -4311,6 +4324,7 @@ pub(crate) async fn create_terminal_replacement(
         true,
         &mut limiter,
         Some(launch),
+        replacement_ownership_id,
     )
     .await;
     while let Ok(message) = reply_rx.try_recv() {

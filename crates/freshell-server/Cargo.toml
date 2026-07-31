@@ -98,6 +98,8 @@ regex = "1"
 libc = "0.2"
 
 [dev-dependencies]
+# Deterministic virtual-time assertions for bounded background retry loops.
+tokio = { version = "1", features = ["test-util"] }
 # `ServiceExt::oneshot` for in-process axum router handler tests (`sessions.rs`).
 tower = { version = "0.5", features = ["util"] }
 # Isolated temp dirs for `session_metadata.rs`'s store round-trip tests.

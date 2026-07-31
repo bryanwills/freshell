@@ -62,6 +62,7 @@ pub const CODEX_SIDECAR_NOT_ADOPTABLE_MESSAGE: &str =
 /// How long a spawned app-server gets to bring its WS listener up — matches
 /// `freshell-freshagent/src/codex.rs::SIDECAR_START_BUDGET`.
 const SIDECAR_START_BUDGET: Duration = Duration::from_secs(45);
+const RESTART_REPLACEMENT_OWNERSHIP_ENV: &str = "FRESHELL_RESTART_REPLACEMENT_ID";
 
 // ─── the runtime seam (CodexRuntimeLike, launch-planner.ts:34-52, scoped) ───────────────
 
@@ -76,6 +77,11 @@ pub struct CodexRuntimeReady {
 /// the adopt-time ownership update, and teardown. The S5 RPC surface
 /// (`readThreadTurn`/`watchPath`/…) joins this trait when its consumers land.
 pub trait CodexLaunchRuntime: Send + Sync {
+    /// Stamp a durable restart ownership token onto the next sidecar spawn.
+    /// Fresh runtimes are created per plan, so this is set once before
+    /// `ensure_ready`.
+    fn set_replacement_ownership_id(&self, _ownership_id: Option<&str>) {}
+
     /// Bring the app-server up (spawn on first call) and return its WS URL
     /// (`runtime.ensureReady(cwd)`, called with the create cwd in BOTH plan branches,
     /// `launch-planner.ts:137,153`).
@@ -280,10 +286,19 @@ impl CodexLaunchPlanner {
         &self,
         input: &CodexLaunchPlanInput<'_>,
     ) -> Result<CodexTerminalLaunch, CodexLaunchError> {
+        self.plan_create_fenced(input, None).await
+    }
+
+    pub async fn plan_create_fenced(
+        &self,
+        input: &CodexLaunchPlanInput<'_>,
+        replacement_ownership_id: Option<&str>,
+    ) -> Result<CodexTerminalLaunch, CodexLaunchError> {
         self.assert_accepting_plans()?;
         let plan = plan_codex_launch(input).map_err(CodexLaunchError::Config)?;
 
         let runtime = (self.runtime_factory)();
+        runtime.set_replacement_ownership_id(replacement_ownership_id);
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let sidecar = Arc::new(CodexLaunchSidecar {
             id,
@@ -350,10 +365,24 @@ impl CodexLaunchPlanner {
         attempts: u32,
         retry_delay_ms: u64,
     ) -> Result<CodexTerminalLaunch, CodexLaunchError> {
+        self.plan_create_with_retry_fenced(input, attempts, retry_delay_ms, None)
+            .await
+    }
+
+    pub async fn plan_create_with_retry_fenced(
+        &self,
+        input: &CodexLaunchPlanInput<'_>,
+        attempts: u32,
+        retry_delay_ms: u64,
+        replacement_ownership_id: Option<&str>,
+    ) -> Result<CodexTerminalLaunch, CodexLaunchError> {
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
-            match self.plan_create(input).await {
+            match self
+                .plan_create_fenced(input, replacement_ownership_id)
+                .await
+            {
                 Ok(launch) => return Ok(launch),
                 Err(error) => {
                     let is_config_error = matches!(error, CodexLaunchError::Config(_));
@@ -445,6 +474,23 @@ impl CodexTerminalLaunchManager {
         self.ensure_teardown_worker();
         self.planner
             .plan_create_with_retry(input, attempts, CODEX_INITIAL_LAUNCH_RETRY_DELAY_MS)
+            .await
+    }
+
+    pub async fn plan_create_with_retry_fenced(
+        &self,
+        input: &CodexLaunchPlanInput<'_>,
+        attempts: u32,
+        replacement_ownership_id: Option<&str>,
+    ) -> Result<CodexTerminalLaunch, CodexLaunchError> {
+        self.ensure_teardown_worker();
+        self.planner
+            .plan_create_with_retry_fenced(
+                input,
+                attempts,
+                CODEX_INITIAL_LAUNCH_RETRY_DELAY_MS,
+                replacement_ownership_id,
+            )
             .await
     }
 
@@ -694,6 +740,7 @@ pub struct SpawnedCodexAppServerRuntime {
     start_budget: Duration,
     state: tokio::sync::Mutex<Option<SpawnedSidecar>>,
     adopted_metadata: Mutex<Option<(String, u64)>>,
+    replacement_ownership_id: Mutex<Option<String>>,
 }
 
 impl Default for SpawnedCodexAppServerRuntime {
@@ -711,6 +758,7 @@ impl SpawnedCodexAppServerRuntime {
             start_budget: SIDECAR_START_BUDGET,
             state: tokio::sync::Mutex::new(None),
             adopted_metadata: Mutex::new(None),
+            replacement_ownership_id: Mutex::new(None),
         }
     }
 
@@ -770,6 +818,10 @@ fn drain_child_io(child: &mut tokio::process::Child) {
 }
 
 impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
+    fn set_replacement_ownership_id(&self, ownership_id: Option<&str>) {
+        *self.replacement_ownership_id.lock().unwrap() = ownership_id.map(str::to_string);
+    }
+
     fn ensure_ready(
         &self,
         cwd: Option<String>,
@@ -800,6 +852,11 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
             }
             for (key, value) in &spec.env {
                 cmd.env(key, value);
+            }
+            if let Some(replacement_ownership_id) =
+                self.replacement_ownership_id.lock().unwrap().as_deref()
+            {
+                cmd.env(RESTART_REPLACEMENT_OWNERSHIP_ENV, replacement_ownership_id);
             }
             cmd.stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())

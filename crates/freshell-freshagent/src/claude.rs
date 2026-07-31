@@ -304,6 +304,24 @@ impl FreshClaudeState {
     /// consumer, and broadcast `freshAgent.created` (or `freshAgent.create.failed`).
     /// Long-running (cold sidecar spawn), so the WS loop dispatches this as a detached task.
     pub async fn handle_create(&self, msg: FreshAgentCreate) {
+        self.handle_create_with_replacement_ownership(msg, None)
+            .await;
+    }
+
+    pub async fn handle_create_for_restart(
+        &self,
+        msg: FreshAgentCreate,
+        replacement_ownership_id: &str,
+    ) {
+        self.handle_create_with_replacement_ownership(msg, Some(replacement_ownership_id))
+            .await;
+    }
+
+    async fn handle_create_with_replacement_ownership(
+        &self,
+        msg: FreshAgentCreate,
+        replacement_ownership_id: Option<&str>,
+    ) {
         let request_id = msg.request_id.clone();
         let session_type = session_type_str(msg.session_type);
 
@@ -400,16 +418,17 @@ impl FreshClaudeState {
             }
         }
 
-        let (mut child, mut stdin, stdout, ownership_id) = match spawn_sidecar().await {
-            Ok(parts) => parts,
-            Err(err) => {
-                if let Some(mut g) = lease_guard.take() {
-                    g.fail();
+        let (mut child, mut stdin, stdout, ownership_id) =
+            match spawn_sidecar(replacement_ownership_id).await {
+                Ok(parts) => parts,
+                Err(err) => {
+                    if let Some(mut g) = lease_guard.take() {
+                        g.fail();
+                    }
+                    self.fail_create(&request_id, "CLAUDE_SIDECAR_START_FAILED", &err);
+                    return;
                 }
-                self.fail_create(&request_id, "CLAUDE_SIDECAR_START_FAILED", &err);
-                return;
-            }
-        };
+            };
         // Arm the TTL tree-kill path now that the child + its ownership tag exist.
         if let Some(g) = lease_guard.as_mut() {
             if let Some(pid) = child.id() {
@@ -1352,7 +1371,7 @@ impl FreshClaudeState {
             cwd: resume_cwd.as_str().map(str::to_string),
         };
 
-        let (mut child, mut stdin, stdout, ownership_id) = spawn_sidecar()
+        let (mut child, mut stdin, stdout, ownership_id) = spawn_sidecar(None)
             .await
             .map_err(ResumeClaudeError::Transient)?;
         // Task 13: arm the lease's TTL tree-kill path now that the child + tag exist.
@@ -1761,7 +1780,9 @@ fn lost_session_frame(session_id: &str, session_type: SessionType) -> ServerMess
 /// Spawn `node <sidecar>/index.mjs`, ownership-tagged, inheriting the server's isolated HOME
 /// (so the SDK's `claude` CLI authenticates from + writes under `<isolatedHOME>/.claude`).
 /// Returns the owned child, its stdin, its stdout, and the ownership tag.
-async fn spawn_sidecar() -> Result<(Child, ChildStdin, ChildStdout, String), String> {
+async fn spawn_sidecar(
+    replacement_ownership_id: Option<&str>,
+) -> Result<(Child, ChildStdin, ChildStdout, String), String> {
     let entry = sidecar_entry_path();
     if !entry.exists() {
         return Err(format!(
@@ -1779,6 +1800,12 @@ async fn spawn_sidecar() -> Result<(Child, ChildStdin, ChildStdout, String), Str
     // (the SDK's clean-env passes FRESHELL_CLAUDE_SIDECAR_ID through — it strips only
     // CLAUDECODE + ANTHROPIC_API_KEY).
     cmd.env(CLAUDE_SIDECAR_OWNERSHIP_ENV, &ownership_id);
+    if let Some(replacement_ownership_id) = replacement_ownership_id {
+        cmd.env(
+            crate::RESTART_REPLACEMENT_OWNERSHIP_ENV,
+            replacement_ownership_id,
+        );
+    }
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -3015,6 +3042,31 @@ rl.on('line', (line) => {
         })
         .await
         .unwrap_or_else(|_| panic!("freshAgent.created for {request_id} resolves within budget"))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn restart_sidecar_inherits_the_durable_pre_spawn_ownership_tag() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let ownership_tag = format!("restart-sidecar-tag-{}", uuid::Uuid::new_v4());
+        let (mut child, _stdin, _stdout, ownership_id) =
+            spawn_sidecar(Some(&ownership_tag)).await.unwrap();
+        let pid = child.id().expect("sidecar pid");
+        let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
+
+        assert!(environ.split(|byte| *byte == 0).any(|variable| {
+            variable
+                == format!(
+                    "{}={ownership_tag}",
+                    crate::RESTART_REPLACEMENT_OWNERSHIP_ENV
+                )
+                .as_bytes()
+        }));
+
+        let _ = child.start_kill();
+        reap_owned_claude_sidecars(&ownership_id);
+        let _ = child.wait().await;
     }
 
     /// THE regression this task fixes: a duplicate `freshAgent.create` sharing a

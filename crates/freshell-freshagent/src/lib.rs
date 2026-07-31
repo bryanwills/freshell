@@ -151,6 +151,11 @@ use freshell_protocol::{
     UiCommand,
 };
 
+/// Ownership tag persisted by the restart coordinator before replacement
+/// creation. Provider sidecars and terminal PTYs inherit it so a later server
+/// boot can find and quiesce an ambiguously spawned replacement.
+pub const RESTART_REPLACEMENT_OWNERSHIP_ENV: &str = "FRESHELL_RESTART_REPLACEMENT_ID";
+
 /// The opencode fresh-agent `sessionType` (`AGENT_SESSION_TYPES.opencode`, `router.ts:541`).
 const SESSION_TYPE: &str = "freshopencode";
 /// The runtime provider (`AGENT_SESSION_TYPES.opencode.provider`).

@@ -117,6 +117,29 @@ pub struct OwnedProcessTreeBarrier {
 }
 
 impl OwnedProcessTreeBarrier {
+    /// Create an ownership-scan barrier before the tagged process exists.
+    ///
+    /// Restart transactions persist this empty fence before spawning. A later
+    /// boot can then discover any child that inherited the tag even when the
+    /// originating server crashed before it captured a PID.
+    #[cfg(target_os = "linux")]
+    pub fn capture_by_ownership(ownership_env: &str, ownership_id: &str) -> Self {
+        Self {
+            ownership_env: ownership_env.to_string(),
+            ownership_id: ownership_id.to_string(),
+            members: Vec::new(),
+            process_group_id: None,
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn capture_by_ownership(_ownership_env: &str, _ownership_id: &str) -> Self {
+        Self {
+            _root_pid: 0,
+            confirmed_empty: false,
+        }
+    }
+
     /// Capture every currently-readable tagged process plus the known direct
     /// child. This performs no signaling and is safe to call while sidecar
     /// transports are still live.
@@ -381,5 +404,31 @@ mod tests {
             !std::path::Path::new(&format!("/proc/{pid}")).exists(),
             "the exact captured process incarnation must be gone"
         );
+    }
+
+    #[tokio::test]
+    async fn pre_spawn_ownership_fence_discovers_writer_created_after_persistence() {
+        let ownership_id = format!("pre-spawn-restart-fence-{}", uuid::Uuid::new_v4());
+        let fence = OwnedProcessTreeBarrier::capture_by_ownership(
+            "FRESHELL_TEST_RESTART_REPLACEMENT",
+            &ownership_id,
+        );
+        let bytes = serde_json::to_vec(&fence).expect("persist fence before child spawn");
+
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "trap '' TERM; while :; do sleep 1; done"])
+            .env("FRESHELL_TEST_RESTART_REPLACEMENT", &ownership_id)
+            .spawn()
+            .expect("spawn crash-ambiguous replacement");
+        let pid = child.id().expect("writer pid");
+
+        let mut reopened: OwnedProcessTreeBarrier =
+            serde_json::from_slice(&bytes).expect("reopen pre-spawn ownership fence");
+        assert!(
+            reopened.terminate_and_confirm().await,
+            "boot recovery must discover and quiesce a child spawned after fence persistence"
+        );
+        let _ = child.wait().await;
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
     }
 }

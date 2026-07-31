@@ -13,8 +13,8 @@ use freshell_protocol::{
 };
 use freshell_ws::restart::{
     ProductionFreshResumePlan, ProductionFreshRuntime, RestartCoordinator, RestartFailure,
-    RestartOutcome, RestartResumeContext, RestartRetirementAction, RestartRetirementFence,
-    RestartRuntime, RuntimeLocator,
+    RestartOutcome, RestartReplacementFence, RestartResumeContext, RestartRetirementAction,
+    RestartRetirementFence, RestartRuntime, RuntimeLocator,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -2441,7 +2441,7 @@ async fn reopened_late_terminal_association_advances_persisted_generation() {
 }
 
 #[tokio::test]
-async fn terminal_results_are_not_evicted_before_a_requester_can_replay_them() {
+async fn durable_terminal_results_use_a_bounded_recent_replay_window() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("bounded-restart-state.json");
     let coordinator = RestartCoordinator::new_persistent_with_limits(path.clone(), 2, 2).unwrap();
@@ -2468,26 +2468,22 @@ async fn terminal_results_are_not_evicted_before_a_requester_can_replay_them() {
             .await;
     }
 
-    assert_eq!(
-        coordinator.retained_result_count(),
-        3,
-        "a count-based cache limit is not a replay acknowledgement or expiry protocol"
-    );
+    assert_eq!(coordinator.retained_result_count(), 2);
     assert!(coordinator.retained_lock_counts().0 <= 2);
     assert!(coordinator.retained_lock_counts().1 <= 2);
     drop(coordinator);
 
     let reopened = RestartCoordinator::new_persistent_with_limits(path, 2, 2).unwrap();
-    assert_eq!(reopened.retained_result_count(), 3);
+    assert_eq!(reopened.retained_result_count(), 2);
     let runtime = FakeRuntime::resumable("must-not-run");
     let replay = reopened
         .execute(
             AgentRestart {
-                request_id: "bounded-r0".to_string(),
+                request_id: "bounded-r2".to_string(),
                 provider: "claude".to_string(),
-                session_id: "durable-0".to_string(),
+                session_id: "durable-2".to_string(),
                 kind: AgentRuntimeKind::Terminal,
-                live_id: "term-0".to_string(),
+                live_id: "term-2".to_string(),
                 expected_generation: 1,
             },
             &runtime,
@@ -2495,6 +2491,61 @@ async fn terminal_results_are_not_evicted_before_a_requester_can_replay_them() {
         .await;
     assert!(replay.replayed);
     assert_eq!(runtime.shutdowns.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn unique_invalid_restart_requests_cannot_grow_the_durable_journal_without_bound() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("bounded-invalid-restart-state.json");
+    let coordinator = RestartCoordinator::new_persistent_with_limits(path.clone(), 3, 2).unwrap();
+
+    for index in 0..20 {
+        let outcome = coordinator
+            .execute(
+                AgentRestart {
+                    request_id: format!("invalid-r{index}"),
+                    provider: "claude".to_string(),
+                    session_id: format!("missing-{index}"),
+                    kind: AgentRuntimeKind::Terminal,
+                    live_id: format!("missing-runtime-{index}"),
+                    expected_generation: 1,
+                },
+                &FakeRuntime::resumable("must-not-run"),
+            )
+            .await;
+        assert!(matches!(
+            outcome.messages.as_slice(),
+            [ServerMessage::AgentRestartFailed(failed)]
+                if failed.code == AgentRestartFailureCode::RuntimeNotFound
+        ));
+    }
+
+    assert_eq!(coordinator.retained_result_count(), 3);
+    let journal: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(journal["results"].as_array().unwrap().len(), 3);
+    drop(coordinator);
+
+    let reopened = RestartCoordinator::new_persistent_with_limits(path, 3, 2).unwrap();
+    let replay = reopened
+        .execute(
+            AgentRestart {
+                request_id: "invalid-r19".to_string(),
+                provider: "claude".to_string(),
+                session_id: "missing-19".to_string(),
+                kind: AgentRuntimeKind::Terminal,
+                live_id: "missing-runtime-19".to_string(),
+                expected_generation: 1,
+            },
+            &FakeRuntime::resumable("must-not-run"),
+        )
+        .await;
+    assert!(replay.replayed);
+    assert!(matches!(
+        replay.messages.as_slice(),
+        [ServerMessage::AgentRestartFailed(failed)]
+            if failed.code == AgentRestartFailureCode::RuntimeNotFound
+    ));
 }
 
 struct RecoveryMustNotSpawn {
@@ -2617,6 +2668,140 @@ async fn pending_retry_adopts_registered_replacement_after_ambiguous_durable_com
     let replay = coordinator.execute(request, &retry_runtime).await;
     assert!(replay.replayed);
     assert_eq!(retry_runtime.attempts.load(Ordering::SeqCst), 0);
+}
+
+struct DurableSpawnFenceRuntime {
+    persistence_path: std::path::PathBuf,
+    ambiguous_writer_alive: Arc<AtomicBool>,
+    quiesces: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl RestartRuntime for DurableSpawnFenceRuntime {
+    type ResumePlan = ();
+
+    async fn preflight(&self, _request: &AgentRestart) -> Result<(), RestartFailure> {
+        Ok(())
+    }
+
+    async fn shutdown_for_restart(
+        &self,
+        _request: &AgentRestart,
+        _plan: &(),
+    ) -> Result<(), RestartFailure> {
+        Ok(())
+    }
+
+    async fn create_replacement(
+        &self,
+        _request: &AgentRestart,
+        _plan: (),
+    ) -> Result<String, RestartFailure> {
+        panic!("fenced adapters must never use the unfenced spawn seam")
+    }
+
+    fn requires_replacement_fence(&self) -> bool {
+        true
+    }
+
+    async fn create_replacement_fenced(
+        &self,
+        _request: &AgentRestart,
+        _plan: (),
+        fence: Option<&RestartReplacementFence>,
+    ) -> Result<String, RestartFailure> {
+        let fence = fence.expect("replacement fence must precede spawn");
+        let journal: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&self.persistence_path).unwrap()).unwrap();
+        assert!(journal["pendingRecoveries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|pending| pending["replacement_fence"]["ownershipId"] == fence.ownership_id));
+        self.ambiguous_writer_alive.store(true, Ordering::SeqCst);
+        Err(RestartFailure::new(
+            AgentRestartFailureCode::ReplacementFailed,
+            "simulated crash-ambiguous spawn",
+            true,
+        ))
+    }
+
+    async fn recover_ambiguous_replacement(
+        &self,
+        _request: &AgentRestart,
+        _context: Option<&RestartResumeContext>,
+        _fence: &RestartReplacementFence,
+    ) -> Result<(), RestartFailure> {
+        assert!(
+            self.ambiguous_writer_alive.swap(false, Ordering::SeqCst),
+            "recovery must observe the ambiguous writer"
+        );
+        self.quiesces.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn recover_replacement(
+        &self,
+        _request: &AgentRestart,
+        _context: Option<&RestartResumeContext>,
+    ) -> Result<String, RestartFailure> {
+        panic!("fenced adapters must never use the unfenced recovery seam")
+    }
+
+    async fn recover_replacement_fenced(
+        &self,
+        _request: &AgentRestart,
+        _context: Option<&RestartResumeContext>,
+        fence: Option<&RestartReplacementFence>,
+    ) -> Result<String, RestartFailure> {
+        assert!(fence.is_some());
+        assert!(
+            !self.ambiguous_writer_alive.load(Ordering::SeqCst),
+            "a second writer must not spawn until ambiguous ownership is quiescent"
+        );
+        Ok("term-after-fenced-recovery".to_string())
+    }
+}
+
+#[tokio::test]
+async fn persisted_spawn_fence_quiesces_ambiguous_writer_before_boot_retry() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("restart-state.json");
+    let ambiguous_writer_alive = Arc::new(AtomicBool::new(false));
+    let quiesces = Arc::new(AtomicUsize::new(0));
+    let request = restart("spawn-fence-r1", "term-1", 1);
+
+    let coordinator = RestartCoordinator::new_persistent(path.clone()).unwrap();
+    coordinator.register_initial(locator(), "term-1");
+    let first_runtime = DurableSpawnFenceRuntime {
+        persistence_path: path.clone(),
+        ambiguous_writer_alive: Arc::clone(&ambiguous_writer_alive),
+        quiesces: Arc::clone(&quiesces),
+    };
+    let first = coordinator.execute(request.clone(), &first_runtime).await;
+    assert!(matches!(
+        first.messages.last(),
+        Some(ServerMessage::AgentRestartFailed(failed))
+            if failed.retryable && failed.recovery_pending
+    ));
+    assert!(ambiguous_writer_alive.load(Ordering::SeqCst));
+    drop(coordinator);
+
+    let reopened = RestartCoordinator::new_persistent(path.clone()).unwrap();
+    let recovery_runtime = DurableSpawnFenceRuntime {
+        persistence_path: path,
+        ambiguous_writer_alive: Arc::clone(&ambiguous_writer_alive),
+        quiesces: Arc::clone(&quiesces),
+    };
+    let recovered = reopened.execute(request, &recovery_runtime).await;
+
+    assert!(matches!(
+        recovered.messages.last(),
+        Some(ServerMessage::AgentRestartReplaced(replaced))
+            if replaced.runtime.runtime_id == "term-after-fenced-recovery"
+    ));
+    assert!(!ambiguous_writer_alive.load(Ordering::SeqCst));
+    assert_eq!(quiesces.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -3250,6 +3435,16 @@ async fn production_terminal_adapter_uses_the_builtin_restore_path() {
     assert_ne!(replacement_id, terminal_id);
     assert!(!registry.is_live(&terminal_id));
     assert!(registry.is_live(replacement_id));
+    #[cfg(target_os = "linux")]
+    {
+        let replacement_pid = registry
+            .pid_of(replacement_id)
+            .expect("replacement child pid");
+        let environ = std::fs::read(format!("/proc/{replacement_pid}/environ")).unwrap();
+        assert!(environ
+            .split(|byte| *byte == 0)
+            .any(|variable| variable.starts_with(b"FRESHELL_RESTART_REPLACEMENT_ID=")));
+    }
     registry.kill_all();
 }
 

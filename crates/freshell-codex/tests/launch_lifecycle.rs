@@ -44,6 +44,7 @@ struct FakeRuntime {
     shutdown_failures_remaining: AtomicU32,
     shutdown_finished: AtomicBool,
     ownership_updates: Mutex<Vec<(String, u64)>>,
+    replacement_ownership_ids: Mutex<Vec<Option<String>>>,
 }
 
 impl FakeRuntime {
@@ -82,6 +83,7 @@ impl FakeRuntime {
             shutdown_failures_remaining: AtomicU32::new(0),
             shutdown_finished: AtomicBool::new(false),
             ownership_updates: Mutex::new(Vec::new()),
+            replacement_ownership_ids: Mutex::new(Vec::new()),
         })
     }
 
@@ -97,6 +99,13 @@ impl FakeRuntime {
 }
 
 impl CodexLaunchRuntime for FakeRuntime {
+    fn set_replacement_ownership_id(&self, ownership_id: Option<&str>) {
+        self.replacement_ownership_ids
+            .lock()
+            .unwrap()
+            .push(ownership_id.map(str::to_string));
+    }
+
     fn ensure_ready(
         &self,
         cwd: Option<String>,
@@ -188,6 +197,26 @@ async fn fresh_plan_starts_a_real_proxy_with_candidate_persistence_on() {
         Some(true)
     );
 
+    launch.sidecar.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn fenced_plan_stamps_the_runtime_before_sidecar_readiness() {
+    let runtime = FakeRuntime::start().await;
+    let planner = planner_for(runtime.clone());
+    let launch = planner
+        .plan_create_fenced(
+            &CodexLaunchPlanInput::default(),
+            Some("restart-replacement-owner"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        runtime.replacement_ownership_ids.lock().unwrap().as_slice(),
+        &[Some("restart-replacement-owner".to_string())]
+    );
+    assert_eq!(runtime.ensure_ready_calls.lock().unwrap().len(), 1);
     launch.sidecar.shutdown().await.unwrap();
 }
 

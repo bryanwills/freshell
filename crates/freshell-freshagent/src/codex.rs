@@ -494,6 +494,24 @@ impl FreshCodexState {
     /// (or `freshAgent.create.failed`). Long-running (cold sidecar spawn), so the WS loop
     /// dispatches this as a detached task and keeps fanning out the bus meanwhile.
     pub async fn handle_create(&self, msg: FreshAgentCreate) {
+        self.handle_create_with_replacement_ownership(msg, None)
+            .await;
+    }
+
+    pub async fn handle_create_for_restart(
+        &self,
+        msg: FreshAgentCreate,
+        replacement_ownership_id: &str,
+    ) {
+        self.handle_create_with_replacement_ownership(msg, Some(replacement_ownership_id))
+            .await;
+    }
+
+    async fn handle_create_with_replacement_ownership(
+        &self,
+        msg: FreshAgentCreate,
+        replacement_ownership_id: Option<&str>,
+    ) {
         let request_id = msg.request_id.clone();
 
         // Dedup by requestId (parity gap fix -- see [`crate::FreshAgentCreateDedup`]'s
@@ -636,13 +654,17 @@ impl FreshCodexState {
                 sandbox,
                 permission_mode,
                 lease_guard,
+                replacement_ownership_id,
             )
             .await;
             return;
         }
 
         // Spawn + initialize the app-server sidecar.
-        let (client, notifs, ownership_id, child) = match self.spawn_sidecar(cwd.as_deref()).await {
+        let (client, notifs, ownership_id, child) = match self
+            .spawn_sidecar(cwd.as_deref(), replacement_ownership_id)
+            .await
+        {
             Ok(parts) => parts,
             Err(err) => {
                 self.fail_create(&request_id, "CODEX_APP_SERVER_START_FAILED", &err);
@@ -721,6 +743,7 @@ impl FreshCodexState {
         sandbox: Option<String>,
         permission_mode: Option<String>,
         mut lease_guard: Option<crate::FreshSessionLeaseGuard>,
+        replacement_ownership_id: Option<&str>,
     ) {
         if self.is_known_dead_thread(&resume_session_id).await {
             if let Some(mut g) = lease_guard.take() {
@@ -734,7 +757,10 @@ impl FreshCodexState {
             return;
         }
 
-        let (client, notifs, ownership_id, child) = match self.spawn_sidecar(cwd.as_deref()).await {
+        let (client, notifs, ownership_id, child) = match self
+            .spawn_sidecar(cwd.as_deref(), replacement_ownership_id)
+            .await
+        {
             Ok(parts) => parts,
             Err(err) => {
                 if let Some(mut g) = lease_guard.take() {
@@ -1953,15 +1979,16 @@ impl FreshCodexState {
                 .await;
         }
 
-        let (client, notifs, ownership_id, child) = match self.spawn_sidecar(cwd.as_deref()).await {
-            Ok(parts) => parts,
-            Err(err) => {
-                if let Some(mut g) = lease_guard.take() {
-                    g.fail();
+        let (client, notifs, ownership_id, child) =
+            match self.spawn_sidecar(cwd.as_deref(), None).await {
+                Ok(parts) => parts,
+                Err(err) => {
+                    if let Some(mut g) = lease_guard.take() {
+                        g.fail();
+                    }
+                    return Err(EnsureAliveError::RespawnFailed(err));
                 }
-                return Err(EnsureAliveError::RespawnFailed(err));
-            }
-        };
+            };
         // Arm the lease's TTL tree-kill path now that the child + its tag exist.
         if let Some(g) = lease_guard.as_mut() {
             if let Some(pid) = child.id() {
@@ -2182,15 +2209,16 @@ impl FreshCodexState {
         permission_mode: Option<String>,
         mut lease_guard: Option<crate::FreshSessionLeaseGuard>,
     ) -> Result<EnsureAliveOutcome, EnsureAliveError> {
-        let (client, notifs, ownership_id, child) = match self.spawn_sidecar(cwd.as_deref()).await {
-            Ok(parts) => parts,
-            Err(err) => {
-                if let Some(mut g) = lease_guard.take() {
-                    g.fail();
+        let (client, notifs, ownership_id, child) =
+            match self.spawn_sidecar(cwd.as_deref(), None).await {
+                Ok(parts) => parts,
+                Err(err) => {
+                    if let Some(mut g) = lease_guard.take() {
+                        g.fail();
+                    }
+                    return Err(EnsureAliveError::RespawnFailed(err));
                 }
-                return Err(EnsureAliveError::RespawnFailed(err));
-            }
-        };
+            };
         // Task 13: arm the lease's TTL tree-kill path now that the child + tag exist.
         if let Some(g) = lease_guard.as_mut() {
             if let Some(pid) = child.id() {
@@ -2349,6 +2377,7 @@ impl FreshCodexState {
     async fn spawn_sidecar(
         &self,
         cwd: Option<&str>,
+        replacement_ownership_id: Option<&str>,
     ) -> Result<
         (
             Arc<CodexAppServerClient>,
@@ -2383,6 +2412,12 @@ impl FreshCodexState {
         // Inherit the parent env (HOME=<isolated>, CODEX_HOME unset → <HOME>/.codex) and
         // layer the ownership tag so the /proc reaper can find exactly our sidecar.
         cmd.env(CODEX_SIDECAR_OWNERSHIP_ENV, &ownership_id);
+        if let Some(replacement_ownership_id) = replacement_ownership_id {
+            cmd.env(
+                crate::RESTART_REPLACEMENT_OWNERSHIP_ENV,
+                replacement_ownership_id,
+            );
+        }
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -2737,7 +2772,7 @@ impl FreshCodexState {
             }
         }
 
-        let (client, notifs, ownership_id, child) = match self.spawn_sidecar(cwd).await {
+        let (client, notifs, ownership_id, child) = match self.spawn_sidecar(cwd, None).await {
             Ok(parts) => parts,
             Err(err) => {
                 if let Some(mut g) = lease_guard.take() {
