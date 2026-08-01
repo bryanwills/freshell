@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { MINI_CAPS, PLUS_CAPS } from '@/deck/fake-deck-device'
 import {
+  containIconRect,
   cropPreviewLines, drawRing, fitLabel, iconLayout, keyFrameGeometry, previewGeometry, renderKey, renderStrip, truncateTitle,
   APPROVE_COLOR, ACTIVE_COLOR, DISABLED_ACTION_COLOR, EMPTY_BG, PREVIEW_TEXT_COLOR, PREVIEW_BG, RING_COLORS,
   TILE_BG, TILE_FILL_GREEN, BANNER_FILL, BAR_TOP_BORDER, CONTROL_BG, CONTROL_DIM, STOP_COLOR,
@@ -564,6 +565,56 @@ describe('agent pane icons (tab-bar presentation)', () => {
   it('a ready flag with a cache miss (probe-failed/evicted bitmap) still draws nothing', () => {
     const { images } = renderTab(tabSpec({ icons: [], paneIcons: [{ provider: 'claude', tint: 'green', ready: true }] }), () => null)
     expect(images).toHaveLength(0)
+  })
+})
+
+describe('aspect-preserving icon fit', () => {
+  // Single-icon slot on the 80x80 Mini: { x: 18, y: 28, size: 45 }.
+  const slot = iconLayout(80, 80, 1)[0]
+
+  it('containIconRect letterboxes wide bitmaps and pillarboxes tall ones, centered in the slot', () => {
+    const wide = { width: 200, height: 100 } as unknown as CanvasImageSource
+    // scale = 45/200 -> 45x23 (round(22.5) = 23), vertically centered.
+    expect(containIconRect(wide, 10, 20, 45)).toEqual({ x: 10, y: 31, w: 45, h: 23 })
+    const tall = { width: 100, height: 200 } as unknown as CanvasImageSource
+    expect(containIconRect(tall, 10, 20, 45)).toEqual({ x: 21, y: 20, w: 23, h: 45 })
+  })
+
+  it('containIconRect keeps square AND dimensionless bitmaps at the full square (drawn-blank trap)', () => {
+    const square = { width: 64, height: 64 } as unknown as CanvasImageSource
+    expect(containIconRect(square, 10, 20, 45)).toEqual({ x: 10, y: 20, w: 45, h: 45 })
+    // Dimensionless (viewBox-only) SVGs report 0x0 - explicit square dims MUST survive.
+    const dimensionless = { naturalWidth: 0, naturalHeight: 0 } as unknown as CanvasImageSource
+    expect(containIconRect(dimensionless, 10, 20, 45)).toEqual({ x: 10, y: 20, w: 45, h: 45 })
+    expect(containIconRect({} as CanvasImageSource, 10, 20, 45)).toEqual({ x: 10, y: 20, w: 45, h: 45 })
+  })
+
+  it('containIconRect prefers intrinsic naturalWidth/naturalHeight over layout width/height', () => {
+    const img = { naturalWidth: 200, naturalHeight: 100, width: 50, height: 50 } as unknown as CanvasImageSource
+    expect(containIconRect(img, 0, 0, 45)).toEqual({ x: 0, y: 11, w: 45, h: 23 })
+  })
+
+  it('containIconRect never collapses below 1px on extreme aspect ratios', () => {
+    const sliver = { width: 1000, height: 10 } as unknown as CanvasImageSource
+    expect(containIconRect(sliver, 0, 0, 45)).toEqual({ x: 0, y: 22, w: 45, h: 1 })
+  })
+
+  it('a wide repo icon draws contained in its slot, not stretched to the square', () => {
+    const bitmap = { naturalWidth: 200, naturalHeight: 100 } as unknown as CanvasImageSource
+    const { images } = renderTab(
+      tabSpec({ icons: [{ url: '/i/wide', letter: 'W', hue: 120, ready: true }] }),
+      (url) => (url === '/i/wide' ? bitmap : null),
+    )
+    expect(images).toEqual([{ x: slot.x, y: slot.y + 11, w: 45, h: 23 }])
+  })
+
+  it('a non-square agent pane icon draws contained in its slot', () => {
+    const bitmap = { width: 32, height: 16 } as unknown as CanvasImageSource
+    const { images } = renderTab(
+      tabSpec({ icons: [], paneIcons: [{ provider: 'claude', tint: 'green', ready: true }] }),
+      () => bitmap,
+    )
+    expect(images).toEqual([{ x: slot.x, y: slot.y + 11, w: 45, h: 23 }])
   })
 })
 

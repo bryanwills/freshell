@@ -184,6 +184,48 @@ export function iconLayout(w: number, h: number, count: number): Array<{ x: numb
   return Array.from({ length: count }, (_, i) => ({ x: x0 + i * (size + ICON_GAP), y, size }))
 }
 
+/** Intrinsic pixel size of a decoded bitmap. Prefers naturalWidth/naturalHeight
+ * (HTMLImageElement intrinsics) over width/height (layout/attribute values);
+ * returns 0x0 when unknown — dimensionless (viewBox-only) SVGs report 0. */
+function intrinsicIconSize(bitmap: CanvasImageSource): { width: number; height: number } {
+  const src = bitmap as { naturalWidth?: unknown; naturalHeight?: unknown; width?: unknown; height?: unknown }
+  const dim = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0)
+  const nw = dim(src.naturalWidth)
+  const nh = dim(src.naturalHeight)
+  if (nw > 0 && nh > 0) return { width: nw, height: nh }
+  return { width: dim(src.width), height: dim(src.height) }
+}
+
+/** Aspect-preserving contain fit: the largest centered rect with the bitmap's
+ * intrinsic aspect ratio inside the square icon slot — icons only ever scale
+ * SYMMETRICALLY, never stretched to the square. Falls back to the full square
+ * when the intrinsic size is unknown (dimensionless SVGs report 0x0), so
+ * explicit destination dims are always available for drawImage. */
+export function containIconRect(
+  bitmap: CanvasImageSource,
+  x: number,
+  y: number,
+  size: number,
+): { x: number; y: number; w: number; h: number } {
+  const { width, height } = intrinsicIconSize(bitmap)
+  if (width <= 0 || height <= 0 || width === height) return { x, y, w: size, h: size }
+  const scale = size / Math.max(width, height)
+  const w = Math.max(1, Math.round(width * scale))
+  const h = Math.max(1, Math.round(height * scale))
+  return { x: x + Math.round((size - w) / 2), y: y + Math.round((size - h) / 2), w, h }
+}
+
+/** Draws an icon bitmap contain-fitted into its square slot. ALWAYS uses the
+ * 5-arg drawImage form with explicit destination width AND height:
+ * dimensionless (viewBox-only) SVGs draw blank without them (verified headless
+ * Chromium 145; the server serves dimensionless SVGs first-class -
+ * repo_icon_detect.rs:51-52). Never call the 3-arg drawImage(image, dx, dy)
+ * form anywhere in this module. */
+function drawIconContained(ctx: Ctx2D, bitmap: CanvasImageSource, x: number, y: number, size: number): void {
+  const rect = containIconRect(bitmap, x, y, size)
+  ctx.drawImage(bitmap, rect.x, rect.y, rect.w, rect.h)
+}
+
 /** Ring/border that follows the rounded key frame: a rounded-rect stroke of
  * `width` px, `inset` px inside the frame edge. (Replaces the old nested
  * 1px square fillRect frames — strokes keep the rounded shape at corners.) */
@@ -267,11 +309,10 @@ function drawIconsTab(ctx: Ctx2D, w: number, h: number, spec: Extract<KeySpec, {
     const { x, y, size } = slots[i]
     const bitmap = icon.url && icon.ready ? getIcon(icon.url) : null
     if (bitmap) {
-      // ALWAYS pass explicit destination width AND height: dimensionless (viewBox-only)
-      // SVGs draw blank without them (verified headless Chromium 145; the server serves
-      // dimensionless SVGs first-class - repo_icon_detect.rs:51-52). Never call the
-      // 3-arg drawImage(image, dx, dy) form anywhere in this module.
-      ctx.drawImage(bitmap, x, y, size, size)
+      // Contain-fitted so non-square icons scale symmetrically (never stretched).
+      // drawIconContained owns the mandatory 5-arg drawImage rule (dimensionless-SVG
+      // drawn-blank trap) - never call drawImage directly for icons.
+      drawIconContained(ctx, bitmap, x, y, size)
       return
     }
     // Letter avatar: exact canvas replica of RepoIcon's SVG — circle filling
@@ -295,10 +336,10 @@ function drawIconsTab(ctx: Ctx2D, w: number, h: number, spec: Extract<KeySpec, {
     // ready (it consulted the cache with this same memoized URL, which also
     // started the async load). An unready slot stays empty; when the decode
     // completes, the cache notify repaints, buildFrame flips `ready` in the
-    // spec JSON, and the controller's diff un-skips this key. 5-arg
-    // drawImage is mandatory (see the repo-icon comment above).
+    // spec JSON, and the controller's diff un-skips this key. Contain-fitted;
+    // drawIconContained owns the mandatory 5-arg drawImage rule.
     const bitmap = icon.ready ? getIcon(providerIconDataUrl(icon.provider, PANE_TINT_COLORS[icon.tint])) : null
-    if (bitmap) ctx.drawImage(bitmap, x, y, size, size)
+    if (bitmap) drawIconContained(ctx, bitmap, x, y, size)
   })
   if (hidden.length > 0) {
     // The badge renders horizontally centered inside the row slot reserved
