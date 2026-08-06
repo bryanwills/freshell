@@ -642,7 +642,9 @@ impl OpencodeActivityTracker {
             Ownership::KnownBusy { session_id, .. } => Some(session_id.clone()),
             Ownership::Candidate { previous_known, .. }
             | Ownership::AwaitingAssociation { previous_known, .. } => previous_known.clone(),
-            Ownership::Ambiguous { known_session_id, .. } => known_session_id.clone(),
+            Ownership::Ambiguous {
+                known_session_id, ..
+            } => known_session_id.clone(),
         };
         state.ownership = Ownership::Quiet {
             known_session_id: known,
@@ -1397,7 +1399,7 @@ mod tests {
         tracker.track_terminal("t1", Some("ses-r"), 0);
         tracker.note_status("t1", "ses-r", OpencodeStatus::Busy, 1, 1, 0);
         tracker.expire(2000); // verify requested, still busy
-        // Verify answer: still busy — record retained, deadman re-armed.
+                              // Verify answer: still busy — record retained, deadman re-armed.
         assert!(tracker
             .note_snapshot(
                 "t1",
