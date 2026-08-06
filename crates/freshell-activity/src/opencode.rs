@@ -1894,4 +1894,39 @@ mod tests {
             .is_empty());
         assert!(tracker.blocks_death_bell("t1"));
     }
+
+    #[test]
+    fn ambiguous_repromotes_when_single_root_differs_from_known() {
+        // The DISCRIMINATING case for the #609/#610 always-re-promote
+        // semantics: the old code only re-promoted when the snapshot's
+        // single busy root EQUALLED known_session_id (and stayed Ambiguous
+        // otherwise). One busy root on the pane's own per-pane endpoint is
+        // the pane's session even when it is NOT the previously-known one.
+        let mut tracker = OpencodeActivityTracker::new();
+        tracker.track_terminal("t1", None, 0);
+        tracker.note_status("t1", "ses-a", OpencodeStatus::Busy, 1, 1, 100);
+        // A second busy root: Ambiguous(known = Some("ses-a")).
+        tracker.note_status("t1", "ses-b", OpencodeStatus::Busy, 1, 1, 110);
+        assert!(tracker.blocks_death_bell("t1"));
+        // Verify snapshot: only ses-b busy — a single root that DIFFERS
+        // from the known session. Re-promote to THAT root.
+        assert_eq!(
+            tracker.note_snapshot(
+                "t1",
+                &[("ses-b".to_string(), OpencodeStatus::Busy)],
+                1,
+                1,
+                130
+            ),
+            vec![upsert(rec(Some("ses-b"), 130))],
+            "re-promotion binds the record to the snapshot's single root"
+        );
+        assert!(!tracker.blocks_death_bell("t1"));
+        // The turn's idle edge mints the completion (old code drained the
+        // Ambiguous blocked set silently — no bell).
+        assert_eq!(
+            tracker.note_session_idle("t1", "ses-b", 1, 1, 200),
+            vec![remove(), turn_complete("ses-b", 200, 1)]
+        );
+    }
 }
