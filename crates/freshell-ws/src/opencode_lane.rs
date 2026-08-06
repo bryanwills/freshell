@@ -172,6 +172,9 @@ impl Lane {
                 // where `stream += 1` happens, so every stream starts fresh).
                 let mut recognized_since_verify: u64 = 0;
                 let mut drift_logged_this_stream = false;
+                // #608/#604 rule (b): ask ids seen as *.asked stream events
+                // or replayed by the pending resync on THIS stream.
+                let mut known_ask_ids: HashSet<String> = HashSet::new();
                 let url = format!("{}/event", self.base_url);
                 let conn = match self.deps.events.connect(&url).await {
                     Ok(conn) => conn,
@@ -203,6 +206,18 @@ impl Lane {
                         break 'cycle false;
                     }
                 };
+                // #608: replay outstanding asks BEFORE the snapshot
+                // is noted. check_drift=false — asks that arrived
+                // during the SSE gap are legitimately stream-unseen.
+                self.resync_pending(
+                    cycle,
+                    stream,
+                    &mut known_sessions,
+                    &mut known_ask_ids,
+                    &mut drift_logged_this_stream,
+                    false,
+                )
+                .await;
                 // Root-resolve unknown snapshot session ids FIRST, then note.
                 for (session_id, _) in &statuses {
                     self.resolve_root(cycle, stream, session_id, &mut known_sessions)
@@ -227,6 +242,11 @@ impl Lane {
                             let Some(event) = translate_serve_event(&parsed) else {
                                 continue;
                             };
+                            if let OpencodeLaneEvent::PermissionAsked { permission_id, .. } =
+                                &event
+                            {
+                                known_ask_ids.insert(permission_id.clone());
+                            }
                             // #604 rule (a): count recognized stream events
                             // between consecutive REST observations.
                             recognized_since_verify += 1;
@@ -250,7 +270,8 @@ impl Lane {
                                 // No session id to resolve.
                                 OpencodeLaneEvent::PermissionReplied { .. }
                                 | OpencodeLaneEvent::Snapshot { .. }
-                                | OpencodeLaneEvent::SnapshotFailed { .. } => {}
+                                | OpencodeLaneEvent::SnapshotFailed { .. }
+                                | OpencodeLaneEvent::PermissionsSynced { .. } => {}
                             }
                             self.note(cycle, stream, event);
                         }
@@ -276,6 +297,19 @@ impl Lane {
                                 // A failed probe is not an observation: the counter carries across it.
                                 recognized_since_verify = 0;
                             }
+                            // #608 mid-stream resync + #604 rule (b) —
+                            // runs ONLY here (healthy connected stream):
+                            // during a disconnect an unseen listed ask is
+                            // expected, not drift.
+                            self.resync_pending(
+                                cycle,
+                                stream,
+                                &mut known_sessions,
+                                &mut known_ask_ids,
+                                &mut drift_logged_this_stream,
+                                true,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -416,6 +450,134 @@ impl Lane {
             }
         }
         Ok(statuses)
+    }
+
+    /// #608: GET {base}/permission — pending V1 permission asks across
+    /// sessions (legacy shape; source-verified on opencode v1.18.14, opId
+    /// permission.list; version floor 1.18.x). Returns
+    /// (session_id, ask_id) pairs. Failure is NON-FATAL for the cycle:
+    /// the stream + snapshot still carry the lights; the pause resync
+    /// just doesn't happen this fetch (retried at the next verify or
+    /// reconnect).
+    async fn fetch_permissions(&self) -> Result<Vec<(String, String)>, String> {
+        Self::parse_ask_list("/permission", self.fetch_ask_body("/permission").await?)
+    }
+
+    /// #608: GET {base}/question — pending questions live in a SEPARATE
+    /// store from permissions (source-verified opencode v1.18.14:
+    /// question/index.ts:42-44, route groups/question.ts:11). A resync
+    /// that polls only /permission never drains a question pause. Same
+    /// shape contract and version floor as fetch_permissions.
+    async fn fetch_questions(&self) -> Result<Vec<(String, String)>, String> {
+        Self::parse_ask_list("/question", self.fetch_ask_body("/question").await?)
+    }
+
+    async fn fetch_ask_body(&self, path: &str) -> Result<serde_json::Value, String> {
+        let url = format!("{}{}", self.base_url, path);
+        let (status, body) = self.deps.http.get_json(&url).await?;
+        if status != 200 {
+            return Err(format!("GET {path} returned {status}"));
+        }
+        Ok(body)
+    }
+
+    fn parse_ask_list(
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<Vec<(String, String)>, String> {
+        let list = body
+            .as_array()
+            .ok_or_else(|| format!("GET {path}: body is not an array"))?;
+        let mut asks = Vec::new();
+        for entry in list {
+            let (Some(session_id), Some(ask_id)) = (
+                entry.get("sessionID").and_then(|v| v.as_str()),
+                entry.get("id").and_then(|v| v.as_str()),
+            ) else {
+                return Err(format!("GET {path}: entry missing id/sessionID"));
+            };
+            asks.push((session_id.to_string(), ask_id.to_string()));
+        }
+        Ok(asks)
+    }
+
+    /// #608: fetch BOTH pending-ask sets and replay them into the
+    /// tracker (idempotent — only a NEWLY inserted id arms,
+    /// opencode.rs:508-510); when BOTH fetches succeed, note
+    /// PermissionsSynced so the hub drains stale local pauses
+    /// (instance-dispose drains pending with NO events). Reconciliation
+    /// is all-or-nothing: draining question pauses because only
+    /// /permission answered would wedge the truth. With `check_drift`
+    /// (mid-stream verify only): a listed id never seen as an *.asked
+    /// stream event nor replayed before is #604 rule (b) drift — every
+    /// ask minted on a healthy stream publishes *.asked at ask time.
+    /// Connect-time calls pass check_drift=false: asks that arrived
+    /// during the SSE gap are expected to be stream-unseen.
+    #[allow(clippy::too_many_arguments)]
+    async fn resync_pending(
+        &self,
+        cycle: u64,
+        stream: u64,
+        known_sessions: &mut HashSet<String>,
+        known_ask_ids: &mut HashSet<String>,
+        drift_logged_this_stream: &mut bool,
+        check_drift: bool,
+    ) {
+        let perms = self.fetch_permissions().await;
+        let questions = self.fetch_questions().await;
+        let both_ok = perms.is_ok() && questions.is_ok();
+        if !both_ok {
+            let error = [perms.as_ref().err(), questions.as_ref().err()]
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ");
+            tracing::warn!(
+                terminal_id = %self.terminal_id,
+                %error,
+                "opencode pending-ask resync incomplete; replaying what fetched, skipping reconciliation (#608)"
+            );
+        }
+        let listed: Vec<(String, String)> = perms
+            .unwrap_or_default()
+            .into_iter()
+            .chain(questions.unwrap_or_default())
+            .collect();
+        if check_drift {
+            let unseen = unseen_pending_asks(&listed, known_ask_ids);
+            if !unseen.is_empty() && !*drift_logged_this_stream {
+                *drift_logged_this_stream = true;
+                OPENCODE_DRIFT_EVENTS.fetch_add(1, AtomicOrdering::SeqCst);
+                tracing::error!(
+                    terminal_id = %self.terminal_id,
+                    unseen = ?unseen,
+                    "opencode asked-family drift: pending ask ids listed by /permission|/question were never seen as *.asked stream events on a healthy stream (#604 rule (b))"
+                );
+            }
+        }
+        let mut pending_ids = Vec::new();
+        for (session_id, ask_id) in listed {
+            self.resolve_root(cycle, stream, &session_id, known_sessions)
+                .await;
+            known_ask_ids.insert(ask_id.clone());
+            pending_ids.push(ask_id.clone());
+            self.note(
+                cycle,
+                stream,
+                OpencodeLaneEvent::PermissionAsked {
+                    session_id,
+                    permission_id: ask_id,
+                },
+            );
+        }
+        if both_ok {
+            self.note(
+                cycle,
+                stream,
+                OpencodeLaneEvent::PermissionsSynced { pending_ids },
+            );
+        }
     }
 
     /// Lane-level HTTP root resolver (A4 — the Node `resolveRootForEvent` /
@@ -1448,17 +1610,24 @@ mod tests {
         );
 
         // Each snapshot was noted after its own connect: the call order is
-        // health → connect → snapshot GET, twice.
+        // health → connect → snapshot GET → permission GET → question GET,
+        // twice (#608: the pending-ask resync runs between the snapshot
+        // fetch and the Snapshot note; here both asks GETs 404 → the
+        // resync warns and continues).
         let calls = log.lock().expect("call log").clone();
         assert_eq!(
-            &calls[..6],
+            &calls[..10],
             &[
                 "GET http://fake/global/health".to_string(),
                 "CONNECT http://fake/event".to_string(),
                 "GET http://fake/session/status".to_string(),
+                "GET http://fake/permission".to_string(),
+                "GET http://fake/question".to_string(),
                 "GET http://fake/global/health".to_string(),
                 "CONNECT http://fake/event".to_string(),
                 "GET http://fake/session/status".to_string(),
+                "GET http://fake/permission".to_string(),
+                "GET http://fake/question".to_string(),
             ],
             "full order: {calls:?}"
         );
@@ -1845,6 +2014,214 @@ mod tests {
         known.insert("que-9".to_string());
         assert!(unseen_pending_asks(&listed, &known).is_empty());
         assert!(unseen_pending_asks(&[], &known).is_empty());
+    }
+
+    /// #608: on (re)connect the lane asks GET /permission AND
+    /// GET /question (disjoint pending stores, source-verified opencode
+    /// v1.18.14) and replays outstanding asks into the tracker BEFORE
+    /// the snapshot is noted, so an ask that happened during the SSE gap
+    /// still arms the pause; a PermissionsSynced entry follows so the
+    /// hub can drain stale local pauses.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_replays_outstanding_asks_before_snapshot() {
+        let log: CallLog = Arc::new(Mutex::new(Vec::new()));
+        let http = FakeLaneHttp {
+            log: log.clone(),
+            respond: Box::new(|url| {
+                if url.ends_with("/global/health") {
+                    return Ok((200, json!({"healthy": true, "version": "1.18.14"})));
+                }
+                if url.ends_with("/permission") {
+                    return Ok((
+                        200,
+                        json!([{"id":"per-9","sessionID":"ses-1","permission":"bash",
+                                "patterns":[],"metadata":{},"always":[]}]),
+                    ));
+                }
+                if url.ends_with("/question") {
+                    return Ok((
+                        200,
+                        json!([{"id":"que-3","sessionID":"ses-1","questions":[]}]),
+                    ));
+                }
+                if url.ends_with("/session/status") {
+                    return Ok((200, json!({"ses-1": {"type": "busy"}})));
+                }
+                if url.ends_with("/session/ses-1") {
+                    return Ok((200, json!({"id": "ses-1"})));
+                }
+                Ok((404, json!({})))
+            }),
+        };
+        let stream = FakeLaneStream {
+            log: log.clone(),
+            scripts: Mutex::new(VecDeque::from([StreamScript {
+                buffered: vec![],
+                live: vec![],
+                finish: false, // park: the cycle stays open
+            }])),
+        };
+        let (hub, _rx) = hub();
+        hub.register_opencode_lane_for_tests("t1", 7);
+        let deps = Arc::new(OpencodeLaneDeps {
+            http: Arc::new(http),
+            events: Arc::new(stream),
+        });
+        let (lane, _verify_tx) = spawn_opencode_lane(
+            deps,
+            hub.clone(),
+            "t1".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            7,
+        );
+
+        // SessionCreated + PermissionAsked x2 + PermissionsSynced + Snapshot.
+        let ingress = wait_for_ingress(&hub, 5, 2000).await;
+        let idx_of_per_asked = ingress
+            .iter()
+            .position(|(_, _, _, e)| {
+                *e == OpencodeLaneEvent::PermissionAsked {
+                    session_id: "ses-1".to_string(),
+                    permission_id: "per-9".to_string(),
+                }
+            })
+            .expect("per-9 replayed as PermissionAsked");
+        let idx_of_que_asked = ingress
+            .iter()
+            .position(|(_, _, _, e)| {
+                *e == OpencodeLaneEvent::PermissionAsked {
+                    session_id: "ses-1".to_string(),
+                    permission_id: "que-3".to_string(),
+                }
+            })
+            .expect("que-3 replayed as PermissionAsked");
+        let idx_of_synced = ingress
+            .iter()
+            .position(|(_, _, _, e)| {
+                *e == OpencodeLaneEvent::PermissionsSynced {
+                    pending_ids: vec!["per-9".to_string(), "que-3".to_string()],
+                }
+            })
+            .expect("PermissionsSynced noted with both ids");
+        let idx_of_snapshot = ingress
+            .iter()
+            .position(|(_, _, _, e)| matches!(e, OpencodeLaneEvent::Snapshot { .. }))
+            .expect("snapshot noted");
+        assert!(
+            idx_of_per_asked < idx_of_synced && idx_of_que_asked < idx_of_synced,
+            "replay must precede reconciliation"
+        );
+        assert!(
+            idx_of_synced < idx_of_snapshot,
+            "replay+sync must precede the snapshot"
+        );
+        // Every entry carries the same (generation, cycle, stream).
+        for (generation, cycle, stream_id, _) in &ingress {
+            assert_eq!((*generation, *cycle, *stream_id), (7, 1, 1));
+        }
+        lane.abort();
+    }
+
+    /// #608 mid-stream resync wires #604 rule (b): a pending ask id
+    /// listed by /permission that was never seen as an *.asked stream
+    /// event (nor replayed at connect) is drift — the counter bumps and
+    /// the error logs once, but the pause STILL arms: the
+    /// PermissionAsked + PermissionsSynced ingress pair arrives anyway.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_resync_flags_never_streamed_ask_as_drift() {
+        let log: CallLog = Arc::new(Mutex::new(Vec::new()));
+        let permission_calls = Arc::new(AtomicUsize::new(0));
+        let permission_calls_in_responder = permission_calls.clone();
+        let http = FakeLaneHttp {
+            log: log.clone(),
+            respond: Box::new(move |url| {
+                if url.ends_with("/global/health") {
+                    return Ok((200, json!({"healthy": true, "version": "1.18.14"})));
+                }
+                if url.ends_with("/permission") {
+                    let n = permission_calls_in_responder.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        // Connect-time resync: nothing pending.
+                        return Ok((200, json!([])));
+                    }
+                    // Verify-time resync: a never-streamed pending ask.
+                    return Ok((
+                        200,
+                        json!([{"id":"per-drift","sessionID":"ses-1","permission":"bash",
+                                "patterns":[],"metadata":{},"always":[]}]),
+                    ));
+                }
+                if url.ends_with("/question") {
+                    return Ok((200, json!([])));
+                }
+                if url.ends_with("/session/status") {
+                    return Ok((200, json!({})));
+                }
+                if url.ends_with("/session/ses-1") {
+                    return Ok((200, json!({"id": "ses-1"})));
+                }
+                Ok((404, json!({})))
+            }),
+        };
+        let stream = FakeLaneStream {
+            log: log.clone(),
+            scripts: Mutex::new(VecDeque::from([StreamScript {
+                buffered: vec![],
+                live: vec![],
+                finish: false, // park: the cycle stays open for verify requests
+            }])),
+        };
+        let (hub, _rx) = hub();
+        hub.register_opencode_lane_for_tests("t1", 7);
+        let deps = Arc::new(OpencodeLaneDeps {
+            http: Arc::new(http),
+            events: Arc::new(stream),
+        });
+        let (lane, verify_tx) = spawn_opencode_lane(
+            deps,
+            hub.clone(),
+            "t1".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            7,
+        );
+
+        // Connect completes: PermissionsSynced (empty) + Snapshot (empty).
+        let log1 = wait_for_ingress(&hub, 2, 2000).await;
+        assert_eq!(
+            log1[0].3,
+            OpencodeLaneEvent::PermissionsSynced {
+                pending_ids: vec![]
+            }
+        );
+        assert!(matches!(log1[1].3, OpencodeLaneEvent::Snapshot { .. }));
+
+        // One verify against the drifted /permission listing.
+        let drift_before = OPENCODE_DRIFT_EVENTS.load(AtomicOrdering::SeqCst);
+        verify_tx.send(()).expect("verify channel open");
+        // Verify Snapshot + SessionCreated + PermissionAsked +
+        // PermissionsSynced.
+        let ingress = wait_for_ingress(&hub, 6, 2000).await;
+        assert!(
+            OPENCODE_DRIFT_EVENTS.load(AtomicOrdering::SeqCst) > drift_before,
+            "rule (b) drift increments the counter"
+        );
+        // The pause still arms even while drift is flagged.
+        assert!(
+            ingress.iter().any(|(_, _, _, e)| *e
+                == OpencodeLaneEvent::PermissionAsked {
+                    session_id: "ses-1".to_string(),
+                    permission_id: "per-drift".to_string(),
+                }),
+            "the never-streamed ask is still replayed: {ingress:?}"
+        );
+        assert!(
+            ingress.iter().any(|(_, _, _, e)| *e
+                == OpencodeLaneEvent::PermissionsSynced {
+                    pending_ids: vec!["per-drift".to_string()],
+                }),
+            "reconciliation still follows the replay: {ingress:?}"
+        );
+        lane.abort();
     }
 
     /// A failing CONNECT-cycle snapshot notes SnapshotFailed (loud, crash

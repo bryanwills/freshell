@@ -223,6 +223,11 @@ pub(crate) enum OpencodeLaneEvent {
     /// must NOT read as idle (#603/#604). The hub applies crash semantics
     /// via [`OpencodeActivityTracker::note_verify_failed`].
     SnapshotFailed { error: String },
+    /// #608: the authoritative pending-ask listing fetched from GET
+    /// /permission + GET /question (noted only when BOTH succeeded). The
+    /// hub drains any locally-pending id not listed — see
+    /// OpencodeActivityTracker::note_permissions_synced.
+    PermissionsSynced { pending_ids: Vec<String> },
 }
 
 struct AmplifierLane {
@@ -926,6 +931,9 @@ impl ActivityHub {
                             );
                             inner.opencode.note_verify_failed(&terminal_id, at)
                         }
+                        OpencodeLaneEvent::PermissionsSynced { pending_ids } => inner
+                            .opencode
+                            .note_permissions_synced(&terminal_id, &pending_ids, at),
                     };
                     // ForceRead only arises from expire()
                     let (frames, _) = opencode_frames(&mut inner.idle, effects);

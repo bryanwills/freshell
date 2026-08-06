@@ -574,6 +574,37 @@ impl OpencodeActivityTracker {
         }
     }
 
+    /// #608 reconciliation: the fetched pending sets (GET /permission +
+    /// GET /question) are authoritative — a locally-pending ask id
+    /// absent from them was drained WITHOUT events (instance dispose,
+    /// opencode permission/index.ts:54-61 / question/index.ts:74-81).
+    /// Treat each stale id as replied at `at` (the same drain path), so
+    /// a pause can never wedge. Deterministic: a pure set difference
+    /// against the fetched listing; no timers, no guesses.
+    pub fn note_permissions_synced(
+        &mut self,
+        terminal_id: &str,
+        pending_ids: &[String],
+        at: i64,
+    ) -> Vec<OpencodeEffect> {
+        let stale: Vec<String> = {
+            let Some(state) = self.states.get(terminal_id) else {
+                return Vec::new();
+            };
+            state
+                .pending_permissions
+                .iter()
+                .filter(|id| !pending_ids.contains(*id))
+                .cloned()
+                .collect()
+        };
+        let mut effects = Vec::new();
+        for id in stale {
+            effects.extend(self.note_permission_replied(terminal_id, &id, at));
+        }
+        effects
+    }
+
     /// Death-bell engagement extension (D4): a pane blocked on a permission
     /// whose process dies spontaneously must ring. Read by the hub's Exit
     /// arm BEFORE `note_exit` (audit-A17 ordering, same as codex).
@@ -1005,15 +1036,29 @@ fn reduce_snapshot(
                 }
                 effects
             } else if busy_roots.len() == 1 && busy_roots[0] == own {
-                // Refresh: abort gate re-arms; a pause resumes out-of-band.
-                state.pending_permissions.clear();
-                state.ownership = Ownership::KnownBusy {
-                    session_id: own.clone(),
-                    cycle,
-                    stream,
-                    turn_aborted: false,
-                };
-                set_busy_record(state, Some(own), at)
+                // Busy refresh for the owned root. #608: while a pause is
+                // outstanding the record stays absent and the claim stays —
+                // only permission.replied (or a STREAM busy edge = genuine
+                // resume) ends a pause; a snapshot is an observation, not a
+                // resume. Stamps still refresh so stream guards keep
+                // accepting this turn's edges.
+                if state.pending_permissions.is_empty() {
+                    state.ownership = Ownership::KnownBusy {
+                        session_id: own.clone(),
+                        cycle,
+                        stream,
+                        turn_aborted: false,
+                    };
+                    set_busy_record(state, Some(own), at)
+                } else {
+                    state.ownership = Ownership::KnownBusy {
+                        session_id: own.clone(),
+                        cycle,
+                        stream,
+                        turn_aborted: false,
+                    };
+                    Vec::new()
+                }
             } else {
                 let mut blocked = busy_roots;
                 blocked.push(own.clone());
@@ -1773,6 +1818,66 @@ mod tests {
             tracker.note_session_idle("t1", "ses-r", 1, 2, 200),
             vec![remove(), turn_complete("ses-r", 200, 1)]
         );
+    }
+
+    #[test]
+    fn busy_snapshot_does_not_clear_an_outstanding_pause() {
+        // #608: a blocked-on-permission session still reports BUSY in
+        // /session/status — the reconnect snapshot must not resurrect the
+        // busy record or forget the pause (that is exactly how the pending
+        // bell got lost, residual D8(b)).
+        let mut tracker = OpencodeActivityTracker::new();
+        tracker.track_terminal("t1", Some("ses-r"), 0);
+        tracker.note_status("t1", "ses-r", OpencodeStatus::Busy, 1, 1, 100);
+        assert_eq!(
+            tracker.note_permission_asked("t1", "ses-r", "perm-1", 150),
+            vec![remove(), boundary(150)]
+        );
+        // Reconnect snapshot (new cycle): session busy — pause SURVIVES.
+        assert!(tracker
+            .note_snapshot(
+                "t1",
+                &[("ses-r".to_string(), OpencodeStatus::Busy)],
+                2,
+                1,
+                200
+            )
+            .is_empty());
+        assert!(tracker.has_pending_permissions("t1"));
+        assert!(tracker.list().is_empty(), "mid-pause: record stays absent");
+        // The reply still resumes busy normally.
+        assert_eq!(
+            tracker.note_permission_replied("t1", "perm-1", 300),
+            vec![upsert(rec(Some("ses-r"), 300))]
+        );
+    }
+
+    #[test]
+    fn permissions_sync_drains_stale_pauses() {
+        // #608 reconciliation: opencode instance-dispose drains pending
+        // asks WITHOUT publishing any replied/rejected event
+        // (permission/index.ts:54-61, question/index.ts:74-81) — the
+        // fetched pending sets are authoritative, so a locally-pending
+        // id absent from them is deterministically stale: treat it as
+        // replied so the pause cannot wedge.
+        let mut tracker = OpencodeActivityTracker::new();
+        tracker.track_terminal("t1", Some("ses-r"), 0);
+        tracker.note_status("t1", "ses-r", OpencodeStatus::Busy, 1, 1, 100);
+        tracker.note_permission_asked("t1", "ses-r", "perm-1", 150);
+        assert!(tracker.has_pending_permissions("t1"));
+        // Sync says: nothing pending server-side — drain exactly like a
+        // reply (busy resumes, same effects as note_permission_replied).
+        assert_eq!(
+            tracker.note_permissions_synced("t1", &[], 300),
+            vec![upsert(rec(Some("ses-r"), 300))]
+        );
+        assert!(!tracker.has_pending_permissions("t1"));
+        // A still-listed id keeps its pause untouched.
+        tracker.note_permission_asked("t1", "ses-r", "perm-2", 400);
+        assert!(tracker
+            .note_permissions_synced("t1", &["perm-2".to_string()], 500)
+            .is_empty());
+        assert!(tracker.has_pending_permissions("t1"));
     }
 
     #[test]

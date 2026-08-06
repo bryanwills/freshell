@@ -65,13 +65,19 @@
 //!     accepted (it requires local intent, and two busy roots still
 //!     demote to Ambiguous, which stays honest-blue and death-silent).
 //! 7. Unmanaged/PTY-only codex has no approval signal — documented limitation.
-//! 8. Opencode: an SSE reconnect during a permission pause loses the pending
-//!    pause bell (the busy snapshot clears it; GET /permission resync is a
-//!    possible follow-up). Ambiguous ownership stays bell-free. Child sessions
-//!    unseen on-stream (reconnect gap, mid-turn attach) are recovered by the
-//!    lane's HTTP root resolver (GET /session/{id} exposes parentID); only
-//!    resolver FAILURE degrades to ambiguous (conservative silence), retried
-//!    on the next occurrence.
+//!  8. (CLOSED by #608, 2026-08-06) SSE reconnect resyncs outstanding
+//!     asks via GET /permission AND GET /question (disjoint pending
+//!     stores at v1.18.14; both replayed BEFORE the snapshot), busy
+//!     snapshots no longer clear an outstanding pause, and the fetched
+//!     sets reconcile stale local pauses (instance-dispose drains with
+//!     NO events — a locally-pending id absent from the listing is
+//!     treated as replied, so pauses cannot wedge). The
+//!     pending-attention bell survives connection blips.
+//!     Ambiguous ownership stays bell-free. Child sessions
+//!     unseen on-stream (reconnect gap, mid-turn attach) are recovered by the
+//!     lane's HTTP root resolver (GET /session/{id} exposes parentID); only
+//!     resolver FAILURE degrades to ambiguous (conservative silence), retried
+//!     on the next occurrence.
 //! 9. (RE-SCOPED by #604, 2026-08-06) permission.* and question.*
 //!    families (v1 AND v2) are translated onto the same pause
 //!    machinery, source-verified against opencode v1.18.14: TUI-driven
