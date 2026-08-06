@@ -809,23 +809,21 @@ fn reduce_busy_edge(
     at: i64,
 ) -> Vec<OpencodeEffect> {
     match state.ownership.clone() {
-        Ownership::Quiet { known_session_id } => {
-            if known_session_id.as_deref() == Some(session_id) {
-                state.ownership = Ownership::KnownBusy {
-                    session_id: session_id.to_string(),
-                    cycle,
-                    stream,
-                    turn_aborted: false,
-                };
-            } else {
-                state.ownership = Ownership::Candidate {
-                    session_id: session_id.to_string(),
-                    previous_known: known_session_id,
-                    cycle,
-                    stream,
-                    turn_aborted: false,
-                };
-            }
+        Ownership::Quiet { .. } => {
+            // #609: busy edges reach this tracker ONLY from the pane's own
+            // per-pane lane (generation/cycle/stream-guarded, root-
+            // resolved), so the busy root IS the pane's session — identity
+            // confirms by construction. Direct KnownBusy: first-turn asks
+            // ring (KnownBusy arming), first-turn deaths are eligible, and
+            // the indefinite-candidate tail cannot form. Candidate/
+            // AwaitingAssociation remain for the locator/plugin bind
+            // producers and defense in depth.
+            state.ownership = Ownership::KnownBusy {
+                session_id: session_id.to_string(),
+                cycle,
+                stream,
+                turn_aborted: false,
+            };
             set_busy_record(state, Some(session_id.to_string()), at)
         }
         Ownership::Candidate {
@@ -1086,15 +1084,17 @@ fn reduce_snapshot(
                     }
                     // Session switched during an SSE reconnect gap, visible
                     // only in the snapshot (Node reduceSnapshot:406-417).
-                    let foreign = busy_roots[0].clone();
-                    state.ownership = Ownership::Candidate {
-                        session_id: foreign.clone(),
-                        previous_known: Some(known),
+                    // #609: the switch happened on the pane's OWN per-pane
+                    // endpoint, so the foreign root IS the pane's new
+                    // session — rebind directly, no Candidate detour.
+                    let root = busy_roots[0].clone();
+                    state.ownership = Ownership::KnownBusy {
+                        session_id: root.clone(),
                         cycle,
                         stream,
                         turn_aborted: false,
                     };
-                    return set_busy_record(state, Some(foreign), at);
+                    return set_busy_record(state, Some(root), at);
                 }
                 state.ownership = Ownership::Ambiguous {
                     known_session_id: Some(known),
@@ -1266,22 +1266,40 @@ mod tests {
     }
 
     #[test]
-    fn candidate_completion_defers_to_bind_session() {
+    fn first_turn_busy_root_binds_directly_and_is_death_eligible() {
+        // #609: on the pane's own per-pane endpoint the busy root IS the
+        // pane's session — no Candidate detour, first-turn deaths ring.
         let mut tracker = OpencodeActivityTracker::new();
         tracker.track_terminal("t1", None, 0);
         assert_eq!(
             tracker.note_status("t1", "ses-x", OpencodeStatus::Busy, 1, 1, 100),
             vec![upsert(rec(Some("ses-x"), 100))]
         );
-        // Candidate turn end: remove only, completion deferred.
+        assert!(
+            !tracker.blocks_death_bell("t1"),
+            "first-turn ownership is confirmed by construction (#609)"
+        );
+        // The first turn's idle edge completes IMMEDIATELY — no deferral.
         assert_eq!(
             tracker.note_session_idle("t1", "ses-x", 1, 1, 200),
-            vec![remove()]
+            vec![remove(), turn_complete("ses-x", 200, 1)]
         );
-        // The bind mints the deferred completion at the STORED idle timestamp.
+    }
+
+    #[test]
+    fn superseded_session_rebinds_directly() {
+        // A NEW root going busy on the pane's endpoint (e.g. /new in the
+        // TUI) is the pane's new session — rebind, don't candidate.
+        let mut tracker = OpencodeActivityTracker::new();
+        tracker.track_terminal("t1", Some("ses-old"), 0);
         assert_eq!(
-            tracker.bind_session("t1", "ses-x", 500),
-            vec![turn_complete("ses-x", 200, 1)]
+            tracker.note_status("t1", "ses-new", OpencodeStatus::Busy, 1, 1, 100),
+            vec![upsert(rec(Some("ses-new"), 100))]
+        );
+        assert!(!tracker.blocks_death_bell("t1"));
+        assert_eq!(
+            tracker.note_session_idle("t1", "ses-new", 1, 1, 200),
+            vec![remove(), turn_complete("ses-new", 200, 1)]
         );
     }
 
@@ -1322,25 +1340,23 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_single_foreign_busy_from_quiet_known_enters_candidate() {
+    fn snapshot_single_foreign_busy_from_quiet_known_rebinds() {
+        // #609 inversion (deliberate, not a regression): a session switch
+        // visible only in the snapshot (SSE reconnect gap) happened on the
+        // pane's OWN per-pane endpoint, so the foreign root IS the pane's
+        // new session — direct KnownBusy, no Candidate detour.
         let mut tracker = OpencodeActivityTracker::new();
         tracker.track_terminal("t1", Some("ses-r"), 0);
-        // Session switched during an SSE reconnect gap, visible only in the
-        // snapshot (Node reduceSnapshot:406-417): candidate, not silence.
         let statuses = vec![("ses-x".to_string(), OpencodeStatus::Busy)];
         assert_eq!(
             tracker.note_snapshot("t1", &statuses, 1, 1, 100),
             vec![upsert(rec(Some("ses-x"), 100))]
         );
-        // Candidate defers: the matching idle is quiet…
+        assert!(!tracker.blocks_death_bell("t1"));
+        // The subsequent idle edge mints the completion immediately.
         assert_eq!(
             tracker.note_session_idle("t1", "ses-x", 1, 1, 200),
-            vec![remove()]
-        );
-        // …and the bind mints the deferred completion.
-        assert_eq!(
-            tracker.bind_session("t1", "ses-x", 300),
-            vec![turn_complete("ses-x", 200, 1)]
+            vec![remove(), turn_complete("ses-x", 200, 1)]
         );
     }
 
@@ -1574,33 +1590,33 @@ mod tests {
     }
 
     #[test]
-    fn candidate_pause_arms_and_deferred_completion_is_swallowed_at_bind() {
+    fn first_turn_pause_arms_and_completion_is_swallowed() {
+        // #609 inversion (deliberate, not a regression): the first busy
+        // edge on the pane's own lane binds directly (KnownBusy) — the ask
+        // still arms, and the mid-pause turn end is swallowed WITHOUT any
+        // bind_session step.
         let mut tracker = OpencodeActivityTracker::new();
         tracker.track_terminal("t1", None, 0);
-        // Busy with no binding: Candidate ownership.
+        // Busy with no prior binding: KnownBusy by construction (#609).
         assert_eq!(
             tracker.note_status("t1", "ses-x", OpencodeStatus::Busy, 1, 1, 100),
             vec![upsert(rec(Some("ses-x"), 100))]
         );
-        // Candidate arming (D3): the single busy unbound session on the
-        // pane's own per-pane endpoint — first-turn asks must ring.
+        // First-turn asks ring (D3/D7 ordering unchanged).
         assert_eq!(
             tracker.note_permission_asked("t1", "ses-x", "perm-1", 150),
             vec![remove(), boundary(150)]
         );
-        // Idle edge: AwaitingAssociation with the pause claim intact (the
-        // record was already removed at the ask — no effects here).
+        // Mid-pause turn end (KnownBusy arm): the pause was the episode's
+        // bell — no effects (D3), and the pending claim clears HERE (no
+        // AwaitingAssociation continuation, no bind needed).
         assert!(tracker
             .note_session_idle("t1", "ses-x", 1, 1, 200)
             .is_empty());
-        assert!(tracker.has_pending_permissions("t1"));
-        // Bind: NO deferred TurnComplete — the pause was the episode's bell
-        // (mid-pause turn end, D3).
-        assert!(tracker.bind_session("t1", "ses-x", 300).is_empty());
         assert!(!tracker.has_pending_permissions("t1"));
         assert!(tracker.list_latest_completions().is_empty());
-        // State is Quiet{known: Some(ses-x)}: the next busy+idle turn
-        // completes normally (KnownBusy path, first ledger completion).
+        // State is Quiet{known: Some(ses-x)}: the follow-up busy+idle turn
+        // completes normally (first ledger completion, seq 1).
         tracker.note_status("t1", "ses-x", OpencodeStatus::Busy, 2, 1, 400);
         assert_eq!(
             tracker.note_session_idle("t1", "ses-x", 2, 1, 500),
@@ -1625,8 +1641,8 @@ mod tests {
             .note_permission_replied("t1", "perm-9", 185)
             .is_empty());
 
-        // Repeat under Candidate ownership (re-track with no binding; the
-        // re-track drops the restored record).
+        // Repeat from an unbound re-track (busy binds directly under #609;
+        // the re-track drops the restored record).
         assert_eq!(tracker.track_terminal("t1", None, 300), vec![remove()]);
         tracker.note_status("t1", "ses-x", OpencodeStatus::Busy, 2, 1, 310);
         tracker.note_permission_asked("t1", "ses-x", "perm-2", 320);
@@ -1655,8 +1671,9 @@ mod tests {
         assert!(tracker.list_latest_completions().is_empty());
         assert!(!tracker.has_pending_permissions("t1"));
 
-        // Repeat from Candidate ownership: the aborted candidate parks in
-        // AwaitingAssociation{aborted} with the same force-emit.
+        // Repeat from an unbound re-track: the busy edge binds directly
+        // (#609), and the aborted mid-pause turn end force-emits the same
+        // cancel from the KnownBusy arm.
         assert!(tracker.track_terminal("t1", None, 300).is_empty());
         tracker.note_status("t1", "ses-x", OpencodeStatus::Busy, 2, 1, 310);
         tracker.note_permission_asked("t1", "ses-x", "perm-2", 320);
@@ -1706,18 +1723,19 @@ mod tests {
         tracker.note_permission_replied("t1", "perm-1", 180);
         assert!(!tracker.has_pending_permissions("t1"));
 
-        // Candidate blocks — INCLUDING with a candidate-armed pause pending
-        // (D4: candidate ownership never death-rings).
+        // #609 inversion (deliberate, not a regression): an unbound pane's
+        // busy edge arrives on its OWN per-pane lane, so identity confirms
+        // by construction — KnownBusy is death-eligible, even mid-pause.
         let mut tracker = OpencodeActivityTracker::new();
         tracker.track_terminal("t1", None, 0);
         tracker.note_status("t1", "ses-x", OpencodeStatus::Busy, 1, 1, 100);
-        assert!(tracker.blocks_death_bell("t1"));
+        assert!(!tracker.blocks_death_bell("t1"));
         tracker.note_permission_asked("t1", "ses-x", "perm-1", 150);
         assert!(tracker.has_pending_permissions("t1"));
-        assert!(tracker.blocks_death_bell("t1"));
-        // The pause claim survives into AwaitingAssociation — still
-        // candidate-armed, still blocked (D4).
-        tracker.note_session_idle("t1", "ses-x", 1, 1, 200);
+        assert!(!tracker.blocks_death_bell("t1"));
+        // A second busy root demotes to Ambiguous — the pause claim
+        // survives the demotion and the state blocks again (D4).
+        tracker.note_status("t1", "ses-y", OpencodeStatus::Busy, 1, 1, 160);
         assert!(tracker.has_pending_permissions("t1"));
         assert!(tracker.blocks_death_bell("t1"));
         // Exit drops the pending set with the state (the hub reads
@@ -1753,40 +1771,6 @@ mod tests {
         assert_eq!(
             tracker.note_session_idle("t1", "ses-r", 1, 2, 200),
             vec![remove(), turn_complete("ses-r", 200, 1)]
-        );
-    }
-
-    #[test]
-    fn rejected_bind_clears_stale_pause_claim() {
-        // A candidate pause claim survives into AwaitingAssociation (D3,
-        // load-bearing for the confirm-swallow), but a REJECTED bind lands
-        // in Quiet where the claim is stale: it must not swallow the next
-        // turn's completion or leak into the death-bell predicate.
-        let mut tracker = OpencodeActivityTracker::new();
-        tracker.track_terminal("t1", Some("ses-r"), 0);
-        // Foreign busy: Candidate{ses-x, previous_known: ses-r}.
-        assert_eq!(
-            tracker.note_status("t1", "ses-x", OpencodeStatus::Busy, 1, 1, 100),
-            vec![upsert(rec(Some("ses-x"), 100))]
-        );
-        // Candidate arming, then idle: claim survives into AwaitingAssociation.
-        assert_eq!(
-            tracker.note_permission_asked("t1", "ses-x", "perm-1", 150),
-            vec![remove(), boundary(150)]
-        );
-        assert!(tracker
-            .note_session_idle("t1", "ses-x", 1, 1, 200)
-            .is_empty());
-        assert!(tracker.has_pending_permissions("t1"));
-        // REJECTED bind (different session id): Quiet{ses-r}, claim retired.
-        assert!(tracker.bind_session("t1", "ses-y", 300).is_empty());
-        assert!(!tracker.has_pending_permissions("t1"));
-        // The next same-known-session turn completes normally — no
-        // mid-pause swallow of a genuinely completed turn's bell.
-        tracker.note_status("t1", "ses-r", OpencodeStatus::Busy, 2, 1, 400);
-        assert_eq!(
-            tracker.note_session_idle("t1", "ses-r", 2, 1, 500),
-            vec![remove(), turn_complete("ses-r", 500, 1)]
         );
     }
 

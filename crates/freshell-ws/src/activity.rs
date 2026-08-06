@@ -4651,12 +4651,13 @@ mod tests {
         );
     }
 
-    /// D3 candidate arming: a first-turn ask (no resume identity, the busy
-    /// session is an unconfirmed CANDIDATE) still rings. The turn then ends
-    /// mid-pause and identity proof arrives — the DEFERRED completion is
-    /// swallowed (the pause was the episode's bell).
+    /// D3 first-turn arming (#609: the busy edge binds directly, KnownBusy):
+    /// a first-turn ask (no resume identity) rings. The turn then ends
+    /// mid-pause — the completion is swallowed at the idle edge (the pause
+    /// was the episode's bell), and a trailing locator/plugin bind stays
+    /// silent too.
     #[tokio::test(flavor = "multi_thread")]
-    async fn opencode_first_turn_permission_pause_rings_under_candidate() {
+    async fn opencode_first_turn_permission_pause_rings() {
         let (hub, mut rx) = hub();
         observer_send(
             &hub,
@@ -4714,16 +4715,17 @@ mod tests {
         assert_no_attention_frames(&mut rx, 1_500).await;
     }
 
-    /// Task 10 producer contract (D3 deferred completion): a restore-created
-    /// opencode terminal WITHOUT resume identity goes busy for `ses-x`
-    /// (unconfirmed CANDIDATE), then idle — the completion is DEFERRED
-    /// (awaitingAssociation), total silence. The identity bind arriving via
-    /// `bind_opencode_session` (the ingress Task 10's association sweep and
-    /// TUI rebind-signal producers drive) confirms ownership and releases it:
+    /// #609 inversion (deliberate, not a regression): a restore-created
+    /// opencode terminal WITHOUT resume identity goes busy for `ses-x` on
+    /// its OWN per-pane lane — identity confirms by construction
+    /// (KnownBusy), so the idle edge mints the completion IMMEDIATELY:
     /// terminal.turn.complete{provider:"opencode"} then exactly ONE
-    /// terminal.idle{reason:"grace"}.
+    /// terminal.idle{reason:"grace"}. No bind_opencode_session step — the
+    /// D3 deferred-completion contract no longer applies to lane busy
+    /// edges (`bind_opencode_session` remains for the locator/plugin
+    /// producers, covered by `bind_session`'s tracker tests).
     #[tokio::test(flavor = "multi_thread")]
-    async fn resume_created_opencode_terminal_binds_identity_via_bind_ingress() {
+    async fn restore_created_opencode_terminal_completes_first_turn_directly() {
         let (hub, mut rx) = hub();
         observer_send(
             &hub,
@@ -4749,7 +4751,7 @@ mod tests {
             v["upsert"][0]["phase"] == "busy"
         })
         .await;
-        assert!(busy.is_some(), "candidate busy upsert");
+        assert!(busy.is_some(), "first-turn busy upsert (KnownBusy, #609)");
 
         hub.note_opencode_lane_event(
             "t-oc",
@@ -4760,27 +4762,22 @@ mod tests {
                 session_id: "ses-x".into(),
             },
         );
-        // Candidate turn end: the completion must DEFER, not ring.
-        assert_no_attention_frames(&mut rx, 1_500).await;
-
-        // Identity proof (the Task 10 producers): the deferred completion
-        // releases — turn.complete first, then one idle after the grace.
-        hub.bind_opencode_session("t-oc", "ses-x");
+        // First-turn end: the completion mints immediately (#609).
         let complete = next_frame_of_type(&mut rx, "terminal.turn.complete", 1_500)
             .await
-            .expect("the bind releases the deferred completion");
+            .expect("the first turn's idle edge completes directly (#609)");
         assert_eq!(complete["terminalId"], "t-oc");
         assert_eq!(complete["provider"], "opencode");
         let idle = next_frame_of_type(&mut rx, "terminal.idle", 3_500)
             .await
-            .expect("one grace idle after the released completion");
+            .expect("one grace idle after the completion");
         assert_eq!(idle["terminalId"], "t-oc");
         assert_eq!(idle["reason"], "grace");
         assert!(
             next_frame_of_type(&mut rx, "terminal.idle", 1_500)
                 .await
                 .is_none(),
-            "exactly one terminal.idle for the released completion"
+            "exactly one terminal.idle for the completion"
         );
     }
 
@@ -4853,108 +4850,123 @@ mod tests {
         );
     }
 
-    /// D4: candidate/ambiguous ownership never death-rings — even with a
-    /// candidate-armed pause pending (residual D8(i)); an idle quiet pane is
-    /// silent; a freshell-initiated kill (spontaneous=false) is silent even
-    /// mid-turn.
+    /// #609: an opencode pane's FIRST turn is death-eligible — a busy
+    /// root on the pane's own lane confirms identity by construction.
     #[tokio::test(flavor = "multi_thread")]
-    async fn opencode_death_while_candidate_or_idle_is_silent_and_freshell_kill_is_silent() {
-        // (a) candidate busy: unconfirmed identity stays silent.
-        let (hub_a, mut rx_a) = hub();
+    async fn opencode_first_turn_spontaneous_exit_rings() {
+        let (hub, mut rx) = hub();
         observer_send(
-            &hub_a,
+            &hub,
             ActivityEvent::Created {
-                terminal_id: "t-oc".into(),
+                terminal_id: "t1".into(),
                 mode: "opencode".into(),
                 resume_session_id: None,
                 at: 1_000,
             },
         );
-        hub_a.register_opencode_lane_for_tests("t-oc", 1);
-        hub_a.note_opencode_lane_event(
-            "t-oc",
+        hub.register_opencode_lane_for_tests("t1", 1);
+        hub.note_opencode_lane_event(
+            "t1",
             1,
             1,
             1,
             OpencodeLaneEvent::Status {
-                session_id: "ses-new".into(),
+                session_id: "ses-x".into(),
                 status: OpencodeStatus::Busy,
             },
         );
-        let busy = next_frame_matching(&mut rx_a, "opencode.activity.updated", 1_500, |v| {
+        let busy = next_frame_matching(&mut rx, "opencode.activity.updated", 1_500, |v| {
             v["upsert"][0]["phase"] == "busy"
         })
         .await;
-        assert!(busy.is_some(), "candidate busy upsert");
+        assert!(busy.is_some(), "first-turn busy upsert (KnownBusy, #609)");
+
         observer_send(
-            &hub_a,
+            &hub,
             ActivityEvent::Exit {
-                terminal_id: "t-oc".into(),
+                terminal_id: "t1".into(),
                 at: now_ms(),
                 spontaneous: true,
             },
         );
-        assert!(
-            next_frame_of_type(&mut rx_a, "terminal.idle", 1_500)
+        let idle =
+            next_frame_matching(&mut rx, "terminal.idle", 1_500, |v| v["terminalId"] == "t1")
                 .await
-                .is_none(),
-            "a candidate death must stay silent (D4)"
-        );
+                .expect("first-turn death rings — identity confirmed by construction (#609)");
+        assert_eq!(idle["reason"], "grace");
+    }
 
-        // (b) candidate + candidate-armed pause pending: STILL silent
-        // (residual D8(i)); 3_500ms also proves the armed pause window died
-        // with the pane instead of ringing at the grace deadline.
-        let (hub_b, mut rx_b) = hub();
+    /// #609 inverse guard: two busy roots still demote to Ambiguous, and
+    /// Ambiguous ownership never death-rings — D4's remaining gate on the
+    /// lane path stays pinned.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opencode_ambiguous_exit_stays_silent() {
+        let (hub, mut rx) = hub();
         observer_send(
-            &hub_b,
+            &hub,
             ActivityEvent::Created {
-                terminal_id: "t-oc".into(),
+                terminal_id: "t1".into(),
                 mode: "opencode".into(),
                 resume_session_id: None,
                 at: 1_000,
             },
         );
-        hub_b.register_opencode_lane_for_tests("t-oc", 1);
-        hub_b.note_opencode_lane_event(
-            "t-oc",
+        hub.register_opencode_lane_for_tests("t1", 1);
+        hub.note_opencode_lane_event(
+            "t1",
             1,
             1,
             1,
             OpencodeLaneEvent::Status {
-                session_id: "ses-new".into(),
+                session_id: "ses-a".into(),
                 status: OpencodeStatus::Busy,
             },
         );
-        let busy = next_frame_matching(&mut rx_b, "opencode.activity.updated", 1_500, |v| {
-            v["upsert"][0]["phase"] == "busy"
-        })
-        .await;
-        assert!(busy.is_some(), "candidate busy upsert");
-        hub_b.note_opencode_lane_event(
-            "t-oc",
+        hub.note_opencode_lane_event(
+            "t1",
             1,
             1,
             1,
-            OpencodeLaneEvent::PermissionAsked {
-                session_id: "ses-new".into(),
-                permission_id: "perm-1".into(),
+            OpencodeLaneEvent::Status {
+                session_id: "ses-b".into(),
+                status: OpencodeStatus::Busy,
             },
         );
+        // The second busy root demotes the record to session-less
+        // (Ambiguous): wait for it so the Exit cannot race the demotion.
+        let demoted = next_frame_matching(&mut rx, "opencode.activity.updated", 1_500, |v| {
+            v["upsert"][0]["phase"] == "busy" && v["upsert"][0]["sessionId"].is_null()
+        })
+        .await;
+        assert!(
+            demoted.is_some(),
+            "ambiguous demotes to a session-less record"
+        );
+
         observer_send(
-            &hub_b,
+            &hub,
             ActivityEvent::Exit {
-                terminal_id: "t-oc".into(),
+                terminal_id: "t1".into(),
                 at: now_ms(),
                 spontaneous: true,
             },
         );
         assert!(
-            next_frame_of_type(&mut rx_b, "terminal.idle", 3_500)
+            next_frame_of_type(&mut rx, "terminal.idle", 300)
                 .await
                 .is_none(),
-            "a candidate-armed pause must not death-ring (residual D8(i))"
+            "an ambiguous death must stay silent (D4)"
         );
+    }
 
+    /// An idle quiet pane is silent on spontaneous exit; a
+    /// freshell-initiated kill (spontaneous=false) is silent even mid-turn.
+    /// (#609: the former candidate death-silence sections are superseded on
+    /// the lane path — `opencode_first_turn_spontaneous_exit_rings` pins the
+    /// inverted behavior; Ambiguous death-silence stays pinned by
+    /// `opencode_ambiguous_exit_stays_silent`.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opencode_death_while_idle_is_silent_and_freshell_kill_is_silent() {
         // (c) quiet idle pane: a spontaneous exit is not an attention event.
         let (hub_c, mut rx_c) = hub();
         observer_send(

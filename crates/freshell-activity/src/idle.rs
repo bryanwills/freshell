@@ -49,14 +49,21 @@
 //!    death bell — a MISSED bell (never a false ring); accepted.
 //! 5. A SENT approval request auto-resolved server-side slower than ~2s rings
 //!    once (decision 5); accepted.
-//! 6. Opencode death bells now ring on both servers, ownership-scoped:
-//!    candidate/ambiguous ownership never death-rings (the old noisy-busy-proxy
-//!    problem, now excluded by construction). Consequences kept deliberate:
-//!    first-turn deaths stay silent (candidate covers the whole first turn on
-//!    Node — even with a candidate-armed permission pause pending), and a Rust
-//!    pane whose bind producers all fail (locator ambiguity + plugin absence)
-//!    stays candidate indefinitely — candidate-armed pauses still ring there,
-//!    but completions and death bells wait for the bind.
+//!  6. (CLOSED for lane-backed panes by #609, 2026-08-06) A busy root on
+//!     the pane's own per-pane lane binds identity directly (KnownBusy) —
+//!     first-turn deaths ring and the indefinite-candidate tail cannot
+//!     form. Identity-by-construction holds because opencode v1.18.14
+//!     creates sessions only client-initiated and internal features
+//!     never mint ROOT sessions (title/summary run in-place; subagents
+//!     are CHILDREN carrying parentID — child filtering in root
+//!     resolution stays load-bearing). D4 unchanged:
+//!     Candidate/Ambiguous/AwaitingAssociation still never death-ring.
+//!     Residuals (adjudicated): externally-attached panes on a SHARED
+//!     opencode endpoint have no lane and keep conservative silence;
+//!     and `opencode run --attach http://127.0.0.1:<port>` against a
+//!     pane's port can DELIBERATELY mint foreign busy roots — named,
+//!     accepted (it requires local intent, and two busy roots still
+//!     demote to Ambiguous, which stays honest-blue and death-silent).
 //! 7. Unmanaged/PTY-only codex has no approval signal — documented limitation.
 //! 8. Opencode: an SSE reconnect during a permission pause loses the pending
 //!    pause bell (the busy snapshot clears it; GET /permission resync is a
