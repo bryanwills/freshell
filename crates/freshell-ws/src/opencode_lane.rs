@@ -273,8 +273,9 @@ impl Lane {
                                     );
                                 }
                                 last_verified_busy = Some(busy);
+                                // A failed probe is not an observation: the counter carries across it.
+                                recognized_since_verify = 0;
                             }
-                            recognized_since_verify = 0;
                         }
                     }
                 }
