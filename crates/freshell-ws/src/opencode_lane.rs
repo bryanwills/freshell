@@ -497,11 +497,32 @@ pub(crate) fn translate_serve_event(event: &ParsedServeEvent) -> Option<Opencode
                 .unwrap_or("UnknownError")
                 .to_string(),
         }),
-        "permission.asked" => Some(OpencodeLaneEvent::PermissionAsked {
-            session_id: props.get("sessionID")?.as_str()?.to_string(),
-            permission_id: props.get("id")?.as_str()?.to_string(),
-        }),
-        "permission.replied" => Some(OpencodeLaneEvent::PermissionReplied {
+        // #604: v1 + v2 + question families all feed the SAME two lane
+        // events (one reducer, many spellings). Source-verified against
+        // opencode v1.18.14: TUI-driven turns emit the V1 names
+        // (permission.asked / question.asked / question.replied /
+        // question.rejected); the v2 names fire only via the /api/*
+        // routes and are forward-compat here. v2 renames payload fields
+        // freshell doesn't read (permission→action, patterns→resources,
+        // always→save, tool→source) and keeps id/sessionID; question ids
+        // (^que) can't collide with permission ids (^per), so questions
+        // reuse the permission pause machinery unchanged.
+        // question.rejected ends the pause exactly like a reply. NO
+        // permission.*.rejected type exists: permission rejection is a
+        // *.replied with reply:"reject", which this arm already drains
+        // (the reply value is deliberately not inspected).
+        "permission.asked" | "permission.v2.asked" | "question.asked" | "question.v2.asked" => {
+            Some(OpencodeLaneEvent::PermissionAsked {
+                session_id: props.get("sessionID")?.as_str()?.to_string(),
+                permission_id: props.get("id")?.as_str()?.to_string(),
+            })
+        }
+        "permission.replied"
+        | "permission.v2.replied"
+        | "question.replied"
+        | "question.v2.replied"
+        | "question.rejected"
+        | "question.v2.rejected" => Some(OpencodeLaneEvent::PermissionReplied {
             permission_id: props.get("requestID")?.as_str()?.to_string(),
         }),
         "message.updated" => {
@@ -974,6 +995,26 @@ mod tests {
             json!({"type":"message.updated","properties":{"sessionID":"ses-1","info":{"sessionID":"ses-1"}}}),
             json!({"type":"message.part.delta","properties":{"part":{"sessionID":"ses-1"},"delta":"hi"}}),
             json!({"type":"session.diff","properties":{"sessionID":"ses-1","diff":[]}}),
+            // #604: v1 + v2 + question families — source-verified against
+            // opencode v1.18.14 (2026-08-06). TUI-driven turns emit the
+            // V1 names (the TUI's own pause footer matches them); the v2
+            // names fire only via the /api/* routes and are covered as
+            // forward-compat. The /event stream applies NO type
+            // transform, so whichever family the driving surface uses
+            // arrives raw.
+            json!({"type":"permission.v2.asked","properties":{"sessionID":"ses-1","id":"per-2","action":"bash","resources":["*"]}}),
+            json!({"type":"permission.v2.replied","properties":{"sessionID":"ses-1","requestID":"per-2","reply":"once"}}),
+            json!({"type":"question.asked","properties":{"sessionID":"ses-1","id":"que-1","questions":[{"question":"Proceed?","header":"Confirm","options":[]}]}}),
+            json!({"type":"question.replied","properties":{"sessionID":"ses-1","requestID":"que-1","answers":[["yes"]]}}),
+            json!({"type":"question.v2.asked","properties":{"sessionID":"ses-1","id":"que-2","questions":[{"question":"Proceed?","header":"Confirm","options":[]}]}}),
+            json!({"type":"question.v2.rejected","properties":{"sessionID":"ses-1","requestID":"que-2"}}),
+            json!({"type":"question.rejected","properties":{"sessionID":"ses-1","requestID":"que-1"}}),
+            json!({"type":"question.v2.replied","properties":{"sessionID":"ses-1","requestID":"que-2","answers":[[]]}}),
+            // There is NO permission.rejected / permission.v2.rejected
+            // event type (v1/permission.ts:68, schema/permission.ts:52):
+            // permission rejection IS a replied with reply:"reject" —
+            // pinned so nobody ever "adds" a rejected row and waits on it.
+            json!({"type":"permission.replied","properties":{"sessionID":"ses-1","requestID":"per-1","reply":"reject"}}),
         ];
         let stream: String = frames.iter().map(|f| format!("data: {f}\n\n")).collect();
         let mut decoder = SseDecoder::new();
@@ -1072,6 +1113,67 @@ mod tests {
             "message.part.delta is activity-irrelevant"
         );
         assert_eq!(translated[13], None, "session.diff is activity-irrelevant");
+        assert_eq!(
+            translated[14],
+            Some(OpencodeLaneEvent::PermissionAsked {
+                session_id: "ses-1".to_string(),
+                permission_id: "per-2".to_string(),
+            }),
+            "permission.v2.asked keeps id/sessionID — one reducer, two families"
+        );
+        assert_eq!(
+            translated[15],
+            Some(OpencodeLaneEvent::PermissionReplied {
+                permission_id: "per-2".to_string(),
+            })
+        );
+        assert_eq!(
+            translated[16],
+            Some(OpencodeLaneEvent::PermissionAsked {
+                session_id: "ses-1".to_string(),
+                permission_id: "que-1".to_string(),
+            }),
+            "question.asked is a blocker identically to permission.asked (opencode's own TUI treats it so)"
+        );
+        assert_eq!(
+            translated[17],
+            Some(OpencodeLaneEvent::PermissionReplied {
+                permission_id: "que-1".to_string(),
+            })
+        );
+        assert_eq!(
+            translated[18],
+            Some(OpencodeLaneEvent::PermissionAsked {
+                session_id: "ses-1".to_string(),
+                permission_id: "que-2".to_string(),
+            })
+        );
+        assert_eq!(
+            translated[19],
+            Some(OpencodeLaneEvent::PermissionReplied {
+                permission_id: "que-2".to_string(),
+            }),
+            "a rejected question ends the pause exactly like a reply"
+        );
+        assert_eq!(
+            translated[20],
+            Some(OpencodeLaneEvent::PermissionReplied {
+                permission_id: "que-1".to_string(),
+            })
+        );
+        assert_eq!(
+            translated[21],
+            Some(OpencodeLaneEvent::PermissionReplied {
+                permission_id: "que-2".to_string(),
+            })
+        );
+        assert_eq!(
+            translated[22],
+            Some(OpencodeLaneEvent::PermissionReplied {
+                permission_id: "per-1".to_string(),
+            }),
+            "rejection IS a replied with reply:\"reject\" — no permission.*.rejected type exists (source-verified v1.18.14); the drain must not wait for one"
+        );
     }
 
     /// Pure prefix check against `TESTED_OPENCODE_VERSION_RANGE`: "1.18.11"

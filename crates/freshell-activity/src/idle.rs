@@ -65,13 +65,18 @@
 //!    lane's HTTP root resolver (GET /session/{id} exposes parentID); only
 //!    resolver FAILURE degrades to ambiguous (conservative silence), retried
 //!    on the next occurrence.
-//! 9. Opencode protocol drift: permission.v2.* / question.* event families
-//!    (schema-declared, unobserved on 1.18.11) are unhandled — the pause bell
-//!    goes deaf if a future server switches families. session.idle is already
-//!    deprecated upstream and a v1->v2 event/health migration is in progress;
-//!    the log-once version gate (Rust lane + Node tracker) converts silent
-//!    drift into a logged warning, and /session/status absence==idle is
-//!    version-derived behavior (1.18.x).
+//! 9. (RE-SCOPED by #604, 2026-08-06) permission.* and question.*
+//!    families (v1 AND v2) are translated onto the same pause
+//!    machinery, source-verified against opencode v1.18.14: TUI-driven
+//!    turns emit the V1 names; v2 names fire only via /api/* routes
+//!    (kept as forward-compat). Permission rejection has NO event type
+//!    of its own — it arrives as *.replied with reply:"reject", which
+//!    the replied translation drains. Residual: a FUTURE
+//!    never-before-seen event family cannot be handled in advance —
+//!    mitigated by the snapshot poll (turn lights stay correct
+//!    regardless of stream vocabulary, #603) and the loud drift
+//!    detector (#604); bells for a brand-new family stay deaf until
+//!    vocabulary is updated (adjudicated: acceptable).
 //! 10. Opencode abort window W1: an abort landing between the prompt loop-top
 //!     and processor.create emits NO abort evidence at all before idle — a
 //!     ms-scale window where a completion bell can ring on a human abort
