@@ -102,6 +102,11 @@ fn server_info_body(state: &DiagState) -> Value {
         // mechanism these two functions read back via `option_env!`.
         "commit": build_commit(),
         "buildDirty": build_dirty(),
+        // #604: drift contradictions detected by the opencode lane since
+        // boot (additive diagnostics field, never replacing an existing
+        // one — same rule as commit/buildDirty).
+        "opencodeDriftEvents": freshell_ws::opencode_lane::OPENCODE_DRIFT_EVENTS
+            .load(std::sync::atomic::Ordering::SeqCst),
     })
 }
 
@@ -414,7 +419,9 @@ mod tests {
         );
 
         assert!(
-            body.get("opencodeDriftEvents").and_then(|v| v.as_u64()).is_some(),
+            body.get("opencodeDriftEvents")
+                .and_then(|v| v.as_u64())
+                .is_some(),
             "server-info surfaces the opencode drift counter (#604)"
         );
 

@@ -24,6 +24,7 @@
 //! live at the bottom (wired at boot by Task 10).
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -167,6 +168,10 @@ impl Lane {
                 //    first raw server.connected frame); frames decoded past
                 //    the ack are buffered inside `conn`, never dropped.
                 stream += 1;
+                // #604 rule (a): drift bookkeeping is per stream (declared
+                // where `stream += 1` happens, so every stream starts fresh).
+                let mut recognized_since_verify: u64 = 0;
+                let mut drift_logged_this_stream = false;
                 let url = format!("{}/event", self.base_url);
                 let conn = match self.deps.events.connect(&url).await {
                     Ok(conn) => conn,
@@ -203,6 +208,11 @@ impl Lane {
                     self.resolve_root(cycle, stream, session_id, &mut known_sessions)
                         .await;
                 }
+                // #604 rule (a): the CONNECT snapshot seeds the first REST
+                // observation for the drift detector (computed before the
+                // statuses are moved into the note).
+                let mut last_verified_busy =
+                    Some(statuses.iter().any(|(_, s)| *s != OpencodeStatus::Idle));
                 self.note(cycle, stream, OpencodeLaneEvent::Snapshot { statuses });
 
                 // 4. drive + pump (channel seam — per-event handling must
@@ -217,6 +227,9 @@ impl Lane {
                             let Some(event) = translate_serve_event(&parsed) else {
                                 continue;
                             };
+                            // #604 rule (a): count recognized stream events
+                            // between consecutive REST observations.
+                            recognized_since_verify += 1;
                             match &event {
                                 OpencodeLaneEvent::SessionCreated {
                                     session_id,
@@ -242,7 +255,26 @@ impl Lane {
                             self.note(cycle, stream, event);
                         }
                         Some(()) = verify_rx.recv() => {
-                            self.verify(cycle, stream, &mut known_sessions).await;
+                            let busy = self
+                                .verify(cycle, stream, &mut known_sessions)
+                                .await;
+                            if let Some(busy) = busy {
+                                if drift_contradiction(
+                                    last_verified_busy,
+                                    busy,
+                                    recognized_since_verify,
+                                ) && !drift_logged_this_stream
+                                {
+                                    drift_logged_this_stream = true;
+                                    OPENCODE_DRIFT_EVENTS.fetch_add(1, AtomicOrdering::SeqCst);
+                                    tracing::error!(
+                                        terminal_id = %self.terminal_id,
+                                        "opencode stream vocabulary drift: /session/status TRANSITIONED between consecutive observations with ZERO recognized stream events in between; turn lights remain snapshot-driven (#604 rule (a))"
+                                    );
+                                }
+                                last_verified_busy = Some(busy);
+                            }
+                            recognized_since_verify = 0;
                         }
                     }
                 }
@@ -266,7 +298,11 @@ impl Lane {
                 tokio::select! {
                     _ = &mut sleep => break,
                     Some(()) = verify_rx.recv() => {
-                        self.verify(cycle, stream, &mut known_sessions).await;
+                        // No drift bookkeeping between cycles: there is no
+                        // healthy connected stream to contradict, so a
+                        // transition observed across a disconnect is
+                        // expected, not drift (#604 rule (a)).
+                        let _ = self.verify(cycle, stream, &mut known_sessions).await;
                     }
                 }
             }
@@ -311,17 +347,28 @@ impl Lane {
     /// tracker's stream guards accept it. A probe failure is noted as
     /// SnapshotFailed (crash semantics downstream) — NEVER as an empty
     /// (idle-shaped) snapshot.
-    async fn verify(&self, cycle: u64, stream: u64, known_sessions: &mut HashSet<String>) {
+    /// Returns `Some(busy)` — any busy/retry entry — on a successful
+    /// snapshot; `None` on probe failure (a failed probe is NOT an
+    /// observation for the #604 drift detector).
+    async fn verify(
+        &self,
+        cycle: u64,
+        stream: u64,
+        known_sessions: &mut HashSet<String>,
+    ) -> Option<bool> {
         match self.fetch_snapshot().await {
             Ok(statuses) => {
+                let busy = statuses.iter().any(|(_, s)| *s != OpencodeStatus::Idle);
                 for (session_id, _) in &statuses {
                     self.resolve_root(cycle, stream, session_id, known_sessions)
                         .await;
                 }
                 self.note(cycle, stream, OpencodeLaneEvent::Snapshot { statuses });
+                Some(busy)
             }
             Err(error) => {
                 self.note(cycle, stream, OpencodeLaneEvent::SnapshotFailed { error });
+                None
             }
         }
     }
@@ -548,6 +595,47 @@ pub(crate) fn translate_serve_event(event: &ParsedServeEvent) -> Option<Opencode
         // plugin.added, ... are activity-irrelevant.
         _ => None,
     }
+}
+
+/// #604: count of detected stream-vocabulary drift contradictions since
+/// boot (REST-observed status transition with no recognized stream
+/// counterpart, or a pending ask listed by /permission|/question that
+/// never appeared as an *.asked stream event). Read by
+/// GET /api/server-info.
+pub static OPENCODE_DRIFT_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+/// #604 drift rule (a) — transition contradiction. SessionStatus.set
+/// publishes session.status/session.idle UNCONDITIONALLY on every
+/// transition (opencode v1.18.14 status.ts:41-43), so a transition seen
+/// by diffing two consecutive REST observations on a healthy stream
+/// with zero recognized events in between is machine-proof of drift.
+/// Steady state across a silent window (e.g. one long tool call that
+/// publishes only message.part.updated, which translates to None) is
+/// NOT drift — the falsified draft rule is deliberately not built.
+pub fn drift_contradiction(
+    previous_busy: Option<bool>,
+    busy_in_snapshot: bool,
+    recognized_since_verify: u64,
+) -> bool {
+    match previous_busy {
+        Some(previous) => previous != busy_in_snapshot && recognized_since_verify == 0,
+        None => false, // first observation on this stream: nothing to diff
+    }
+}
+
+/// #604 drift rule (b) — asked-listing contradiction predicate: pending
+/// ask ids fetched from GET /permission + GET /question that were never
+/// seen as an *.asked stream event nor replayed at connect. Wired by
+/// Task 8's mid-stream pending resync (which owns the fetches).
+pub fn unseen_pending_asks(
+    listed: &[(String, String)],
+    known: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    listed
+        .iter()
+        .filter(|(_, id)| !known.contains(id))
+        .map(|(_, id)| id.clone())
+        .collect()
 }
 
 // ── production impls (reqwest; wired at boot by Task 10) ────────────────────
@@ -1749,7 +1837,10 @@ mod tests {
             ("ses-1".to_string(), "per-1".to_string()),
             ("ses-1".to_string(), "que-9".to_string()),
         ];
-        assert_eq!(unseen_pending_asks(&listed, &known), vec!["que-9".to_string()]);
+        assert_eq!(
+            unseen_pending_asks(&listed, &known),
+            vec!["que-9".to_string()]
+        );
         known.insert("que-9".to_string());
         assert!(unseen_pending_asks(&listed, &known).is_empty());
         assert!(unseen_pending_asks(&[], &known).is_empty());
