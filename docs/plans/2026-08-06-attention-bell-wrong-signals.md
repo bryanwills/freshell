@@ -16,11 +16,19 @@ correct in-repo template is the codex deadman self-heal
 (`crates/freshell-activity/src/codex.rs:44-56`): on uncertainty, emit
 `TrackerEffect::ForceRead`, STAY busy, and let a truth-source read decide.
 Truth sources: opencode `GET /session/status` (via the per-pane SSE lane),
-the claude session JSONL under `~/.claude/projects` (spike-verified on
-claude-code 2.1.223: turn-start = `user` record with `promptSource`;
-turn-end = `system`/`turn_duration` record), the amplifier `events.jsonl`
-tail, and — for death bells — freshell's own PTY input stream (quit-intent
-detection). When a verify probe itself FAILS, the owner ruling applies:
+the claude session JSONL under `~/.claude/projects` (corpus-validated
+2026-08-06 against claude-code 2.1.223, 1561 files / 240k records:
+turn-start `user` records with `promptSource` exist for typed/queued
+turns BUT slash-command turns can run with ZERO `promptSource` records,
+so submit confirmation accepts ANY appended transcript activity;
+turn-end = `system`/`turn_duration` — which never under-fires on
+completed cli turns (918/938 segments, 0 real under-fires) but is NOT
+always last: hook/slash continuations legitimately append user/assistant
+records AFTER it, and the interrupt marker's `message.content` is
+ARRAY-wrapped — Task 9 bakes in the corrected classification), the
+amplifier `events.jsonl` tail, and — for death bells — freshell's own
+PTY input stream (quit-intent detection, tapped at
+`crates/freshell-terminal/src/registry.rs:1338`). When a verify probe itself FAILS, the owner ruling applies:
 clear busy AND fire the attention/death engagement signal (never hold
 silently, never invent an "unknown" state).
 
@@ -59,7 +67,9 @@ include this section.
      (/quit, /exit, Ctrl+D, Ctrl+C) must NOT ring it."
   7. "#611: bounded submit-grace gate acceptable ONLY if the claude-JSONL
      truth-source spike fails; prefer the verify-backed approach." (The
-     spike SUCCEEDED — see Task 9 — so the verify-backed approach is used.)
+     spike SUCCEEDED and its claims were corpus-validated 2026-08-06
+     against 1561 files / 240k records — with corrections baked into
+     Task 9 — so the verify-backed approach is used.)
 - **Strict red-green-refactor TDD** (AGENTS.md): write the failing test
   first, run it to see it fail, implement minimally, run it to see it pass,
   commit. Never weaken an assertion to make a test pass without a stated
@@ -91,7 +101,13 @@ include this section.
   boundary re-arms grace-only; this ordering is the existing D7 contract in
   `opencode_frames`, `activity.rs:1719-1722`) plus an `error!`-level
   tracing log. With no busy record and no pending pauses, a probe failure
-  emits nothing (there is no light to correct).
+  emits nothing (there is no light to correct). The effect ORDER is
+  load-bearing and pinned, not stylistic: run-validated against the real
+  `IdleGate` (2026-08-06) — a boundary delivered BEFORE the
+  `Changed` remove/upsert never fires the gate. `Changed` MUST precede
+  `AttentionBoundary` within an effect vector; every new test in this plan
+  that inspects crash-semantics effects asserts the boundary is LAST, and
+  that assertion is a contract.
 - **Rust file paths** are relative to the worktree root. Line numbers cited
   are against `main` @ `bbf3bad96` and drift as tasks land — anchor by the
   quoted code, not the number.
@@ -113,8 +129,8 @@ Files created:
 - `crates/freshell-ws/src/claude_truth.rs` — claude session-JSONL truth
   source: trait `ClaudeTruth` + production `FsClaudeTruth` + probe types.
   One responsibility: answer "is this claude session's turn in flight,
-  ended, or unknowable?" and "did a turn start after byte offset N?" from
-  disk. (Task 9)
+  ended, or unknowable?" and "did the agent append transcript activity
+  after byte offset N?" from disk. (Task 9)
 - `scripts/build-stamp-check.sh` — scripted integration check for the
   build.rs commit stamp (throwaway git repo; proves the packed-ref →
   loose-ref transition restamps). (Task 15)
@@ -130,8 +146,9 @@ Files modified (responsibility of each change):
   (hub → lane), `verify()` re-fetch of `/session/status` stamped with the
   CURRENT cycle/stream, `SnapshotFailed` on probe failure, snapshot
   parse-hardening (unknown status ⇒ Busy, shape break ⇒ failure), v2 +
-  question event vocabulary, drift contradiction detector, `GET
-  /permission` resync on connect. (Tasks 2, 3, 4, 5, 8)
+  question event vocabulary (both families), transition-contradiction
+  drift detector, `GET /permission` + `GET /question` resync with
+  stale-pause reconciliation. (Tasks 2, 3, 4, 5, 8)
 - `crates/freshell-ws/src/activity.rs` — `opencode_frames`/`claude_frames`
   return force-reads; hub services opencode verifies via the lane channel
   and claude verifies via `ClaudeTruth`; `SnapshotFailed` intake arm;
@@ -142,6 +159,11 @@ Files modified (responsibility of each change):
   verify-then-decide; `note_verified_busy` / `note_verified_ended` /
   `note_verify_failed`; provisional submit-grace with probe-backed
   confirmation; `set_busy_deadman_ms` test hook. (Tasks 10, 11)
+- `crates/freshell-ws/src/claude_signal.rs` — the SessionStart rebind
+  apply path also binds the activity tracker via
+  `ActivityHub::bind_claude_session` (today it stops at
+  `registry.set_meta`, so the tracker probes a stale session after an
+  in-TUI /resume or /clear). (Task 10)
 - `crates/freshell-activity/src/amplifier/tracker.rs` — confirmed-busy
   signal loss keeps busy + `ForceRead`; `note_verify_failed` (crash
   semantics). (Task 12)
@@ -154,7 +176,8 @@ Files modified (responsibility of each change):
   (Task 15)
 - `crates/freshell-server/src/main.rs` + `crates/freshell-server/src/diag.rs`
   — self-identifying boot line (timestamp + pid + commit + dirty);
-  `opencodeDriftEvents` on `/api/server-info`. (Tasks 5, 15)
+  `opencodeDriftEvents` and `claudeTruthAnomalies` on
+  `/api/server-info`. (Tasks 5, 10, 15)
 
 Key existing types the tasks build on (defined in
 `crates/freshell-activity/src/lib.rs:41-57`, shared by all trackers):
@@ -178,9 +201,9 @@ pub enum TrackerEffect<R> {
 | #604 opencode event drift | 3, 4, 5 | snapshot poll is the safety net + shape-tolerant vocabulary + loud drift detector |
 | #609 opencode first-turn / never-bound | 6 | per-pane endpoint busy-root evidence binds directly |
 | #610 opencode ambiguous quiet drain | 7 | verify snapshot collapses to one root → re-promote |
-| #608 opencode permission resync | 8 | GET /permission on connect + pause survives busy snapshots |
+| #608 opencode permission resync | 8 | GET /permission + GET /question resync + reconciliation + pause survives busy snapshots |
 | #606 claude output deadman | 9, 10 | session JSONL tail (turn_duration / interrupt marker) |
-| #611 claude stray Enter | 9, 11 | session JSONL offset probe (turn-start user record) |
+| #611 claude stray Enter | 9, 11 | session JSONL offset probe (appended transcript activity) |
 | #605 amplifier signal loss / give-up | 12 | events.jsonl force-read + capped-repeat retry + crash semantics |
 | #612 death bell on human quit | 13 | freshell-owned PTY input stream (quit-intent marker) |
 | #607 codex unmanaged approval | 14 | documentation of owner ruling (no code behavior change) |
@@ -314,6 +337,14 @@ Replace `expire` (`opencode.rs:617-628`) with:
     /// probe failure → [`Self::note_verify_failed`]). `last_observed_at`
     /// re-arms here so a wedged verify cannot hot-loop (the codex
     /// anchor-disarm lesson, codex.rs:49-53).
+    ///
+    /// Turn-start gap note (source-verified opencode v1.18.14): the serve
+    /// registers busy only at runLoop start (prompt.ts:1089), a beat
+    /// after prompt accept — but a LIT pane cannot false-green from that
+    /// gap: lighting this record required a busy publish, which implies
+    /// status-map membership, and removal from the map implies an idle
+    /// publish (the turn truly ended). Empty snapshot ⇒
+    /// clear-with-completion is therefore sound for lit panes.
     pub fn expire(&mut self, at: i64) -> Vec<OpencodeEffect> {
         let mut effects = Vec::new();
         for state in self.states.values_mut() {
@@ -772,7 +803,7 @@ git commit -m "fix(opencode): hub+lane service deadman verify via /session/statu
 **Interfaces:**
 - Consumes: Task 2's `OpencodeLaneEvent::SnapshotFailed` and hub intake arm.
 - Produces: hardened `fetch_snapshot` semantics relied on by every later snapshot consumer:
-  - entry with a RECOGNIZED `status.type` (`busy`/`retry`/`idle`) → as today;
+  - entry with a RECOGNIZED `status.type` (`busy`/`retry`/`idle`) → as today; NAMED explicitly: `retry` maps to `OpencodeStatus::Retry`, which is Busy everywhere in the tracker (D6, `opencode.rs:38-42` and the `Busy | Retry` reduce arm at `:406`) — a retrying turn keeps its light, and the test below pins the row so it can never silently drift toward idle;
   - entry with an UNRECOGNIZED-but-present `status.type` string → `OpencodeStatus::Busy` (conservative-toward-busy, matching the stream translation's `_ => Busy`) + one `warn!` naming the unknown vocabulary;
   - entry whose value is not an object or has no string `type` → `Err(…)` (shape break — the endpoint contract itself drifted);
   - non-200 / non-object body / transport error → `Err(…)` (unchanged).
@@ -791,9 +822,12 @@ In `opencode_lane.rs` tests:
         // Build a Lane directly (same pattern as the other lane tests) with
         // a responder returning, on successive /session/status calls:
         //   1) {"ses-1": {"type": "hyperbusy"}}   → Busy + warn
-        //   2) {"ses-1": 42}                       → Err (shape break)
-        // Drive via two verify requests after connect; assert ingress:
-        //   Snapshot{[("ses-1", Busy)]}, then SnapshotFailed{..}.
+        //   2) {"ses-1": {"type": "retry"}}        → Retry (Busy everywhere,
+        //      D6 — named so the retrying-turn light can never drift idle)
+        //   3) {"ses-1": 42}                       → Err (shape break)
+        // Drive via three verify requests after connect; assert ingress:
+        //   Snapshot{[("ses-1", Busy)]}, Snapshot{[("ses-1", Retry)]},
+        //   then SnapshotFailed{..}.
         …
     }
 ```
@@ -801,7 +835,9 @@ In `opencode_lane.rs` tests:
 Write it concretely by copying `verify_request_refetches_snapshot_with_current_stamps`
 (Task 2) and swapping the responder bodies and assertions:
 first verify → `OpencodeLaneEvent::Snapshot { statuses: vec![("ses-1".into(), OpencodeStatus::Busy)] }`;
-second verify → `SnapshotFailed { error }` with `error.contains("not an object")`
+second verify → `OpencodeLaneEvent::Snapshot { statuses: vec![("ses-1".into(), OpencodeStatus::Retry)] }`
+(assertion message: `"retry is Busy everywhere (D6): the light stays on"`);
+third verify → `SnapshotFailed { error }` with `error.contains("not an object")`
 (exact message from Step 3 below). Also add a connect-time test:
 
 ```rust
@@ -819,6 +855,8 @@ stream script; assert the FIRST ingress entry is `SnapshotFailed`).
 Run: `cargo test -p freshell-ws snapshot_unknown_vocabulary connect_snapshot_failure`
 Expected: FAIL — today an unknown `status.type` is skipped (test sees an
 EMPTY snapshot, not Busy) and a connect snapshot failure notes nothing.
+(The `retry` row may already pass — it is a deliberate named pin, not a
+red assertion.)
 
 - [ ] **Step 3: Implement**
 
@@ -903,23 +941,26 @@ git commit -m "fix(opencode): snapshot parse trouble degrades toward busy or fai
 - Modify: `crates/freshell-activity/src/idle.rs` (Accepted Residuals entry 9, ~:68-74)
 
 **Interfaces:**
-- Consumes: spike-verified opencode 1.18.14 schemas (from the live OpenAPI doc): BOTH v1 and v2 event families coexist in the `Event` union; `/event` applies NO type downgrade (whichever type the bus publishes arrives raw). Payload facts: `permission.v2.asked` keeps `id`/`sessionID` (renames only `permission→action`, `patterns→resources`, `always→save`, `tool→source` — none of which freshell reads); `permission.v2.replied` is field-identical to v1 (`sessionID`, `requestID`, `reply`); `question.asked`/`question.v2.asked` carry `id` (pattern `^que`), `sessionID`, `questions`; `question.replied`/`.v2.replied` carry `requestID`; `question.rejected`/`.v2.rejected` carry `requestID`. Question ids (`^que`) and permission ids (`^per`) cannot collide, so questions reuse the permission pause machinery unchanged.
-- Produces: `translate_serve_event` rows mapping all of the following onto the EXISTING `OpencodeLaneEvent` variants (reducer untouched):
-  - `permission.v2.asked` → `PermissionAsked`
-  - `permission.v2.replied` → `PermissionReplied`
+- Consumes: source-validated opencode v1.18.14 behavior (emission-site source at the tag, verified 2026-08-06): the serve process ships TWO parallel permission/question pipelines. TUI-driven turns emit the V1 families — `permission.asked`, `permission.replied`, `question.asked`, `question.replied`, `question.rejected` (the opencode TUI's own pause footer matches exactly these names, `stream.transport.ts:151-153`); the v2 names (`permission.v2.asked`, …) fire ONLY for turns driven via the `/api/*` routes — they are included here as forward-compat, not as the live family. `/event` applies NO type transform (`handlers/event.ts:40` maps type verbatim). Payload facts: `permission.v2.asked` keeps `id`/`sessionID` (renames only `permission→action`, `patterns→resources`, `always→save`, `tool→source` — none of which freshell reads); `permission.v2.replied` is field-identical to v1 (`sessionID`, `requestID`, `reply`); `question.asked`/`question.v2.asked` carry `id` (pattern `^que`), `sessionID`, `questions`; `question.replied`/`.v2.replied` and `question.rejected`/`.v2.rejected` carry `requestID`. There is NO `permission.rejected` / `permission.v2.rejected` event type at all (`v1/permission.ts:68`, `schema/permission.ts:52` — `Event = {Asked, Replied}` only): permission REJECTION arrives as `*.replied` with `reply:"reject"`, so the replied translation IS the rejection drain — never wait for a rejected type. Question ids (`^que`) and permission ids (`^per`) cannot collide, so questions reuse the permission pause machinery unchanged.
+- Produces: `translate_serve_event` rows mapping all of the following onto the EXISTING `OpencodeLaneEvent` variants (reducer untouched; the replied mapping is reply-value-agnostic, so `reply:"reject"` drains identically):
+  - `permission.v2.asked` → `PermissionAsked` (v1 `permission.asked` already maps — both families covered)
+  - `permission.v2.replied` → `PermissionReplied` (any `reply` value, including `"reject"`)
   - `question.asked`, `question.v2.asked` → `PermissionAsked`
   - `question.replied`, `question.v2.replied`, `question.rejected`, `question.v2.rejected` → `PermissionReplied`
 
 - [ ] **Step 1: Add failing rows to the table-driven test**
 
 In `translate_covers_the_attention_vocabulary` (~:890), append to the
-`frames` array (indexes 14-21):
+`frames` array (indexes 14-22):
 
 ```rust
-            // #604: v2 + question families — schema-verified against the
-            // installed opencode 1.18.14 OpenAPI (spike 2026-08-06). The
-            // /event stream applies NO type downgrade, so both families
-            // can arrive raw.
+            // #604: v1 + v2 + question families — source-verified against
+            // opencode v1.18.14 (2026-08-06). TUI-driven turns emit the
+            // V1 names (the TUI's own pause footer matches them); the v2
+            // names fire only via the /api/* routes and are covered as
+            // forward-compat. The /event stream applies NO type
+            // transform, so whichever family the driving surface uses
+            // arrives raw.
             json!({"type":"permission.v2.asked","properties":{"sessionID":"ses-1","id":"per-2","action":"bash","resources":["*"]}}),
             json!({"type":"permission.v2.replied","properties":{"sessionID":"ses-1","requestID":"per-2","reply":"once"}}),
             json!({"type":"question.asked","properties":{"sessionID":"ses-1","id":"que-1","questions":[{"question":"Proceed?","header":"Confirm","options":[]}]}}),
@@ -928,6 +969,11 @@ In `translate_covers_the_attention_vocabulary` (~:890), append to the
             json!({"type":"question.v2.rejected","properties":{"sessionID":"ses-1","requestID":"que-2"}}),
             json!({"type":"question.rejected","properties":{"sessionID":"ses-1","requestID":"que-1"}}),
             json!({"type":"question.v2.replied","properties":{"sessionID":"ses-1","requestID":"que-2","answers":[[]]}}),
+            // There is NO permission.rejected / permission.v2.rejected
+            // event type (v1/permission.ts:68, schema/permission.ts:52):
+            // permission rejection IS a replied with reply:"reject" —
+            // pinned so nobody ever "adds" a rejected row and waits on it.
+            json!({"type":"permission.replied","properties":{"sessionID":"ses-1","requestID":"per-1","reply":"reject"}}),
 ```
 
 and the matching positional assertions:
@@ -987,6 +1033,13 @@ and the matching positional assertions:
                 permission_id: "que-2".to_string(),
             })
         );
+        assert_eq!(
+            translated[22],
+            Some(OpencodeLaneEvent::PermissionReplied {
+                permission_id: "per-1".to_string(),
+            }),
+            "rejection IS a replied with reply:\"reject\" — no permission.*.rejected type exists (source-verified v1.18.14); the drain must not wait for one"
+        );
 ```
 
 (Also bump the `assert_eq!(events.len(), frames.len(), …)` expectation —
@@ -995,7 +1048,9 @@ it derives from `frames.len()`, so no literal changes.)
 - [ ] **Step 2: Run to verify failure**
 
 Run: `cargo test -p freshell-ws translate_covers_the_attention_vocabulary`
-Expected: FAIL — indexes 14-21 currently translate to `None`.
+Expected: FAIL — indexes 14-21 currently translate to `None`. (Index 22
+already passes — the existing v1 `permission.replied` arm ignores the
+`reply` value; it is a deliberate pin of the no-rejected-type fact.)
 
 - [ ] **Step 3: Implement**
 
@@ -1005,13 +1060,19 @@ match arms):
 
 ```rust
         // #604: v1 + v2 + question families all feed the SAME two lane
-        // events (one reducer, many spellings). Verified against opencode
-        // 1.18.14's OpenAPI: v2 renames payload fields freshell doesn't
-        // read (permission→action, patterns→resources, always→save,
-        // tool→source) and keeps id/sessionID; question ids (^que) can't
-        // collide with permission ids (^per), so questions reuse the
-        // permission pause machinery unchanged. question.rejected ends
-        // the pause exactly like a reply.
+        // events (one reducer, many spellings). Source-verified against
+        // opencode v1.18.14: TUI-driven turns emit the V1 names
+        // (permission.asked / question.asked / question.replied /
+        // question.rejected); the v2 names fire only via the /api/*
+        // routes and are forward-compat here. v2 renames payload fields
+        // freshell doesn't read (permission→action, patterns→resources,
+        // always→save, tool→source) and keeps id/sessionID; question ids
+        // (^que) can't collide with permission ids (^per), so questions
+        // reuse the permission pause machinery unchanged.
+        // question.rejected ends the pause exactly like a reply. NO
+        // permission.*.rejected type exists: permission rejection is a
+        // *.replied with reply:"reject", which this arm already drains
+        // (the reply value is deliberately not inspected).
         "permission.asked" | "permission.v2.asked" | "question.asked" | "question.v2.asked" => {
             Some(OpencodeLaneEvent::PermissionAsked {
                 session_id: props.get("sessionID")?.as_str()?.to_string(),
@@ -1039,14 +1100,18 @@ In `crates/freshell-activity/src/idle.rs`, rewrite Accepted Residuals
 entry 9 (~:68-74, the D8(d) mirror):
 
 ```rust
-//!  9. (RE-SCOPED by #604, 2026-08-06) permission.v2.* and question.*
-//!     families (v1 and v2) are now translated onto the same pause
-//!     machinery, schema-verified against opencode 1.18.14. Residual:
-//!     a FUTURE never-before-seen event family cannot be handled in
-//!     advance — mitigated by the snapshot poll (turn lights stay
-//!     correct regardless of stream vocabulary, #603) and the loud
-//!     drift detector (#604); bells for a brand-new family stay deaf
-//!     until vocabulary is updated (adjudicated: acceptable).
+//!  9. (RE-SCOPED by #604, 2026-08-06) permission.* and question.*
+//!     families (v1 AND v2) are translated onto the same pause
+//!     machinery, source-verified against opencode v1.18.14: TUI-driven
+//!     turns emit the V1 names; v2 names fire only via /api/* routes
+//!     (kept as forward-compat). Permission rejection has NO event type
+//!     of its own — it arrives as *.replied with reply:"reject", which
+//!     the replied translation drains. Residual: a FUTURE
+//!     never-before-seen event family cannot be handled in advance —
+//!     mitigated by the snapshot poll (turn lights stay correct
+//!     regardless of stream vocabulary, #603) and the loud drift
+//!     detector (#604); bells for a brand-new family stay deaf until
+//!     vocabulary is updated (adjudicated: acceptable).
 ```
 
 - [ ] **Step 6: Commit**
@@ -1068,17 +1133,39 @@ git commit -m "fix(opencode): translate permission.v2.* and question.* families 
 **Interfaces:**
 - Consumes: Task 2's verify path (`Lane::verify`), `Lane::run` locals.
 - Produces:
-  - `pub fn drift_contradiction(busy_in_snapshot: bool, recognized_since_verify: u64) -> bool` in `opencode_lane.rs` — pure rule: `busy_in_snapshot && recognized_since_verify == 0`.
+  - `pub fn drift_contradiction(previous_busy: Option<bool>, busy_in_snapshot: bool, recognized_since_verify: u64) -> bool` in `opencode_lane.rs` — pure rule (a): a REST-observed status TRANSITION between two consecutive observations with zero recognized stream events in between.
+  - `pub fn unseen_pending_asks(listed: &[(String, String)], known: &std::collections::HashSet<String>) -> Vec<String>` — pure rule (b) predicate; its lane wiring lands with Task 8 (which introduces the pending-list fetches).
+  - `async fn verify(…) -> Option<bool>` — `Some(any busy/retry entry)` on a successful snapshot, `None` on probe failure (a failed probe is NOT an observation; `SnapshotFailed` carries the crash semantics).
   - `pub static OPENCODE_DRIFT_EVENTS: std::sync::atomic::AtomicU64` (exported from `freshell-ws`, e.g. `pub static OPENCODE_DRIFT_EVENTS: AtomicU64 = AtomicU64::new(0);` in `opencode_lane.rs`, re-exported from the crate root).
   - `/api/server-info` gains `"opencodeDriftEvents": <u64>` (additive field).
 
-The deterministic contradiction: the deadman verify fired (⇒ ≥120s of
-event silence), the snapshot says a session is BUSY, and the stream
-translated ZERO recognized events since the previous verify on this
-stream — machine-checkable evidence the stream vocabulary has drifted
-while the snapshot (the load-bearing truth source after #603) keeps the
-lights correct. Surface: `error!`-level log, once per stream, plus a
-monotonic counter on `/api/server-info`.
+The deterministic contradictions (redesigned 2026-08-06 after source
+validation of opencode v1.18.14 — the earlier draft rule "busy && zero
+recognized events over the deadman window ⇒ drift" is FALSIFIED and must
+NOT be built: long tool calls legitimately publish only
+`message.part.updated` (which `translate_serve_event` maps to `None`) or
+nothing at all, and `session.status` publishes on TRANSITIONS only
+(status.ts:39-48) — that rule would false-positive on every ≥120s tool
+call, exactly idle.rs residual 12's scenario):
+
+- **Rule (a) — transition contradiction:** `SessionStatus.set`
+  unconditionally publishes `session.status` (and `session.idle` on
+  idle) on every transition (status.ts:41-43). So a status TRANSITION
+  observed by diffing two consecutive REST observations (the connect
+  snapshot and each verify snapshot: busy→absent or absent→busy) on a
+  healthy connected stream with NO recognized stream event since the
+  previous observation is machine-proof the stream vocabulary drifted.
+  Steady state across a silent window (busy==busy: one long tool call)
+  is NOT drift.
+- **Rule (b) — asked-listing contradiction:** a pending ask id listed by
+  `GET /permission` (or `GET /question`) that was never seen as an
+  `*.asked` stream event (nor replayed at connect — gap asks are
+  expected) ⇒ asked-family drift. The predicate lands here; the wiring
+  lands in Task 8's mid-stream pending resync, which owns the fetches.
+
+Surface: `error!`-level log, once per stream, plus a monotonic counter
+on `/api/server-info`. The turn lights never depend on the detector —
+they stay snapshot-driven (#603).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1087,9 +1174,38 @@ In `opencode_lane.rs` tests:
 ```rust
     #[test]
     fn drift_contradiction_rule() {
-        assert!(drift_contradiction(true, 0));
-        assert!(!drift_contradiction(true, 3));
-        assert!(!drift_contradiction(false, 0));
+        // Rule (a): a REST-observed status TRANSITION with no recognized
+        // stream counterpart is drift…
+        assert!(drift_contradiction(Some(true), false, 0));
+        assert!(drift_contradiction(Some(false), true, 0));
+        // …a transition WITH recognized stream traffic is normal…
+        assert!(!drift_contradiction(Some(true), false, 2));
+        assert!(!drift_contradiction(Some(false), true, 1));
+        // …and steady state across a silent window is a LONG TOOL CALL,
+        // not drift (the falsified draft rule: message.part.updated
+        // translates to None and session.status publishes on transitions
+        // only — never flag busy==busy silence).
+        assert!(!drift_contradiction(Some(true), true, 0));
+        assert!(!drift_contradiction(Some(false), false, 0));
+        // The first observation on a stream has no previous to diff.
+        assert!(!drift_contradiction(None, true, 0));
+        assert!(!drift_contradiction(None, false, 0));
+    }
+
+    #[test]
+    fn unseen_pending_asks_rule() {
+        // Rule (b): listed-but-never-asked ids are drift evidence; wiring
+        // lands with Task 8's pending resync.
+        let mut known = std::collections::HashSet::new();
+        known.insert("per-1".to_string());
+        let listed = vec![
+            ("ses-1".to_string(), "per-1".to_string()),
+            ("ses-1".to_string(), "que-9".to_string()),
+        ];
+        assert_eq!(unseen_pending_asks(&listed, &known), vec!["que-9".to_string()]);
+        known.insert("que-9".to_string());
+        assert!(unseen_pending_asks(&listed, &known).is_empty());
+        assert!(unseen_pending_asks(&[], &known).is_empty());
     }
 ```
 
@@ -1106,8 +1222,9 @@ In `crates/freshell-server/src/diag.rs`, find the existing unit test of
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `cargo test -p freshell-ws drift_contradiction_rule && cargo test -p freshell-server server_info`
-Expected: compile FAIL (`drift_contradiction` and the field don't exist).
+Run: `cargo test -p freshell-ws drift_contradiction_rule unseen_pending_asks_rule && cargo test -p freshell-server server_info`
+Expected: compile FAIL (`drift_contradiction`, `unseen_pending_asks`, and
+the field don't exist).
 
 - [ ] **Step 3: Implement**
 
@@ -1117,48 +1234,87 @@ In `opencode_lane.rs` (top level):
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 /// #604: count of detected stream-vocabulary drift contradictions since
-/// boot (snapshot busy + zero recognized stream events across a verify
-/// window). Read by GET /api/server-info.
+/// boot (REST-observed status transition with no recognized stream
+/// counterpart, or a pending ask listed by /permission|/question that
+/// never appeared as an *.asked stream event). Read by
+/// GET /api/server-info.
 pub static OPENCODE_DRIFT_EVENTS: AtomicU64 = AtomicU64::new(0);
 
-/// #604 drift rule: the deadman verify found the session busy while the
-/// open stream produced zero recognized events since the last verify.
-pub fn drift_contradiction(busy_in_snapshot: bool, recognized_since_verify: u64) -> bool {
-    busy_in_snapshot && recognized_since_verify == 0
+/// #604 drift rule (a) — transition contradiction. SessionStatus.set
+/// publishes session.status/session.idle UNCONDITIONALLY on every
+/// transition (opencode v1.18.14 status.ts:41-43), so a transition seen
+/// by diffing two consecutive REST observations on a healthy stream
+/// with zero recognized events in between is machine-proof of drift.
+/// Steady state across a silent window (e.g. one long tool call that
+/// publishes only message.part.updated, which translates to None) is
+/// NOT drift — the falsified draft rule is deliberately not built.
+pub fn drift_contradiction(
+    previous_busy: Option<bool>,
+    busy_in_snapshot: bool,
+    recognized_since_verify: u64,
+) -> bool {
+    match previous_busy {
+        Some(previous) => previous != busy_in_snapshot && recognized_since_verify == 0,
+        None => false, // first observation on this stream: nothing to diff
+    }
+}
+
+/// #604 drift rule (b) — asked-listing contradiction predicate: pending
+/// ask ids fetched from GET /permission + GET /question that were never
+/// seen as an *.asked stream event nor replayed at connect. Wired by
+/// Task 8's mid-stream pending resync (which owns the fetches).
+pub fn unseen_pending_asks(
+    listed: &[(String, String)],
+    known: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    listed
+        .iter()
+        .filter(|(_, id)| !known.contains(id))
+        .map(|(_, id)| id.clone())
+        .collect()
 }
 ```
 
-Wire the counter through the run loop:
-- `run` gains locals `let mut recognized_since_verify: u64 = 0;` and
-  `let mut drift_logged_this_stream = false;` (reset both where
-  `stream += 1` happens).
+Wire rule (a) through the run loop:
+- `run` gains locals `let mut recognized_since_verify: u64 = 0;`,
+  `let mut drift_logged_this_stream = false;`, and
+  `let mut last_verified_busy: Option<bool> = None;` (reset all three
+  where `stream += 1` happens).
 - In the pump arm, after `let Some(event) = translate_serve_event(&parsed) else { continue; };`
   add `recognized_since_verify += 1;`.
-- `verify()` gains two `&mut` params (`recognized_since_verify`,
-  `drift_logged_this_stream`) — or simplest: inline the drift check at the
-  verify call sites in `run`, where the locals are in scope:
+- After the CONNECT snapshot is noted in `run` step 3, seed the first
+  observation: `last_verified_busy = Some(statuses.iter().any(|(_, s)| *s != OpencodeStatus::Idle));`.
+- Inline the drift check at the pump-loop verify call site, where the
+  locals are in scope:
 
 ```rust
-                        Some(()) = self.verify_rx.recv() => {
+                        Some(()) = verify_rx.recv() => {
                             let busy = self
                                 .verify(cycle, stream, &mut known_sessions)
                                 .await;
-                            if drift_contradiction(busy, recognized_since_verify)
-                                && !drift_logged_this_stream
-                            {
-                                drift_logged_this_stream = true;
-                                OPENCODE_DRIFT_EVENTS.fetch_add(1, AtomicOrdering::SeqCst);
-                                tracing::error!(
-                                    terminal_id = %self.terminal_id,
-                                    "opencode stream vocabulary drift suspected: session busy in /session/status but ZERO recognized stream events across a verify window; turn lights remain snapshot-driven (#604)"
-                                );
+                            if let Some(busy) = busy {
+                                if drift_contradiction(
+                                    last_verified_busy,
+                                    busy,
+                                    recognized_since_verify,
+                                ) && !drift_logged_this_stream
+                                {
+                                    drift_logged_this_stream = true;
+                                    OPENCODE_DRIFT_EVENTS.fetch_add(1, AtomicOrdering::SeqCst);
+                                    tracing::error!(
+                                        terminal_id = %self.terminal_id,
+                                        "opencode stream vocabulary drift: /session/status TRANSITIONED between consecutive observations with ZERO recognized stream events in between; turn lights remain snapshot-driven (#604 rule (a))"
+                                    );
+                                }
+                                last_verified_busy = Some(busy);
                             }
                             recognized_since_verify = 0;
                         }
 ```
 
-  Change `verify()` to return `bool` ("any busy/retry entry in the
-  snapshot"; `false` on failure):
+  Change `verify()` to return `Option<bool>` (`Some(any busy/retry
+  entry)` on success; `None` on failure — a failed probe is NOT an
+  observation and must not be diffed):
 
 ```rust
     async fn verify(
@@ -1166,7 +1322,7 @@ Wire the counter through the run loop:
         cycle: u64,
         stream: u64,
         known_sessions: &mut HashSet<String>,
-    ) -> bool {
+    ) -> Option<bool> {
         match self.fetch_snapshot().await {
             Ok(statuses) => {
                 let busy = statuses
@@ -1177,18 +1333,21 @@ Wire the counter through the run loop:
                         .await;
                 }
                 self.note(cycle, stream, OpencodeLaneEvent::Snapshot { statuses });
-                busy
+                Some(busy)
             }
             Err(error) => {
                 self.note(cycle, stream, OpencodeLaneEvent::SnapshotFailed { error });
-                false
+                None
             }
         }
     }
 ```
 
   (The between-cycles verify arm from Task 2 ignores the return value —
-  there is no open stream to contradict.)
+  write it as `let _ = self.verify(cycle, stream, &mut known_sessions).await;`
+  since `Option` is `#[must_use]` — AND performs no drift bookkeeping:
+  there is no healthy connected stream to contradict, so a transition
+  observed across a disconnect is expected, not drift.)
 
 In `crates/freshell-ws/src/lib.rs` ensure `opencode_lane` is reachable for
 the server crate (it already is — `freshell_ws::opencode_lane::ReqwestLaneHttp`
@@ -1235,9 +1394,12 @@ the pane's OWN per-pane opencode server; lanes exist only for
 freshell-managed panes, events are generation/cycle/stream-guarded, and
 session ids are root-resolved before they reach the tracker. On a per-pane
 endpoint, *the busy root session observed on that endpoint IS the pane's
-session* — identity is confirmed by construction, so a Quiet pane's busy
-root promotes DIRECTLY to `KnownBusy` (no `Candidate` detour, no wait for
-SQLite-locator/plugin luck). D4's rule is preserved (`blocks_death_bell`
+session* — identity is confirmed by construction (source-verified on
+opencode v1.18.14: session creation is only ever client-initiated and no
+internal feature mints a ROOT session — subagent children carry
+`parentID`, so the existing child filtering in root resolution stays), so
+a Quiet pane's busy root promotes DIRECTLY to `KnownBusy` (no `Candidate`
+detour, no wait for SQLite-locator/plugin luck). D4's rule is preserved (`blocks_death_bell`
 still blocks Candidate/Ambiguous/AwaitingAssociation) — those states simply
 stop arising on the lane path, which by construction fixes both first-turn
 death silence and the indefinite-candidate tail. Shared-endpoint
@@ -1405,10 +1567,18 @@ Expected: PASS.
 //!  6. (CLOSED for lane-backed panes by #609, 2026-08-06) A busy root on
 //!     the pane's own per-pane lane binds identity directly (KnownBusy) —
 //!     first-turn deaths ring and the indefinite-candidate tail cannot
-//!     form. D4 unchanged: Candidate/Ambiguous/AwaitingAssociation still
-//!     never death-ring. Residual (adjudicated): externally-attached
-//!     panes on a SHARED opencode endpoint have no lane and keep
-//!     conservative silence.
+//!     form. Identity-by-construction holds because opencode v1.18.14
+//!     creates sessions only client-initiated and internal features
+//!     never mint ROOT sessions (title/summary run in-place; subagents
+//!     are CHILDREN carrying parentID — child filtering in root
+//!     resolution stays load-bearing). D4 unchanged:
+//!     Candidate/Ambiguous/AwaitingAssociation still never death-ring.
+//!     Residuals (adjudicated): externally-attached panes on a SHARED
+//!     opencode endpoint have no lane and keep conservative silence;
+//!     and `opencode run --attach http://127.0.0.1:<port>` against a
+//!     pane's port can DELIBERATELY mint foreign busy roots — named,
+//!     accepted (it requires local intent, and two busy roots still
+//!     demote to Ambiguous, which stays honest-blue and death-silent).
 ```
 
 - [ ] **Step 7: Commit**
@@ -1568,17 +1738,20 @@ git commit -m "fix(opencode): ambiguous ownership re-promotes from a single-busy
 
 ---
 
-### Task 8: opencode permission pause survives snapshots + GET /permission resync (#608)
+### Task 8: opencode permission pause survives snapshots + pending-ask resync (#608)
 
 **Files:**
-- Modify: `crates/freshell-activity/src/opencode.rs` (`reduce_snapshot` KnownBusy single-matching-root arm ~:945-954; tests)
-- Modify: `crates/freshell-ws/src/opencode_lane.rs` (connect sequence step 3.5; new `fetch_permissions`; tests)
+- Modify: `crates/freshell-activity/src/opencode.rs` (`reduce_snapshot` KnownBusy single-matching-root arm ~:945-954; new `note_permissions_synced`; tests)
+- Modify: `crates/freshell-ws/src/opencode_lane.rs` (connect sequence step 3.5; new `fetch_permissions` + `fetch_questions` + `resync_pending`; rule-(b) drift wiring; tests)
+- Modify: `crates/freshell-ws/src/activity.rs` (`OpencodeLaneEvent::PermissionsSynced` variant + intake arm)
 
 **Interfaces:**
-- Consumes: spike-verified `GET /permission` on opencode 1.18.x (verified live on 1.18.14, opId `permission.list`: "all pending permission requests across all sessions", legacy shape `{ id: "^per", sessionID: "^ses", permission, patterns, metadata, always, tool? }`, `[]`/HTTP 200 when none; version floor: 1.18.x — the endpoint is part of the same 1.18 surface the lane already requires; on any older opencode without it the fetch fails and reconnect behaves as today, name this floor in the PR). Existing `note_permission_asked` idempotence ("Only a NEWLY inserted permission id arms", `opencode.rs:508-510`).
+- Consumes: source-verified opencode v1.18.14 (2026-08-06): `GET /permission` lists ONLY the V1 permission pending map (`permission/index.ts:169-172`) — pending QUESTIONS live in a SEPARATE store exposed at `GET /question` (`question/index.ts:42-44`, route `groups/question.ts:11`), so BOTH endpoints must be fetched (legacy permission shape `{ id: "^per", sessionID: "^ses", permission, patterns, metadata, always, tool? }`; questions carry `id: "^que"`, `sessionID`; `[]`/HTTP 200 when none; version floor: 1.18.x for both — on any older opencode the fetch fails and reconnect behaves as today, name this floor in the PR). Instance dispose drains pending asks by failing deferreds WITHOUT publishing any replied/rejected event (`permission/index.ts:54-61`, `question/index.ts:74-81`) — a pause keyed on replied-events alone can wedge, hence the reconciliation below. Existing `note_permission_asked` idempotence ("Only a NEWLY inserted permission id arms", `opencode.rs:508-510`). Task 5's `unseen_pending_asks` predicate + `OPENCODE_DRIFT_EVENTS` counter (rule (b) wiring lives here).
 - Produces:
   - Tracker: while `pending_permissions` is non-empty, a busy snapshot for the owned root REFRESHES stamps only — it does NOT restore the busy record and does NOT clear the pause (mid-pause is record-absent by design, D3).
-  - Lane: `async fn fetch_permissions(&self) -> Result<Vec<(String, String)>, String>` (session_id, permission_id pairs) + connect-sequence ordering: permissions are replayed into the tracker BEFORE the snapshot is noted.
+  - Tracker: `pub fn note_permissions_synced(&mut self, terminal_id: &str, pending_ids: &[String], at: i64) -> Vec<OpencodeEffect>` — reconciliation: any locally-pending ask id NOT in the fetched sets is stale (drained without events) and is treated as replied at `at`, so pauses cannot wedge. Deterministic set difference.
+  - Lane: `async fn fetch_permissions(&self) -> Result<Vec<(String, String)>, String>` and `async fn fetch_questions(&self) -> Result<Vec<(String, String)>, String>` ((session_id, ask_id) pairs); `async fn resync_pending(&self, cycle, stream, known_sessions, known_ask_ids, drift_logged_this_stream, check_drift)` used at connect (check_drift=false — gap asks are expected) and at each pump-loop verify (check_drift=true — #604 rule (b)). Connect-sequence ordering: asks are replayed into the tracker BEFORE the snapshot is noted.
+  - Hub: `OpencodeLaneEvent::PermissionsSynced { pending_ids: Vec<String> }` (lane → hub, noted only when BOTH fetches succeeded — reconciliation is all-or-nothing so a failed /question fetch can never drain a live question pause) with an intake arm calling `note_permissions_synced`.
 
 - [ ] **Step 1: Write the failing tracker test**
 
@@ -1614,13 +1787,43 @@ git commit -m "fix(opencode): ambiguous ownership re-promotes from a single-busy
             vec![upsert(rec(Some("ses-r"), 300))]
         );
     }
+
+    #[test]
+    fn permissions_sync_drains_stale_pauses() {
+        // #608 reconciliation: opencode instance-dispose drains pending
+        // asks WITHOUT publishing any replied/rejected event
+        // (permission/index.ts:54-61, question/index.ts:74-81) — the
+        // fetched pending sets are authoritative, so a locally-pending
+        // id absent from them is deterministically stale: treat it as
+        // replied so the pause cannot wedge.
+        let mut tracker = OpencodeActivityTracker::new();
+        tracker.track_terminal("t1", Some("ses-r"), 0);
+        tracker.note_status("t1", "ses-r", OpencodeStatus::Busy, 1, 1, 100);
+        tracker.note_permission_asked("t1", "ses-r", "perm-1", 150);
+        assert!(tracker.has_pending_permissions("t1"));
+        // Sync says: nothing pending server-side — drain exactly like a
+        // reply (busy resumes, same effects as note_permission_replied).
+        assert_eq!(
+            tracker.note_permissions_synced("t1", &[], 300),
+            vec![upsert(rec(Some("ses-r"), 300))]
+        );
+        assert!(!tracker.has_pending_permissions("t1"));
+        // A still-listed id keeps its pause untouched.
+        tracker.note_permission_asked("t1", "ses-r", "perm-2", 400);
+        assert!(tracker
+            .note_permissions_synced("t1", &["perm-2".to_string()], 500)
+            .is_empty());
+        assert!(tracker.has_pending_permissions("t1"));
+    }
 ```
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `cargo test -p freshell-activity busy_snapshot_does_not_clear_an_outstanding_pause`
-Expected: FAIL — today the snapshot's KnownBusy single-matching-root arm
-clears `pending_permissions` (`:947`) and calls `set_busy_record`.
+Run: `cargo test -p freshell-activity busy_snapshot_does_not_clear_an_outstanding_pause permissions_sync_drains_stale_pauses`
+Expected: compile FAIL (`note_permissions_synced` missing); after
+stubbing, `busy_snapshot…` FAILS — today the snapshot's KnownBusy
+single-matching-root arm clears `pending_permissions` (`:947`) and calls
+`set_busy_record`.
 
 - [ ] **Step 3: Implement the tracker half**
 
@@ -1656,115 +1859,308 @@ guard the busy-resume on the pause being empty:
 Check `busy_snapshot_refresh_rearms_the_abort_gate` (~:1609) still passes
 (its scenario has no pending permissions — unaffected).
 
-- [ ] **Step 4: Write the failing lane test (replay-before-snapshot ordering)**
+Add `note_permissions_synced` after `note_permission_replied`:
+
+```rust
+    /// #608 reconciliation: the fetched pending sets (GET /permission +
+    /// GET /question) are authoritative — a locally-pending ask id
+    /// absent from them was drained WITHOUT events (instance dispose,
+    /// opencode permission/index.ts:54-61 / question/index.ts:74-81).
+    /// Treat each stale id as replied at `at` (the same drain path), so
+    /// a pause can never wedge. Deterministic: a pure set difference
+    /// against the fetched listing; no timers, no guesses.
+    pub fn note_permissions_synced(
+        &mut self,
+        terminal_id: &str,
+        pending_ids: &[String],
+        at: i64,
+    ) -> Vec<OpencodeEffect> {
+        let stale: Vec<String> = {
+            let Some(state) = self.states.get(terminal_id) else {
+                return Vec::new();
+            };
+            state
+                .pending_permissions
+                .iter()
+                .filter(|id| !pending_ids.contains(*id))
+                .cloned()
+                .collect()
+        };
+        let mut effects = Vec::new();
+        for id in stale {
+            effects.extend(self.note_permission_replied(terminal_id, &id, at));
+        }
+        effects
+    }
+```
+
+- [ ] **Step 4: Write the failing lane test (replay-before-snapshot ordering, both endpoints)**
 
 In `opencode_lane.rs` tests (copy the connect-flow harness from
 `lane_gates_on_health_then_snapshots_then_streams`):
 
 ```rust
-    /// #608: on (re)connect the lane asks GET /permission and replays
-    /// outstanding asks into the tracker BEFORE the snapshot is noted, so
-    /// an ask that happened during the SSE gap still arms the pause.
+    /// #608: on (re)connect the lane asks GET /permission AND
+    /// GET /question (disjoint pending stores, source-verified opencode
+    /// v1.18.14) and replays outstanding asks into the tracker BEFORE
+    /// the snapshot is noted, so an ask that happened during the SSE gap
+    /// still arms the pause; a PermissionsSynced entry follows so the
+    /// hub can drain stale local pauses.
     #[tokio::test(flavor = "multi_thread")]
-    async fn connect_replays_outstanding_permissions_before_snapshot() {
+    async fn connect_replays_outstanding_asks_before_snapshot() {
         // Responder: health OK; /permission →
-        //   [{"id":"perm-9","sessionID":"ses-1","permission":"bash",
+        //   [{"id":"per-9","sessionID":"ses-1","permission":"bash",
         //     "patterns":[],"metadata":{},"always":[]}]
+        //   ; /question →
+        //   [{"id":"que-3","sessionID":"ses-1","questions":[]}]
         //   ; /session/status → {"ses-1":{"type":"busy"}};
         //   /session/ses-1 → {"id":"ses-1"}. One parked stream script.
-        // Assert ingress ordering: the PermissionAsked{ses-1, perm-9}
-        // entry's index is LOWER than the Snapshot entry's index, and both
-        // carry the same (generation, cycle, stream).
+        // Assert ingress ordering: PermissionAsked{ses-1, per-9} and
+        // PermissionAsked{ses-1, que-3} both have LOWER indexes than the
+        // PermissionsSynced{pending_ids:[per-9, que-3]} entry, which has
+        // a LOWER index than the Snapshot entry; all carry the same
+        // (generation, cycle, stream).
         …
     }
 ```
 
 Write it fully using the Task 2 test as the template; the ordering
-assertion is
-`assert!(idx_of_permission_asked < idx_of_snapshot, "replay must precede the snapshot")`,
-computed with `.iter().position(...)` over `wait_for_ingress(&hub, 3, 2000)`.
+assertions are
+`assert!(idx_of_per_asked < idx_of_synced && idx_of_que_asked < idx_of_synced, "replay must precede reconciliation")`
+and `assert!(idx_of_synced < idx_of_snapshot, "replay+sync must precede the snapshot")`,
+computed with `.iter().position(...)` over `wait_for_ingress(&hub, 5, 2000)`.
 
-Run: `cargo test -p freshell-ws connect_replays_outstanding_permissions`
-Expected: FAIL (no `/permission` GET happens; no PermissionAsked ingress).
+Run: `cargo test -p freshell-ws connect_replays_outstanding_asks`
+Expected: compile FAIL (`PermissionsSynced` doesn't exist), then FAIL (no
+`/permission` or `/question` GET happens; no PermissionAsked ingress).
 
 - [ ] **Step 5: Implement the lane half**
 
 Add next to `fetch_snapshot`:
 
 ```rust
-    /// #608: GET {base}/permission — all pending permission asks across
-    /// sessions (legacy shape; endpoint verified live on opencode 1.18.14,
-    /// opId permission.list; version floor 1.18.x). Returns
-    /// (session_id, permission_id) pairs. Failure is NON-FATAL for the
-    /// cycle: the stream + snapshot still carry the lights; the pause
-    /// resync just doesn't happen this cycle (retried next reconnect).
+    /// #608: GET {base}/permission — pending V1 permission asks across
+    /// sessions (legacy shape; source-verified on opencode v1.18.14, opId
+    /// permission.list; version floor 1.18.x). Returns
+    /// (session_id, ask_id) pairs. Failure is NON-FATAL for the cycle:
+    /// the stream + snapshot still carry the lights; the pause resync
+    /// just doesn't happen this fetch (retried at the next verify or
+    /// reconnect).
     async fn fetch_permissions(&self) -> Result<Vec<(String, String)>, String> {
-        let url = format!("{}/permission", self.base_url);
+        Self::parse_ask_list("/permission", self.fetch_ask_body("/permission").await?)
+    }
+
+    /// #608: GET {base}/question — pending questions live in a SEPARATE
+    /// store from permissions (source-verified opencode v1.18.14:
+    /// question/index.ts:42-44, route groups/question.ts:11). A resync
+    /// that polls only /permission never drains a question pause. Same
+    /// shape contract and version floor as fetch_permissions.
+    async fn fetch_questions(&self) -> Result<Vec<(String, String)>, String> {
+        Self::parse_ask_list("/question", self.fetch_ask_body("/question").await?)
+    }
+
+    async fn fetch_ask_body(&self, path: &str) -> Result<serde_json::Value, String> {
+        let url = format!("{}{}", self.base_url, path);
         let (status, body) = self.deps.http.get_json(&url).await?;
         if status != 200 {
-            return Err(format!("GET /permission returned {status}"));
+            return Err(format!("GET {path} returned {status}"));
         }
+        Ok(body)
+    }
+
+    fn parse_ask_list(
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<Vec<(String, String)>, String> {
         let list = body
             .as_array()
-            .ok_or_else(|| "GET /permission: body is not an array".to_string())?;
+            .ok_or_else(|| format!("GET {path}: body is not an array"))?;
         let mut asks = Vec::new();
         for entry in list {
-            let (Some(session_id), Some(permission_id)) = (
+            let (Some(session_id), Some(ask_id)) = (
                 entry.get("sessionID").and_then(|v| v.as_str()),
                 entry.get("id").and_then(|v| v.as_str()),
             ) else {
-                return Err("GET /permission: entry missing id/sessionID".to_string());
+                return Err(format!("GET {path}: entry missing id/sessionID"));
             };
-            asks.push((session_id.to_string(), permission_id.to_string()));
+            asks.push((session_id.to_string(), ask_id.to_string()));
         }
         Ok(asks)
     }
 ```
 
-In `run` step 3, AFTER a successful `fetch_snapshot` result is bound to
-`statuses` but BEFORE `self.note(cycle, stream, OpencodeLaneEvent::Snapshot …)`,
-insert:
+Add the shared resync method (used at connect AND at each pump-loop
+verify — the latter wires Task 5's rule (b)):
 
 ```rust
-                    // #608: replay outstanding permission asks BEFORE the
-                    // snapshot is noted — ordering is load-bearing (the
-                    // snapshot's busy row must not race an unarmed pause).
-                    // Duplicate replays are safe: only a NEWLY inserted
-                    // permission id arms (opencode.rs:508-510).
-                    match self.fetch_permissions().await {
-                        Ok(asks) => {
-                            for (session_id, permission_id) in asks {
-                                self.resolve_root(cycle, stream, &session_id, &mut known_sessions)
-                                    .await;
-                                self.note(
-                                    cycle,
-                                    stream,
-                                    OpencodeLaneEvent::PermissionAsked {
-                                        session_id,
-                                        permission_id,
-                                    },
-                                );
+    /// #608: fetch BOTH pending-ask sets and replay them into the
+    /// tracker (idempotent — only a NEWLY inserted id arms,
+    /// opencode.rs:508-510); when BOTH fetches succeed, note
+    /// PermissionsSynced so the hub drains stale local pauses
+    /// (instance-dispose drains pending with NO events). Reconciliation
+    /// is all-or-nothing: draining question pauses because only
+    /// /permission answered would wedge the truth. With `check_drift`
+    /// (mid-stream verify only): a listed id never seen as an *.asked
+    /// stream event nor replayed before is #604 rule (b) drift — every
+    /// ask minted on a healthy stream publishes *.asked at ask time.
+    /// Connect-time calls pass check_drift=false: asks that arrived
+    /// during the SSE gap are expected to be stream-unseen.
+    #[allow(clippy::too_many_arguments)]
+    async fn resync_pending(
+        &self,
+        cycle: u64,
+        stream: u64,
+        known_sessions: &mut HashSet<String>,
+        known_ask_ids: &mut HashSet<String>,
+        drift_logged_this_stream: &mut bool,
+        check_drift: bool,
+    ) {
+        let perms = self.fetch_permissions().await;
+        let questions = self.fetch_questions().await;
+        let both_ok = perms.is_ok() && questions.is_ok();
+        if !both_ok {
+            let error = [perms.as_ref().err(), questions.as_ref().err()]
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ");
+            tracing::warn!(
+                terminal_id = %self.terminal_id,
+                %error,
+                "opencode pending-ask resync incomplete; replaying what fetched, skipping reconciliation (#608)"
+            );
+        }
+        let listed: Vec<(String, String)> = perms
+            .unwrap_or_default()
+            .into_iter()
+            .chain(questions.unwrap_or_default())
+            .collect();
+        if check_drift {
+            let unseen = unseen_pending_asks(&listed, known_ask_ids);
+            if !unseen.is_empty() && !*drift_logged_this_stream {
+                *drift_logged_this_stream = true;
+                OPENCODE_DRIFT_EVENTS.fetch_add(1, AtomicOrdering::SeqCst);
+                tracing::error!(
+                    terminal_id = %self.terminal_id,
+                    unseen = ?unseen,
+                    "opencode asked-family drift: pending ask ids listed by /permission|/question were never seen as *.asked stream events on a healthy stream (#604 rule (b))"
+                );
+            }
+        }
+        let mut pending_ids = Vec::new();
+        for (session_id, ask_id) in listed {
+            self.resolve_root(cycle, stream, &session_id, known_sessions)
+                .await;
+            known_ask_ids.insert(ask_id.clone());
+            pending_ids.push(ask_id.clone());
+            self.note(
+                cycle,
+                stream,
+                OpencodeLaneEvent::PermissionAsked {
+                    session_id,
+                    permission_id: ask_id,
+                },
+            );
+        }
+        if both_ok {
+            self.note(
+                cycle,
+                stream,
+                OpencodeLaneEvent::PermissionsSynced { pending_ids },
+            );
+        }
+    }
+```
+
+Wire it in `run`:
+1. `run` gains a local `let mut known_ask_ids: HashSet<String> = HashSet::new();`
+   reset where `stream += 1` happens (next to Task 5's locals). In the
+   pump arm, after `let Some(event) = translate_serve_event(&parsed) else { continue; };`,
+   record stream-seen asks:
+
+```rust
+                            if let OpencodeLaneEvent::PermissionAsked { permission_id, .. } =
+                                &event
+                            {
+                                known_ask_ids.insert(permission_id.clone());
                             }
+```
+
+2. In `run` step 3, AFTER a successful `fetch_snapshot` result is bound to
+   `statuses` but BEFORE `self.note(cycle, stream, OpencodeLaneEvent::Snapshot …)`,
+   insert (replay-before-snapshot is load-bearing — the snapshot's busy
+   row must not race an unarmed pause):
+
+```rust
+                    // #608: replay outstanding asks BEFORE the snapshot
+                    // is noted. check_drift=false — asks that arrived
+                    // during the SSE gap are legitimately stream-unseen.
+                    self.resync_pending(
+                        cycle,
+                        stream,
+                        &mut known_sessions,
+                        &mut known_ask_ids,
+                        &mut drift_logged_this_stream,
+                        false,
+                    )
+                    .await;
+```
+
+3. In the pump-loop verify arm (Task 5's), after the rule-(a) drift check
+   and `recognized_since_verify = 0;`, add the mid-stream resync +
+   rule (b):
+
+```rust
+                            // #608 mid-stream resync + #604 rule (b) —
+                            // runs ONLY here (healthy connected stream):
+                            // during a disconnect an unseen listed ask is
+                            // expected, not drift.
+                            self.resync_pending(
+                                cycle,
+                                stream,
+                                &mut known_sessions,
+                                &mut known_ask_ids,
+                                &mut drift_logged_this_stream,
+                                true,
+                            )
+                            .await;
+```
+
+   (The between-cycles verify arm from Task 2 does NOT resync — no open
+   stream to reconcile against.)
+
+In `crates/freshell-ws/src/activity.rs`, add the lane-event variant (after
+`SnapshotFailed`) and its intake arm:
+
+```rust
+    /// #608: the authoritative pending-ask listing fetched from GET
+    /// /permission + GET /question (noted only when BOTH succeeded). The
+    /// hub drains any locally-pending id not listed — see
+    /// OpencodeActivityTracker::note_permissions_synced.
+    PermissionsSynced { pending_ids: Vec<String> },
+```
+
+```rust
+                        OpencodeLaneEvent::PermissionsSynced { pending_ids } => {
+                            inner.opencode.note_permissions_synced(&terminal_id, &pending_ids, at)
                         }
-                        Err(error) => {
-                            tracing::warn!(
-                                terminal_id = %self.terminal_id,
-                                %error,
-                                "opencode permission resync failed; pauses armed during the gap may be lost until the next reconnect (#608)"
-                            );
-                        }
-                    }
 ```
 
 Note the existing test `lane_gates_on_health_then_snapshots_then_streams`
 asserts the ordered GET call list — its responder's `Ok((404, json!({})))`
-catch-all now serves `/permission` a 404 → the resync warns and continues,
-but the call-order slice assertions (`calls[..6]` style) will include the
-new `GET …/permission` entry: UPDATE that test's expected call list to
-include `GET {base}/permission` between the snapshot GET and the stream
-CONNECT (or wherever it lands per your insertion point — keep snapshot GET
-first, permission GET second, both before the Snapshot note). This is an
-expected-order update, not an assertion weakening.
+catch-all now serves `/permission` and `/question` a 404 → the resync
+warns and continues, but the call-order slice assertions (`calls[..6]`
+style) will include the new `GET …/permission` and `GET …/question`
+entries: UPDATE that test's expected call list to include both between
+the snapshot GET and the stream CONNECT (keep snapshot GET first, then
+permission GET, then question GET, all before the Snapshot note). This is
+an expected-order update, not an assertion weakening. Add a small lane
+test for the rule-(b) wiring: parked stream, connect completes, then one
+verify request against a responder whose `/permission` now lists a
+never-streamed id — assert `OPENCODE_DRIFT_EVENTS` incremented and a
+`PermissionAsked` + `PermissionsSynced` ingress pair still arrived (the
+pause arms even while drift is flagged).
 
 - [ ] **Step 6: Run the suites**
 
@@ -1777,16 +2173,20 @@ Expected: PASS.
 
 ```rust
 //!  8. (CLOSED by #608, 2026-08-06) SSE reconnect resyncs outstanding
-//!     permission asks via GET /permission (replayed BEFORE the snapshot)
-//!     and busy snapshots no longer clear an outstanding pause — the
+//!     asks via GET /permission AND GET /question (disjoint pending
+//!     stores at v1.18.14; both replayed BEFORE the snapshot), busy
+//!     snapshots no longer clear an outstanding pause, and the fetched
+//!     sets reconcile stale local pauses (instance-dispose drains with
+//!     NO events — a locally-pending id absent from the listing is
+//!     treated as replied, so pauses cannot wedge). The
 //!     pending-attention bell survives connection blips.
 ```
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/freshell-activity/src/opencode.rs crates/freshell-ws/src/opencode_lane.rs crates/freshell-activity/src/idle.rs
-git commit -m "fix(opencode): permission pauses survive reconnect — GET /permission resync + snapshot no longer clears pauses (#608)"
+git add crates/freshell-activity/src/opencode.rs crates/freshell-ws/src/opencode_lane.rs crates/freshell-ws/src/activity.rs crates/freshell-activity/src/idle.rs
+git commit -m "fix(opencode): permission pauses survive reconnect — /permission + /question resync, reconciliation, snapshot no longer clears pauses (#608)"
 ```
 
 ---
@@ -1798,52 +2198,98 @@ git commit -m "fix(opencode): permission pauses survive reconnect — GET /permi
 - Modify: `crates/freshell-ws/src/lib.rs` (add `pub mod claude_truth;`)
 - Test: in-file `#[cfg(test)] mod tests` with tempdir fixtures
 
-**Spike verdict this design bakes in (claude-code 2.1.223, verified on
-this machine 2026-08-06):**
+**Validated ground truth this design bakes in (claude-code 2.1.223;
+spike claims corpus-validated 2026-08-06 against 1561 files / 240k
+records under `~/.claude/projects`):**
 - Transcript: `<root>/projects/<cwd-slug>/<session-uuid>.jsonl`; the slug
   is LOSSY — location is a filename scan for `<session_id>.jsonl`, never a
   path computation. Roots in priority order: `$CLAUDE_CONFIG_DIR`,
   `$CLAUDE_HOME`, `$HOME/.claude` (same ladder as
-  `crates/freshell-freshagent/src/claude_snapshot.rs`).
-- Turn START (deterministic): a `"type":"user"` record WITH a
-  `promptSource` field (`typed`/`queued`/`system`/`sdk`) — appended at
-  submit time (~100-250ms flush lag). Tool-result user records have NO
-  `promptSource`.
-- Turn END (deterministic for terminal CLI panes, `entrypoint:"cli"` —
-  which is what freshell claude PTY panes run): a
-  `"type":"system","subtype":"turn_duration"` record, always the last
-  record of a completed turn. `stop_hook_summary` under-fires — do not
-  use. `away_summary` fires minutes later — match `subtype` EXACTLY.
+  `crates/freshell-freshagent/src/claude_snapshot.rs`; empty-string env
+  values are SKIPPED, matching that file's precedent). Basename
+  uniqueness is empirical (0 duplicates across 1561 files), not
+  structural — multiple matches warn and take the first by root
+  priority. Subagent files live one level DEEPER and are intentionally
+  not scanned: main transcripts live at slug level (verified live).
+- Turn START: turn-start `user` records WITH a `promptSource` field
+  (`typed`/`queued`/`system`/`sdk`) exist for typed/queued turns, BUT
+  slash-command turns (e.g. `/goal`) can run with ZERO promptSource
+  records, and promptSource records are not 1:1 with turns (re-emits,
+  queued batches). Consequence: submit confirmation must accept ANY
+  appended parseable non-sidechain transcript record — a phantom Enter
+  appends NOTHING, so "anything appended" is the deterministic
+  discriminator (a tool_result record proves the agent is running, which
+  is exactly what #611 needs).
+- Turn END (terminal CLI panes, `entrypoint:"cli"` — which is what
+  freshell claude PTY panes run): a
+  `"type":"system","subtype":"turn_duration"` record. It NEVER
+  under-fires on completed cli turns (918/938 corpus segments; 0 real
+  under-fires) but it is NOT always last: user/assistant/queue records
+  legitimately appear AFTER a turn_duration in-segment (Stop-hook and
+  slash-command continuations — 236 user + 13 assistant post-td records
+  in corpus), so "Ended" means an end-boundary GENUINELY LAST among
+  user/assistant activity; activity after the boundary means a
+  continuation is running (InFlight). sdk-entrypoint sessions NEVER
+  write turn_duration (out of scope: freshell PTY panes are cli).
+  `stop_hook_summary` under-fires — do not use. `away_summary` fires
+  minutes later — match `subtype` EXACTLY.
 - Interrupt (ESC) writes NO turn_duration: the marker is a `user` record
-  whose `message.content` is the literal string
-  `"[Request interrupted by user]"` — it terminates the turn.
+  whose `message.content` is ARRAY-wrapped —
+  `[{"type":"text","text":"[Request interrupted by user]"}]` (17/17
+  corpus interrupts; the constructor also emits a
+  `"…for tool use"` variant, so match by PREFIX
+  `[Request interrupted by user` on string OR array shapes). Early ESC
+  (before any assistant output) writes NO record at all — accepted
+  residual: a stale blue that self-heals on the next input (named in
+  Task 10).
 - Timestamps are NOT monotonic (attachment records replay older stamps) —
   append order is truth; never sort or compare timestamps.
 - Files reach 31MB — tail-seek, never slurp. Records are one JSON per
-  line; individual lines can be hundreds of KB.
+  line; individual lines reach 1,365,273 bytes (56 files exceed 256 KiB,
+  including 4 main cli transcripts) — a fixed 256 KiB tail window can
+  land entirely inside one record, so the tail scan is ADAPTIVE: start
+  at 256 KiB and double until ≥1 parseable record or an 8 MiB cap
+  (5.9× the max observed line); zero parseable records at the cap ⇒
+  Unavailable + the A8 drift tripwire.
+- Files are append-only and compaction is in-place same-file (9/9
+  compact_boundary records mid-file; 0/609 sessionId mismatches), BUT
+  resume/fork mints a NEW `<session-id>.jsonl` seeded with COPIED
+  records — offsets are only valid for the session they were captured
+  against (Task 11 stashes (session_id, offset) pairs; Task 10's rebind
+  producer keeps the tracker pointed at the live session).
 - Subagent sidechains live in separate files; main-file records have
   `isSidechain:false` — skip any record with `isSidechain:true`
   defensively.
+- Format stability across claude self-updates is UNVERIFIABLE in advance
+  (auto-update is on; these markers churned within the last month) —
+  mitigation A8: `FsClaudeTruth` carries a drift tripwire
+  (`claude_format_anomaly` warn + counter, below) so silent format drift
+  becomes a visible signal instead of a silent wrong light.
 
 **Interfaces:**
 - Produces (Tasks 10/11 depend on these EXACT signatures):
 
 ```rust
 pub enum TurnProbe {
-    /// A turn-start record with no terminating record after it (or
-    /// mid-turn transcript records at the tail) — the agent is working.
+    /// Non-sidechain user/assistant activity after the last end-boundary
+    /// (turn_duration or interrupt marker) — or activity with no boundary
+    /// in the window at all: the agent is working (this includes
+    /// hook/slash continuations that run AFTER a turn_duration).
     InFlight,
-    /// The last started turn has a terminating record (turn_duration or
-    /// the interrupt marker) after it.
+    /// An end-boundary is genuinely LAST among user/assistant activity.
     Ended,
-    /// No transcript found / unreadable / empty — no truth source.
+    /// No transcript found / unreadable / zero parseable records at the
+    /// adaptive-window cap — no truth source (crash semantics upstream).
     Unavailable,
 }
 
 pub enum SubmitProbe {
-    /// A turn-start user record was appended at/after the given offset.
+    /// ANY parseable non-sidechain transcript record (user/assistant/
+    /// system) was appended at/after the given offset — slash turns
+    /// write no promptSource record, and a phantom Enter appends
+    /// nothing, so "anything appended" is the discriminator.
     Confirmed,
-    /// The appended region parsed but contains no turn-start record.
+    /// The appended region parsed but contains no transcript record.
     NoTurnStarted,
     /// Transcript missing/unreadable — cannot verify.
     Unavailable,
@@ -1859,9 +2305,15 @@ pub trait ClaudeTruth: Send + Sync {
 
 pub struct FsClaudeTruth { roots: Vec<std::path::PathBuf> }
 impl FsClaudeTruth {
-    pub fn from_env() -> Self;               // CLAUDE_CONFIG_DIR > CLAUDE_HOME > $HOME/.claude
+    pub fn from_env() -> Self;               // CLAUDE_CONFIG_DIR > CLAUDE_HOME > $HOME/.claude (empty values skipped)
     pub fn with_roots(roots: Vec<std::path::PathBuf>) -> Self;  // tests
 }
+
+/// A8 drift tripwire: count of transcript-format anomalies since boot
+/// (zero parseable records at the adaptive-window cap, or parseable
+/// records that cannot be classified). Surfaced as
+/// "claudeTruthAnomalies" on /api/server-info in Task 10.
+pub static CLAUDE_TRUTH_ANOMALIES: std::sync::atomic::AtomicU64;
 ```
 
 - [ ] **Step 1: Write the failing tests**
@@ -1878,12 +2330,32 @@ elsewhere; add `tempfile` to `crates/freshell-ws/Cargo.toml`
         std::fs::write(dir.join(format!("{session}.jsonl")), lines.join("\n")).unwrap();
     }
 
-    const TURN_START: &str = r#"{"type":"user","promptSource":"typed","origin":{"kind":"human"},"promptId":"p1","isSidechain":false,"message":{"role":"user","content":"hi"},"uuid":"u1","timestamp":"2026-08-06T08:00:00.000Z","sessionId":"S","entrypoint":"cli"}"#;
-    const TOOL_RESULT: &str = r#"{"type":"user","promptId":"p1","isSidechain":false,"toolUseResult":"x","message":{"role":"user","content":[{"type":"tool_result","content":"ok"}]},"uuid":"u2","timestamp":"2026-08-06T08:00:05.000Z"}"#;
-    const ASSISTANT: &str = r#"{"type":"assistant","isSidechain":false,"message":{"role":"assistant","content":[{"type":"text","text":"…"}],"stop_reason":"tool_use"},"uuid":"u3","timestamp":"2026-08-06T08:00:06.000Z"}"#;
-    const TURN_END: &str = r#"{"type":"system","subtype":"turn_duration","durationMs":1234,"messageCount":3,"isSidechain":false,"uuid":"u4","timestamp":"2026-08-06T08:00:07.000Z"}"#;
-    const INTERRUPT: &str = r#"{"type":"user","isSidechain":false,"message":{"role":"user","content":"[Request interrupted by user]"},"uuid":"u5","timestamp":"2026-08-06T08:00:08.000Z"}"#;
-    const AWAY: &str = r#"{"type":"system","subtype":"away_summary","isSidechain":false,"uuid":"u6","timestamp":"2026-08-06T08:03:00.000Z"}"#;
+    const TURN_START: &str = r#"{"type":"user","promptSource":"typed","origin":{"kind":"human"},"promptId":"p1","isSidechain":false,"message":{"role":"user","content":"hi"},"uuid":"u1","timestamp":"2026-08-06T08:00:00.000Z","sessionId":"S","entrypoint":"cli","version":"2.1.223"}"#;
+    const TOOL_RESULT: &str = r#"{"type":"user","promptId":"p1","isSidechain":false,"toolUseResult":"x","message":{"role":"user","content":[{"type":"tool_result","content":"ok"}]},"uuid":"u2","timestamp":"2026-08-06T08:00:05.000Z","version":"2.1.223"}"#;
+    const ASSISTANT: &str = r#"{"type":"assistant","isSidechain":false,"message":{"role":"assistant","content":[{"type":"text","text":"…"}],"stop_reason":"tool_use"},"uuid":"u3","timestamp":"2026-08-06T08:00:06.000Z","version":"2.1.223"}"#;
+    const TURN_END: &str = r#"{"type":"system","subtype":"turn_duration","durationMs":1234,"messageCount":3,"isSidechain":false,"uuid":"u4","timestamp":"2026-08-06T08:00:07.000Z","version":"2.1.223"}"#;
+    // Corpus-validated interrupt shape (17/17): message.content is
+    // ARRAY-wrapped, not a bare string.
+    const INTERRUPT: &str = r#"{"type":"user","isSidechain":false,"message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"uuid":"u5","timestamp":"2026-08-06T08:00:08.000Z","version":"2.1.223"}"#;
+    // The constructor's second literal (interrupted tool call).
+    const INTERRUPT_TOOL_USE: &str = r#"{"type":"user","isSidechain":false,"message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]},"uuid":"u5b","timestamp":"2026-08-06T08:00:08.500Z","version":"2.1.223"}"#;
+    // Defensive: the string-typed shape older builds used.
+    const INTERRUPT_LEGACY: &str = r#"{"type":"user","isSidechain":false,"message":{"role":"user","content":"[Request interrupted by user]"},"uuid":"u5c","timestamp":"2026-08-06T08:00:09.000Z","version":"2.1.202"}"#;
+    const AWAY: &str = r#"{"type":"system","subtype":"away_summary","isSidechain":false,"uuid":"u6","timestamp":"2026-08-06T08:03:00.000Z","version":"2.1.223"}"#;
+    const SIDECHAIN: &str = r#"{"type":"user","promptSource":"typed","isSidechain":true,"message":{"role":"user","content":"sidechain"},"uuid":"u7","timestamp":"2026-08-06T08:00:10.000Z","version":"2.1.223"}"#;
+
+    fn append_lines(root: &std::path::Path, session: &str, lines: &[&str]) {
+        use std::io::Write;
+        let dir = root.join("projects").join("-home-user-proj");
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join(format!("{session}.jsonl")))
+            .unwrap();
+        writeln!(f).unwrap();
+        for line in lines {
+            writeln!(f, "{line}").unwrap();
+        }
+    }
 
     #[test]
     fn probe_turn_state_classifies_the_tail() {
@@ -1897,17 +2369,71 @@ elsewhere; add `tempfile` to `crates/freshell-ws/Cargo.toml`
         write_transcript(dir.path(), "S", &[TURN_START, ASSISTANT, TURN_END]);
         assert!(matches!(truth.probe_turn_state("S"), TurnProbe::Ended));
 
-        // Interrupt terminates a turn (NO turn_duration is written).
+        // Interrupt terminates a turn (NO turn_duration is written) —
+        // corpus shape: content is ARRAY-wrapped; the "for tool use"
+        // variant and the legacy string shape all end the turn.
         write_transcript(dir.path(), "S", &[TURN_START, ASSISTANT, INTERRUPT]);
         assert!(matches!(truth.probe_turn_state("S"), TurnProbe::Ended));
+        write_transcript(dir.path(), "S", &[TURN_START, ASSISTANT, INTERRUPT_TOOL_USE]);
+        assert!(matches!(truth.probe_turn_state("S"), TurnProbe::Ended));
+        write_transcript(dir.path(), "S", &[TURN_START, ASSISTANT, INTERRUPT_LEGACY]);
+        assert!(matches!(truth.probe_turn_state("S"), TurnProbe::Ended));
 
-        // away_summary is NOT an end marker; the started turn is open.
+        // Activity AFTER a turn_duration = a hook/slash continuation is
+        // running (corpus: 236 user + 13 assistant post-td records) —
+        // "ended" requires the boundary to be genuinely last among
+        // user/assistant activity.
+        write_transcript(
+            dir.path(),
+            "S",
+            &[TURN_START, ASSISTANT, TURN_END, TOOL_RESULT, ASSISTANT],
+        );
+        assert!(matches!(truth.probe_turn_state("S"), TurnProbe::InFlight));
+
+        // away_summary (and other trailing housekeeping) is NOT activity
+        // and NOT an end marker: it neither reopens nor closes anything.
+        write_transcript(dir.path(), "S", &[TURN_START, ASSISTANT, TURN_END, AWAY]);
+        assert!(matches!(truth.probe_turn_state("S"), TurnProbe::Ended));
         write_transcript(dir.path(), "S", &[TURN_END, TURN_START, ASSISTANT, AWAY]);
         assert!(matches!(truth.probe_turn_state("S"), TurnProbe::InFlight));
 
         // Redundant end (compaction/resume boundary): tolerated.
         write_transcript(dir.path(), "S", &[TURN_END]);
         assert!(matches!(truth.probe_turn_state("S"), TurnProbe::Ended));
+
+        // Sidechain records are invisible to classification.
+        write_transcript(dir.path(), "S", &[TURN_START, TURN_END, SIDECHAIN]);
+        assert!(matches!(truth.probe_turn_state("S"), TurnProbe::Ended));
+    }
+
+    #[test]
+    fn adaptive_window_grows_past_a_giant_line() {
+        // Corpus: individual lines reach 1,365,273 bytes — a fixed
+        // 256 KiB window can land INSIDE one record and parse nothing.
+        // The adaptive scan doubles until it finds parseable records.
+        let dir = tempfile::tempdir().unwrap();
+        let truth = FsClaudeTruth::with_roots(vec![dir.path().to_path_buf()]);
+        let giant = format!(
+            r#"{{"type":"assistant","isSidechain":false,"message":{{"role":"assistant","content":[{{"type":"text","text":"{}"}}]}},"uuid":"u9","timestamp":"2026-08-06T08:01:00.000Z","version":"2.1.223"}}"#,
+            "x".repeat(400 * 1024)
+        );
+        write_transcript(dir.path(), "S", &[TURN_START, TURN_END, &giant]);
+        // The giant assistant record is ACTIVITY after the boundary:
+        // a mid-turn streaming tail ⇒ InFlight (never a false green,
+        // never a false Unavailable crash bell).
+        assert!(matches!(truth.probe_turn_state("S"), TurnProbe::InFlight));
+    }
+
+    #[test]
+    fn zero_parseable_records_at_cap_is_unavailable() {
+        // > 8 MiB of unparseable tail (a pathological/foreign file):
+        // the scan stops at the cap, notes the A8 format anomaly, and
+        // answers Unavailable (crash semantics upstream — owner ruling).
+        let dir = tempfile::tempdir().unwrap();
+        let truth = FsClaudeTruth::with_roots(vec![dir.path().to_path_buf()]);
+        let blob = "x".repeat(9 * 1024 * 1024);
+        write_transcript(dir.path(), "S", &[&blob]);
+        assert!(matches!(truth.probe_turn_state("S"), TurnProbe::Unavailable));
     }
 
     #[test]
@@ -1916,22 +2442,13 @@ elsewhere; add `tempfile` to `crates/freshell-ws/Cargo.toml`
         let truth = FsClaudeTruth::with_roots(vec![dir.path().to_path_buf()]);
         write_transcript(dir.path(), "S", &[TURN_START, TURN_END]);
         let offset = truth.transcript_len("S").unwrap();
-        // Nothing appended yet: no turn started past the offset.
+        // Nothing appended yet: a phantom Enter appends NOTHING.
         assert!(matches!(
             truth.probe_submit("S", offset),
             SubmitProbe::NoTurnStarted
         ));
         // Append a new turn-start: confirmed.
-        {
-            use std::io::Write;
-            let dir2 = dir.path().join("projects").join("-home-user-proj");
-            let mut f = std::fs::OpenOptions::new()
-                .append(true)
-                .open(dir2.join("S.jsonl"))
-                .unwrap();
-            writeln!(f).unwrap();
-            writeln!(f, "{TURN_START}").unwrap();
-        }
+        append_lines(dir.path(), "S", &[TURN_START]);
         assert!(matches!(truth.probe_submit("S", offset), SubmitProbe::Confirmed));
         // Missing transcript: unavailable.
         assert!(matches!(
@@ -1941,21 +2458,27 @@ elsewhere; add `tempfile` to `crates/freshell-ws/Cargo.toml`
     }
 
     #[test]
-    fn tool_result_user_records_are_not_turn_starts() {
+    fn any_transcript_append_confirms_a_submit() {
+        // A1 corrected: slash-command turns (e.g. /goal) run with ZERO
+        // promptSource records, so the probe confirms on ANY appended
+        // non-sidechain transcript record. A tool_result record PROVES
+        // the agent is running — that is a correct confirmation, not a
+        // false positive (deliberate inversion of the earlier
+        // promptSource-only design).
         let dir = tempfile::tempdir().unwrap();
         let truth = FsClaudeTruth::with_roots(vec![dir.path().to_path_buf()]);
         write_transcript(dir.path(), "S", &[TURN_START, TURN_END]);
         let offset = truth.transcript_len("S").unwrap();
-        {
-            use std::io::Write;
-            let dir2 = dir.path().join("projects").join("-home-user-proj");
-            let mut f = std::fs::OpenOptions::new()
-                .append(true)
-                .open(dir2.join("S.jsonl"))
-                .unwrap();
-            writeln!(f).unwrap();
-            writeln!(f, "{TOOL_RESULT}").unwrap();
-        }
+        append_lines(dir.path(), "S", &[TOOL_RESULT]);
+        assert!(matches!(truth.probe_submit("S", offset), SubmitProbe::Confirmed));
+        // A slash-command turn's records carry no promptSource — still
+        // confirmed (assistant output counts too).
+        let offset = truth.transcript_len("S").unwrap();
+        append_lines(dir.path(), "S", &[ASSISTANT]);
+        assert!(matches!(truth.probe_submit("S", offset), SubmitProbe::Confirmed));
+        // Sidechain-only appends do NOT confirm.
+        let offset = truth.transcript_len("S").unwrap();
+        append_lines(dir.path(), "S", &[SIDECHAIN]);
         assert!(matches!(
             truth.probe_submit("S", offset),
             SubmitProbe::NoTurnStarted
@@ -1974,26 +2497,56 @@ Expected: compile FAIL (module doesn't exist).
 
 ```rust
 //! #606/#611: claude session-JSONL truth source ("ask the agent" via its
-//! transcript ledger). Spike-verified against claude-code 2.1.223
-//! (2026-08-06): turn-start = `user` record WITH `promptSource`;
-//! turn-end = `system`/`turn_duration` OR the interrupt marker
-//! (`"[Request interrupted by user]"` user record — ESC writes no
-//! turn_duration). Append order is truth (timestamps are NOT monotonic);
-//! files reach tens of MB, so probes tail-seek and never slurp. Applies
-//! to terminal CLI panes (`entrypoint:"cli"`) — exactly the population
-//! the PTY claude tracker covers.
+//! transcript ledger). Spike-verified against claude-code 2.1.223 and
+//! corpus-validated 2026-08-06 (1561 files / 240k records). Corrected
+//! semantics baked in:
+//! - Turn end = `system`/`turn_duration` OR the interrupt marker, whose
+//!   `message.content` is ARRAY-wrapped (`[{type:"text",text:"[Request
+//!   interrupted by user…]"}]`; a "for tool use" variant exists — match
+//!   by prefix on string OR array shapes). ESC writes no turn_duration;
+//!   an EARLY ESC (before any output) writes no record at all (accepted
+//!   residual: stale blue that self-heals on next input).
+//! - "Ended" means the end-boundary is genuinely LAST among
+//!   non-sidechain user/assistant activity: hook/slash continuations
+//!   legitimately append records AFTER a turn_duration, and activity
+//!   after the boundary means a continuation is running (InFlight).
+//! - Submit confirmation accepts ANY appended parseable non-sidechain
+//!   transcript record: slash-command turns write no promptSource
+//!   record, and a phantom Enter appends nothing.
+//! - The tail scan is ADAPTIVE (256 KiB doubling to an 8 MiB cap):
+//!   individual lines reach 1.37 MB, so a fixed window can land inside
+//!   one record. Zero parseable records at the cap ⇒ Unavailable + the
+//!   A8 drift tripwire (`claude_format_anomaly`).
+//! - Files are append-only with in-place compaction, BUT resume/fork
+//!   mints a NEW `<session-id>.jsonl` seeded with copied records —
+//!   callers must treat offsets as valid only for the session they were
+//!   captured against (Task 11) and rebind on session change (Task 10).
+//! Append order is truth (timestamps are NOT monotonic); files reach
+//! tens of MB, so probes tail-seek and never slurp. Probes apply to
+//! cli-entrypoint panes (`entrypoint:"cli"`) — exactly what freshell
+//! PTY claude panes run; sdk-entrypoint sessions never write
+//! turn_duration and are out of scope.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-/// Read at most this many bytes from the tail for a turn-state probe.
-/// Individual records can be hundreds of KB; the boundary records
-/// (turn-start / turn_duration / interrupt) are small and frequent, so a
-/// 256 KiB window virtually always contains the decisive record. A window
-/// with transcript records but NO boundary record classifies as InFlight
-/// (mid-turn streaming) — conservative toward busy, never toward a false
-/// green.
-const TAIL_PROBE_BYTES: u64 = 256 * 1024;
+/// Initial tail window for a turn-state probe. The boundary records
+/// (turn-start / turn_duration / interrupt) are small and frequent, so
+/// 256 KiB usually contains the decisive record — but corpus lines reach
+/// 1,365,273 bytes, so the window DOUBLES until it parses ≥1 record or
+/// hits [`TAIL_PROBE_MAX_BYTES`].
+const TAIL_PROBE_INITIAL_BYTES: u64 = 256 * 1024;
+
+/// Adaptive-window cap: 8 MiB = 5.9× the largest line observed in the
+/// 1561-file corpus. Zero parseable records at this cap is a format
+/// anomaly (A8 tripwire) and answers Unavailable — crash semantics
+/// upstream, never a silent guess.
+const TAIL_PROBE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// A8 drift tripwire counter: transcript-format anomalies since boot.
+/// Read by GET /api/server-info as "claudeTruthAnomalies" (Task 10).
+pub static CLAUDE_TRUTH_ANOMALIES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnProbe {
@@ -2019,19 +2572,50 @@ pub struct FsClaudeTruth {
     roots: Vec<PathBuf>,
 }
 
+/// A8 drift tripwire: claude-code self-updates roughly daily and these
+/// markers churned within the last month — when the format drifts out
+/// from under the probes, say so LOUDLY (with the newest record's
+/// "version" field, so the log names the build that drifted) instead of
+/// silently mis-lighting. Log-only here; the counter is surfaced on
+/// /api/server-info in Task 10.
+fn note_format_anomaly(session_id: &str, records: &[serde_json::Value], reason: &str) {
+    CLAUDE_TRUTH_ANOMALIES.fetch_add(1, AtomicOrdering::SeqCst);
+    let version = records
+        .iter()
+        .rev()
+        .find_map(|r| r.get("version").and_then(|v| v.as_str()))
+        .unwrap_or("unknown");
+    tracing::warn!(
+        component = "claude-truth",
+        event = "claude_format_anomaly",
+        session_id = %session_id,
+        version = %version,
+        reason = %reason,
+        "claude transcript format anomaly (A8 drift tripwire); probe answers Unavailable/unclassifiable and crash semantics apply upstream"
+    );
+}
+
 impl FsClaudeTruth {
     /// Candidate roots, priority order — the same ladder as
     /// `claude_snapshot.rs`: CLAUDE_CONFIG_DIR > CLAUDE_HOME > ~/.claude.
+    /// Empty-string values are SKIPPED (claude_snapshot.rs precedent —
+    /// an empty env var must not produce a bogus relative root).
     pub fn from_env() -> Self {
         let mut roots = Vec::new();
         if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
-            roots.push(PathBuf::from(dir));
+            if !dir.is_empty() {
+                roots.push(PathBuf::from(dir));
+            }
         }
         if let Ok(dir) = std::env::var("CLAUDE_HOME") {
-            roots.push(PathBuf::from(dir));
+            if !dir.is_empty() {
+                roots.push(PathBuf::from(dir));
+            }
         }
         if let Some(home) = std::env::var_os("HOME") {
-            roots.push(PathBuf::from(home).join(".claude"));
+            if !home.is_empty() {
+                roots.push(PathBuf::from(home).join(".claude"));
+            }
         }
         Self { roots }
     }
@@ -2040,10 +2624,17 @@ impl FsClaudeTruth {
         Self { roots }
     }
 
-    /// The cwd→project-dir slug is LOSSY, so location is a filename scan:
-    /// first `<root>/projects/*/<session_id>.jsonl` wins (priority order).
+    /// The cwd→project-dir slug is LOSSY, so location is a filename scan
+    /// over `<root>/projects/*/<session_id>.jsonl`. Only the slug level
+    /// is scanned: main transcripts live there (verified live); subagent
+    /// sidechain files one level deeper are intentionally NOT scanned.
+    /// Basename uniqueness is EMPIRICAL (0 duplicates in 1561 corpus
+    /// files), not structural — multiple matches warn and the first by
+    /// root-priority order wins.
     fn locate(&self, session_id: &str) -> Option<PathBuf> {
         let file_name = format!("{session_id}.jsonl");
+        let mut found: Option<PathBuf> = None;
+        let mut duplicates = 0usize;
         for root in &self.roots {
             let projects = root.join("projects");
             let Ok(entries) = std::fs::read_dir(&projects) else {
@@ -2052,11 +2643,43 @@ impl FsClaudeTruth {
             for entry in entries.flatten() {
                 let candidate = entry.path().join(&file_name);
                 if candidate.is_file() {
-                    return Some(candidate);
+                    if found.is_none() {
+                        found = Some(candidate);
+                    } else {
+                        duplicates += 1;
+                    }
                 }
             }
         }
-        None
+        if duplicates > 0 {
+            tracing::warn!(
+                component = "claude-truth",
+                session_id = %session_id,
+                duplicates,
+                "multiple transcript files share this session basename; using the first by root priority (uniqueness is empirical, not structural)"
+            );
+        }
+        found
+    }
+
+    /// Adaptive backward tail scan: read the last `window` bytes, double
+    /// the window until ≥1 record parses, the window covers the whole
+    /// file, or the 8 MiB cap is hit. Returns the parsed records (which
+    /// may be empty AT THE CAP — the caller treats that as an anomaly).
+    fn read_tail_records(path: &PathBuf) -> Option<Vec<serde_json::Value>> {
+        let len = std::fs::metadata(path).ok()?.len();
+        let mut window = TAIL_PROBE_INITIAL_BYTES;
+        loop {
+            let from = len.saturating_sub(window);
+            let records = Self::read_records_from(path, from)?;
+            if !records.is_empty() || from == 0 {
+                return Some(records);
+            }
+            if window >= TAIL_PROBE_MAX_BYTES {
+                return Some(records); // empty at cap — anomaly upstream
+            }
+            window = (window * 2).min(TAIL_PROBE_MAX_BYTES);
+        }
     }
 
     /// Read [from, EOF) as lossy UTF-8, split lines, drop the first line
@@ -2098,16 +2721,16 @@ fn is_sidechain(record: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
-/// Turn start: a `user` record WITH `promptSource` (typed/queued/system/
-/// sdk). Tool-result user records carry no promptSource.
-fn is_turn_start(record: &serde_json::Value) -> bool {
-    !is_sidechain(record)
-        && record.get("type").and_then(|v| v.as_str()) == Some("user")
-        && record.get("promptSource").is_some()
-}
+/// The interrupt marker's text — matched by PREFIX so the
+/// "…for tool use]" variant (both exist in the constructor) is covered.
+const INTERRUPT_PREFIX: &str = "[Request interrupted by user";
 
 /// Turn end: `system`/`turn_duration` (exact subtype match — never any
 /// other trailing system record) OR the interrupt marker user record.
+/// Corpus-validated: interrupt `message.content` is ARRAY-wrapped
+/// (`[{type:"text",text:"[Request interrupted by user…]"}]`, 17/17
+/// corpus records); the bare-string shape is kept defensively for older
+/// builds. Prefix match covers the "for tool use" variant.
 fn is_turn_end(record: &serde_json::Value) -> bool {
     if is_sidechain(record) {
         return false;
@@ -2117,22 +2740,55 @@ fn is_turn_end(record: &serde_json::Value) -> bool {
         return record.get("subtype").and_then(|v| v.as_str()) == Some("turn_duration");
     }
     if ty == Some("user") {
-        return record
-            .get("message")
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_str())
-            == Some("[Request interrupted by user]");
+        let Some(content) = record.get("message").and_then(|m| m.get("content")) else {
+            return false;
+        };
+        // String shape (legacy/defensive).
+        if let Some(text) = content.as_str() {
+            return text.starts_with(INTERRUPT_PREFIX);
+        }
+        // Array-of-blocks shape (corpus reality): any {type:"text",text}
+        // block carrying the marker terminates the turn.
+        if let Some(blocks) = content.as_array() {
+            return blocks.iter().any(|block| {
+                block.get("type").and_then(|v| v.as_str()) == Some("text")
+                    && block
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|t| t.starts_with(INTERRUPT_PREFIX))
+            });
+        }
     }
     false
 }
 
-/// Any transcript-shaped record (used to distinguish "mid-turn streaming
-/// tail with no boundary in the window" from "nothing here").
+/// Model ACTIVITY: a non-sidechain user or assistant record. Activity
+/// after the last end-boundary means a continuation is running (corpus:
+/// 236 user + 13 assistant post-turn_duration records — hook and
+/// slash-command continuations). Trailing housekeeping (queue-operation,
+/// away_summary, attachment, …) is NOT activity and neither reopens nor
+/// closes a turn. The end-boundary records themselves are excluded so an
+/// interrupt marker (a user record) does not read as its own
+/// continuation.
+fn is_activity(record: &serde_json::Value) -> bool {
+    !is_sidechain(record)
+        && !is_turn_end(record)
+        && matches!(
+            record.get("type").and_then(|v| v.as_str()),
+            Some("user") | Some("assistant")
+        )
+}
+
+/// Any transcript-shaped record — the submit-probe discriminator (#611):
+/// slash turns write no promptSource record, and a phantom Enter appends
+/// NOTHING, so any appended non-sidechain user/assistant/system record
+/// confirms the agent is running.
 fn is_transcript_record(record: &serde_json::Value) -> bool {
-    matches!(
-        record.get("type").and_then(|v| v.as_str()),
-        Some("user") | Some("assistant") | Some("system") | Some("attachment")
-    )
+    !is_sidechain(record)
+        && matches!(
+            record.get("type").and_then(|v| v.as_str()),
+            Some("user") | Some("assistant") | Some("system")
+        )
 }
 
 impl ClaudeTruth for FsClaudeTruth {
@@ -2140,31 +2796,58 @@ impl ClaudeTruth for FsClaudeTruth {
         let Some(path) = self.locate(session_id) else {
             return TurnProbe::Unavailable;
         };
-        let Ok(meta) = std::fs::metadata(&path) else {
+        let Some(records) = Self::read_tail_records(&path) else {
             return TurnProbe::Unavailable;
         };
-        let from = meta.len().saturating_sub(TAIL_PROBE_BYTES);
-        let Some(records) = Self::read_records_from(&path, from) else {
+        if records.is_empty() {
+            // Adaptive window hit the 8 MiB cap without one parseable
+            // record: format anomaly (A8 tripwire), no truth source.
+            note_format_anomaly(
+                session_id,
+                &records,
+                "zero parseable records at the 8 MiB adaptive-window cap",
+            );
             return TurnProbe::Unavailable;
-        };
-        // Append order is truth: track the LAST boundary seen.
-        let mut last: Option<bool /* true = start, false = end */> = None;
+        }
+        // Append order is truth. Track the last end-boundary and whether
+        // any ACTIVITY (non-sidechain user/assistant) followed it —
+        // activity-after-end means a hook/slash continuation is running.
+        let mut saw_boundary = false;
+        let mut activity_after_boundary = false;
+        let mut any_activity = false;
         let mut any_transcript = false;
         for record in &records {
             any_transcript |= is_transcript_record(record);
             if is_turn_end(record) {
-                last = Some(false);
-            } else if is_turn_start(record) {
-                last = Some(true);
+                saw_boundary = true;
+                activity_after_boundary = false;
+            } else if is_activity(record) {
+                any_activity = true;
+                if saw_boundary {
+                    activity_after_boundary = true;
+                }
             }
         }
-        match last {
-            Some(true) => TurnProbe::InFlight,
-            Some(false) => TurnProbe::Ended,
-            // Boundary outside the window but records streaming: a huge
-            // mid-turn tail — conservative toward busy.
-            None if any_transcript => TurnProbe::InFlight,
-            None => TurnProbe::Unavailable,
+        if saw_boundary {
+            if activity_after_boundary {
+                TurnProbe::InFlight // continuation past the boundary
+            } else {
+                TurnProbe::Ended // boundary genuinely last among activity
+            }
+        } else if any_activity || any_transcript {
+            // No boundary in the (adaptive) window but records present:
+            // a mid-turn streaming tail — conservative toward busy,
+            // never toward a false green.
+            TurnProbe::InFlight
+        } else {
+            // Parseable records, none transcript-shaped: this is not a
+            // session transcript we understand (A8 tripwire).
+            note_format_anomaly(
+                session_id,
+                &records,
+                "parseable records but no boundary and no transcript records",
+            );
+            TurnProbe::Unavailable
         }
     }
 
@@ -2180,7 +2863,11 @@ impl ClaudeTruth for FsClaudeTruth {
         let Some(records) = Self::read_records_from(&path, from_offset) else {
             return SubmitProbe::Unavailable;
         };
-        if records.iter().any(is_turn_start) {
+        // #611 (A1 corrected): ANY appended parseable non-sidechain
+        // transcript record confirms — a tool_result proves the agent is
+        // running; slash turns write no promptSource record; a phantom
+        // Enter appends nothing.
+        if records.iter().any(is_transcript_record) {
             SubmitProbe::Confirmed
         } else {
             SubmitProbe::NoTurnStarted
@@ -2213,8 +2900,11 @@ git commit -m "feat(claude): session-JSONL truth source (turn-state + submit pro
 
 **Files:**
 - Modify: `crates/freshell-activity/src/claude.rs` (`expire` ~:207-235; new fns; tests ~:261-438)
-- Modify: `crates/freshell-ws/src/activity.rs` (`claude_frames` ~:1602-1650; `expire_due` ~:1478-1550; new claude-truth wiring; tests)
+- Modify: `crates/freshell-ws/src/activity.rs` (`claude_frames` ~:1602-1650; `expire_due` ~:1478-1550; new claude-truth wiring; new `bind_claude_session`; tests)
+- Modify: `crates/freshell-ws/src/claude_signal.rs` (rebind apply path calls the hub bind — the missing producer)
 - Modify: `crates/freshell-server/src/main.rs` (boot wiring: install `FsClaudeTruth`)
+- Modify: `crates/freshell-server/src/diag.rs` (`claudeTruthAnomalies` on `/api/server-info` — the A8 tripwire counter surface)
+- Modify: `crates/freshell-activity/src/idle.rs` (new Accepted Residuals entry: early-ESC stale blue)
 
 **Interfaces:**
 - Consumes: Task 9's `ClaudeTruth` trait + `TurnProbe`.
@@ -2227,6 +2917,8 @@ git commit -m "feat(claude): session-JSONL truth source (turn-state + submit pro
   - `pub fn session_id_of(&self, terminal_id: &str) -> Option<String>` — hub accessor for probe routing.
   - `fn claude_frames(…) -> (Vec<ServerMessage>, Vec<String>)` — returns force-reads (like `codex_frames`); `AttentionBoundary` now arms the gate (`idle.note_turn_boundary`) instead of being ignored.
   - `ActivityHub::set_claude_truth(&self, truth: Arc<dyn ClaudeTruth>)` (+ `HubInner.claude_truth: Option<Arc<dyn ClaudeTruth>>`), installed at boot in `main.rs` next to `set_opencode_lane_deps` (~:515): `activity_hub.set_claude_truth(std::sync::Arc::new(freshell_ws::claude_truth::FsClaudeTruth::from_env()));`
+  - `ActivityHub::bind_claude_session(&self, terminal_id: &str, session_id: &str)` — the MISSING rebind producer (validated 2026-08-06: the tracker's `bind_session` at `claude.rs:114` has ZERO production callers, and the SessionStart rebind path — `claude_signal.rs:308-345`: `identity.upsert` → `registry.set_meta` → ledger → broadcast — never reaches the activity tracker, so after an in-TUI `/resume` or `/clear` the deadman/submit probes would read a STALE session's JSONL). Mirrors `bind_codex_session` (`activity.rs:363`); calls `inner.claude.bind_session(terminal_id, session_id, now_ms())` and emits the resulting frames. Called from `apply_claude_signal`'s rebind tail, right where `registry.set_meta` is invoked (`claude_signal.rs:319`).
+  - `/api/server-info` gains `"claudeTruthAnomalies": <u64>` (additive field, read from `freshell_ws::claude_truth::CLAUDE_TRUTH_ANOMALIES` — the A8 drift tripwire; same additive rule as Task 5's `opencodeDriftEvents`).
   - Test hooks: `#[cfg(test)] pub(crate) fn set_claude_busy_deadman_for_tests(&self, ms: i64)`.
 
 **Servicing rule (hub, `expire_due`)** — collect claude force-read terminal
@@ -2587,7 +3279,71 @@ In `activity.rs`:
     ));
 ```
 
-- [ ] **Step 5: Hub-level test**
+6. The rebind producer on `ActivityHub` (next to `bind_codex_session`,
+   ~:363 — copy its lock/emit shape):
+
+```rust
+    /// #606/#611: bind the claude tracker to the pane's CURRENT session.
+    /// This is the producer that was missing: the SessionStart rebind
+    /// path updated identity/registry/ledger but never the activity
+    /// tracker, so after an in-TUI /resume or /clear the deadman verify
+    /// and submit probes read the OLD session's JSONL (and resume/fork
+    /// mints a NEW <session-id>.jsonl, so "old" also means "no longer
+    /// written"). Called from apply_claude_signal's rebind tail.
+    pub fn bind_claude_session(&self, terminal_id: &str, session_id: &str) {
+        let frames = {
+            let mut inner = self.inner.lock().expect("activity hub lock");
+            let at = now_ms();
+            let effects = inner.claude.bind_session(terminal_id, session_id, at);
+            let (frames, _) = claude_frames(&mut inner.idle, effects);
+            frames
+        };
+        self.emit(frames);
+    }
+```
+
+   (Match `bind_session`'s actual signature at `claude.rs:114` — if it
+   takes no `at`, drop the argument; the tracker method already exists
+   and is unit-tested, it just has no production caller.)
+
+7. Wire the producer in `crates/freshell-ws/src/claude_signal.rs`, in
+   `apply_claude_signal`'s rebind tail, immediately after
+   `state.registry.set_meta(…)` (~:319-325):
+
+```rust
+    // #606/#611: the activity tracker must follow the rebind or every
+    // later JSONL probe targets a stale session (validated: zero
+    // production bind_session callers before this line).
+    if let Some(hub) = state.activity.as_ref() {
+        hub.bind_claude_session(&sig.terminal_id, &sig.session_id);
+    }
+```
+
+   (`WsState.activity: Option<ActivityHub>` already exists — `lib.rs:320`;
+   no state plumbing needed.)
+
+8. The A8 tripwire counter surface in
+   `crates/freshell-server/src/diag.rs`, added to `server_info_body`'s
+   `json!` next to Task 5's `opencodeDriftEvents` (same additive rule),
+   plus the matching unit-test line in the existing `server_info_body`
+   test:
+
+```rust
+        // #606 (A8): claude transcript-format anomalies seen by the
+        // JSONL truth source since boot — the drift tripwire that makes
+        // a claude self-update format break visible instead of silent.
+        "claudeTruthAnomalies": freshell_ws::claude_truth::CLAUDE_TRUTH_ANOMALIES
+            .load(std::sync::atomic::Ordering::SeqCst),
+```
+
+```rust
+        assert!(
+            body.get("claudeTruthAnomalies").and_then(|v| v.as_u64()).is_some(),
+            "server-info surfaces the claude format-anomaly tripwire (#606/A8)"
+        );
+```
+
+- [ ] **Step 5: Hub-level tests (deadman probe + rebind producer)**
 
 In `activity.rs` tests, add a `FakeClaudeTruth` (a struct holding
 `Mutex<TurnProbe>` implementing `ClaudeTruth`; `transcript_len → None` —
@@ -2614,19 +3370,62 @@ sibling `claude_deadman_unavailable_truth_rings_attention` asserting a
 `terminal.idle` frame (reason `grace`) arrives after the deadman when the
 fake returns `Unavailable`.
 
-Run: `cargo test -p freshell-ws claude_deadman`
+Also write the rebind-producer test FIRST (red before Step 4 items 6-7
+land). Give `FakeClaudeTruth` a `probed: Mutex<Vec<String>>` field that
+records every `session_id` passed to `probe_turn_state`, then:
+
+```rust
+    /// #606/#611 (A4): an in-TUI /resume or /clear rebinds the pane to a
+    /// NEW session id; the tracker must follow or every later probe
+    /// reads the OLD session's JSONL. Red until bind_claude_session
+    /// exists and is wired.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn claude_rebind_reaches_the_tracker_and_probes_the_new_session() { … }
+```
+
+Build: `Created{mode:"claude", resume_session_id: Some("S1")}`;
+`hub.set_claude_truth(Arc::new(fake))` (fake returns `InFlight`);
+`hub.set_claude_busy_deadman_for_tests(300)`; `Input{data:"\r"}`;
+`hub.bind_claude_session("t1", "S2")`; assert
+`hub.claude_session_id_for_tests("t1") == Some("S2")` (add that
+`#[cfg(test)]` accessor delegating to `session_id_of`); sleep past the
+deadman and assert the fake's `probed` log contains `"S2"` and its LAST
+entry is not `"S1"` — the probe after rebind targets the NEW session.
+(The claude_signal.rs call site is one `if let` — its wiring is covered
+by the existing `crates/freshell-ws/tests/claude_session_rebind.rs`
+integration suite compiling and passing with the hub present.)
+
+Run: `cargo test -p freshell-ws claude_deadman claude_rebind`
 Expected: PASS.
 
 - [ ] **Step 6: Run full crate suites**
 
-Run: `cargo test -p freshell-activity && cargo test -p freshell-ws && cargo build -p freshell-server`
+Run: `cargo test -p freshell-activity && cargo test -p freshell-ws && cargo test -p freshell-server && cargo build -p freshell-server`
 Expected: PASS / builds.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 7: Update the residual registry**
+
+In `crates/freshell-activity/src/idle.rs`, append a NEW Accepted
+Residuals entry (next number after the existing list):
+
+```rust
+//! 13. (NAMED by #606, 2026-08-06) An EARLY-ESC interrupt — ESC before
+//!     any assistant output — writes NO transcript record at all
+//!     (corpus-verified), so the JSONL truth source cannot distinguish
+//!     it from a long silent tool call: the pane keeps an honest-stale
+//!     blue until the user's next input, at which point the submit
+//!     probe / deadman verify self-heals it. Accepted: no deterministic
+//!     discriminator exists, and a stale blue that self-heals is the
+//!     conservative direction (never a false green).
+```
+
+Run: `cargo test -p freshell-activity` (doc-only change; suite green).
+
+- [ ] **Step 8: Commit**
 
 ```bash
-git add crates/freshell-activity/src/claude.rs crates/freshell-ws/src/activity.rs crates/freshell-server/src/main.rs
-git commit -m "fix(claude): output deadman verifies against session JSONL; verified end rings, probe failure rings attention (#606)"
+git add crates/freshell-activity/src/claude.rs crates/freshell-ws/src/activity.rs crates/freshell-ws/src/claude_signal.rs crates/freshell-server/src/main.rs crates/freshell-server/src/diag.rs crates/freshell-activity/src/idle.rs
+git commit -m "fix(claude): output deadman verifies against session JSONL; rebinds reach the tracker; verified end rings, probe failure rings attention (#606)"
 ```
 
 ---
@@ -2643,8 +3442,15 @@ option; the codex-style fixed pending gate is NOT used):**
 - A submit on an Idle pane whose truth source is usable
   (`confirmable == true`) marks PROVISIONAL busy: `busy_confirmed = false`,
   `in_flight` NOT incremented (this kills the phantom-BEL-consumption skew),
-  grace deadline armed. Confirmation comes from the JSONL: a turn-start
-  user record appended past the byte offset captured at submit time.
+  grace deadline armed. Confirmation comes from the JSONL: ANY parseable
+  non-sidechain transcript record appended past the byte offset captured
+  at submit time (Task 9's corrected `probe_submit` — slash-command
+  turns write no promptSource record; a phantom Enter appends nothing).
+  The stashed offset is SESSION-SCOPED: resume/fork mints a NEW
+  `<session-id>.jsonl` (A7) and rebinds now reach the tracker (Task 10),
+  so an offset captured against one session must never be probed against
+  another — a session mismatch at probe time is treated as
+  `Unavailable` (the #606 deadman is the deterministic backstop).
 - Grace expiry: first lapse → ONE `ForceRead` (confirm probe) + extend
   grace once (amplifier's exact contract); second lapse → SILENT revert to
   Idle (no completion, no bell — a no-op Enter is not attention-worthy;
@@ -2677,7 +3483,7 @@ option; the codex-style fixed pending gate is NOT used):**
   - `pub fn note_submit_unconfirmed(&mut self, terminal_id: &str, at: i64) -> Vec<ClaudeEffect>` — silent revert when provisional: phase→Idle, no completion.
   - `pub fn note_submit_probe_unavailable(&mut self, terminal_id: &str)` — clears the grace deadline, keeps provisional busy (deadman backstop takes over).
   - `pub fn is_awaiting_submit_confirm(&self, terminal_id: &str) -> bool` — hub routing: distinguishes the confirm-probe flavor from the deadman-verify flavor of `ForceRead`.
-  - Hub: `HubInner.claude_submit_offsets: HashMap<String, u64>` — stashed at submit time in the Input arm; consumed by the confirm probe.
+  - Hub: `HubInner.claude_submit_offsets: HashMap<String, (String, u64)>` — `(session_id, offset)` stashed at submit time in the Input arm; consumed by the confirm probe ONLY when the currently-bound session id equals the stashed one (else the probe is `Unavailable` — deadman backstop). Session-scoping is load-bearing: A7's resume/fork mints a new file, and Task 10's rebinds re-point the tracker mid-flight.
 
 - [ ] **Step 1: Write the failing tracker tests**
 
@@ -2959,10 +3765,11 @@ clear (add those two lines to each) so state never wedges.
 
 In `activity.rs`:
 
-1. `HubInner.claude_submit_offsets: HashMap<String, u64>` (Default empty;
-   remove the entry in the Exit teardown block alongside `lanes.remove`).
+1. `HubInner.claude_submit_offsets: HashMap<String, (String, u64)>`
+   (`(session_id, offset)`; Default empty; remove the entry in the Exit
+   teardown block alongside `lanes.remove`).
 2. Input arm (claude case, ~:1071-1075): compute `confirmable` and stash
-   the offset BEFORE calling the tracker:
+   the SESSION-SCOPED offset BEFORE calling the tracker:
 
 ```rust
                         "claude" => {
@@ -2973,9 +3780,14 @@ In `activity.rs`:
                                     (Some(session_id), Some(truth)) => {
                                         match truth.transcript_len(session_id) {
                                             Some(len) => {
-                                                inner
-                                                    .claude_submit_offsets
-                                                    .insert(terminal_id.clone(), len);
+                                                // #611 + A7: the offset is
+                                                // valid ONLY for this
+                                                // session — resume/fork
+                                                // mints a new file.
+                                                inner.claude_submit_offsets.insert(
+                                                    terminal_id.clone(),
+                                                    (session_id.clone(), len),
+                                                );
                                                 true
                                             }
                                             None => false,
@@ -3005,9 +3817,18 @@ In `activity.rs`:
 ```rust
         if awaiting_confirm {
             use crate::claude_truth::SubmitProbe;
-            let probe = match (&session, &truth, offset) {
-                (Some(session_id), Some(truth), Some(offset)) => {
-                    truth.probe_submit(session_id, offset)
+            // #611 + A7: the stash is (session_id, offset) — usable ONLY
+            // if the currently-bound session equals the stashed one.
+            // Resume/fork mints a NEW <session-id>.jsonl and Task 10's
+            // rebinds re-point the tracker mid-flight; probing a foreign
+            // file with a stale offset would be an undefined read, so a
+            // mismatch is a probe failure (Unavailable) and the #606
+            // deadman backstop takes over.
+            let probe = match (&session, &truth, &offset) {
+                (Some(session_id), Some(truth), Some((stashed_session, offset)))
+                    if stashed_session == session_id =>
+                {
+                    truth.probe_submit(session_id, *offset)
                 }
                 _ => SubmitProbe::Unavailable,
             };
@@ -3052,7 +3873,19 @@ Extend `FakeClaudeTruth` (Task 10) with scripted `transcript_len` /
 with `phase == "idle"`; assert NO `terminal.turn.complete` and NO
 `terminal.idle` frame arrived meanwhile.)
 
-Run: `cargo test -p freshell-ws claude_bare_enter && cargo test -p freshell-activity && cargo test -p freshell-ws`
+Add the session-scoping sibling
+`claude_rebind_between_stash_and_probe_is_unavailable`: same setup with
+the fake's `probe_submit` scripted to `Confirmed` and its `probed` log
+recording calls; send `Input{data:"\r"}` (stashes `("S", 100)`), then
+`hub.bind_claude_session("t1", "S2")` BEFORE the grace probe fires;
+assert the fake's `probe_submit` log stays EMPTY (mismatch ⇒ no read of
+a foreign file), the pane stays provisionally busy (no idle upsert
+within the grace window — `note_submit_probe_unavailable` cleared the
+grace), and the #606 deadman path remains armed
+(`hub.set_claude_busy_deadman_for_tests` + the fake's turn-state probe
+eventually fires against `"S2"`).
+
+Run: `cargo test -p freshell-ws claude_bare_enter claude_rebind_between && cargo test -p freshell-activity && cargo test -p freshell-ws`
 Expected: PASS.
 
 - [ ] **Step 6: Commit**
@@ -3360,9 +4193,9 @@ pub(crate) fn lane_retry_delay_ms(failures: u32) -> i64 {
    re-attach owns recovery`) — the effects still flow through
    `amplifier_frames` for their `Changed` frames, but the collected
    force-read list at that call site is discarded.
-5. **Gap-loss rule (deterministic, stated):** records appended during a
-   degrade gap are unverifiable (re-attach is `AttachAt::Eof`). Extend
-   `LaneRetry` with `bytes_at_degrade: Option<u64>`, captured in
+5. **Gap-loss rule (deterministic, stated, SCOPED):** records appended
+   during a degrade gap are unverifiable (re-attach is `AttachAt::Eof`).
+   Extend `LaneRetry` with `bytes_at_degrade: Option<u64>`, captured in
    `note_lane_failure` on the FIRST failure of an episode
    (`failures == 1`) via
    `std::fs::metadata(events_path).ok().map(|m| m.len())`. In
@@ -3379,6 +4212,24 @@ pub(crate) fn lane_retry_delay_ms(failures: u32) -> i64 {
    events file between the injected degrade and the retry window, assert
    the `terminal.idle` + idle upsert; and the inverse: no growth ⇒ busy
    record survives re-attach).
+
+   Scope + accepted residuals (validated 2026-08-06 against the amplifier
+   writer source and on-disk forensics):
+   - The length-delta rule is sound WITHIN a session-id's lifetime: the
+     writer appends with `open("a")` (append-only, stable path), and a
+     shrink already degrades via `FileReset` (`tailer.rs:166-175`) — so
+     within one sid, "length unchanged" deterministically means "nothing
+     was written".
+   - A FRESH amplifier restart mints a NEW sid → a NEW `events.jsonl`
+     that nothing re-attaches; a turn completing there leaves the tailed
+     path unchanged. That is the pre-existing, documented DD6 legacy gap
+     (`activity.rs:1529-1534`) and is explicitly OUT OF SCOPE here.
+     `amplifier session resume <sid>` reuses the same file and IS
+     covered by this rule.
+   - Ring-on-inert-growth: growth during a blind gap consisting only of
+     status-inert records still rings (ring-on-growth is the rule) —
+     deterministic and aligned with owner ruling 4 (unverifiable ⇒
+     ring), accepted and named in Step 7.
 
 - [ ] **Step 6: Run the suites**
 
@@ -3397,6 +4248,16 @@ is unchanged).
 - `activity.rs` comment at ~:78 ("after the last entry the lane gives up
   LOUDLY") → "after the last entry the cap repeats forever; the first
   past-schedule failure rings crash semantics (#605)".
+- `activity.rs` DD6 comment (~:1529-1534): extend it with the #605
+  scope statement so the two gaps are never conflated: "The gap-loss
+  length-delta rule (#605) is scoped to a session-id's lifetime — a
+  FRESH amplifier restart mints a new sid → a new events.jsonl that
+  nothing re-attaches; that is THIS legacy gap (DD6), unchanged by #605.
+  `amplifier session resume <sid>` reuses the file and IS covered."
+  Also name the accepted ring-on-inert-growth residual next to it:
+  "growth during a blind gap consisting only of status-inert records
+  still rings — deterministic, aligned with owner ruling 4
+  (unverifiable ⇒ ring)."
 
 Run: `cargo test -p freshell-ws` (doc-only recheck).
 
@@ -3419,7 +4280,23 @@ git commit -m "fix(amplifier): signal loss verifies via force-read; retries cap-
 **Owner ruling recap:** external `kill -9`/SIGTERM keeps ringing (intended;
 no work). User-typed quits through freshell's own input stream — `/quit`,
 `/exit`, Ctrl+D (0x04), Ctrl+C (0x03) — must NOT ring. Freshell owns the
-PTY input, so these are deterministic byte observations.
+PTY input: the tap is `ActivityEvent::Input` fired from
+`crates/freshell-terminal/src/registry.rs:1338` (NOT freshell-ws — the
+`input()` path writes the bytes to the PTY and taps them verbatim), so
+these are deterministic byte observations.
+
+**Validated byte shapes (3-codebase inspection, 2026-08-06):** Ctrl+C =
+0x03, Ctrl+D = 0x04, Enter = `\r` arrive raw and in-order. BUT pastes
+arrive WRAPPED in bracketed-paste framing: both agent TUIs enable DECSET
+2004 unconditionally, and xterm.js frames every paste as `\x1b[200~` +
+text (with `\n` normalized to `\r`) + `\x1b[201~` — a pasted `/exit`
+followed by Enter arrives as `"\x1b[200~/exit\x1b[201~"` then a separate
+`"\r"`. Under a naive "ESC poisons the line" rule, pasted quits would be
+100% undetectable — hence the framing rules below. Additionally,
+freshell's own client injects DECRQM reports
+(`\x1b[?<mode>;<status>$y`, `request-mode-bypass.ts:256`) as synthetic
+input replies — an exact-grammar skip keeps them from poisoning the line
+(deterministic, not a heuristic).
 
 **Marker rules (exact, stated — not tuned probabilities):**
 1. A quit-intent input observed at time T sets the terminal's marker to T
@@ -3436,15 +4313,43 @@ PTY input, so these are deterministic byte observations.
 
 **Line-buffer rules for detecting typed `/quit` / `/exit` (exact):** per
 terminal, keep a small line buffer (cap 32 bytes). For each char of each
-input chunk, in order: `\r`/`\n` → evaluate (trimmed buffer == "/quit" or
-"/exit" ⇒ quit-intent), then clear the buffer; printable (` `..`~` or
-non-ASCII) → append (if the cap is hit, mark the line unmatchable until
-the next newline); 0x7f/0x08 (backspace) → pop one; 0x03 (Ctrl+C) / 0x04
-(Ctrl+D) → quit-intent immediately + clear buffer; ESC 0x1b or any other
-control byte → clear the buffer and mark unmatchable until the next
-newline (arrow-key/TUI-menu escape sequences make the buffer meaningless —
-that narrow slice, e.g. a TUI menu quit via arrows+Enter, remains
-agent-evidence-dependent; it is named in the residual note).
+input chunk, in order:
+
+1. **Escape accumulator (runs first, split-chunk safe):** on ESC 0x1b,
+   accumulate into a pending buffer and keep accumulating while the run
+   is still a proper prefix of a RECOGNIZED sequence — `\x1b[200~`
+   (paste begin), `\x1b[201~` (paste end), or a DECRQM report matching
+   exactly `ESC [ ? <digits> ; <digit> $ y`. Markers split across input
+   chunks therefore still match (paste atomicity is observed but not
+   contractual). A completed `200~`/`201~` toggles paste framing and
+   does NOT poison (the framing itself is not user line content); a
+   completed DECRQM report is consumed WITHOUT poisoning (freshell's own
+   client injects these as synthetic input replies — exact-grammar skip,
+   deterministic). A run that can no longer become any recognized
+   sequence falls to rule 5 (poison), and its final char is reprocessed
+   through the normal rules (so a trailing `\r` still evaluates and a
+   fresh ESC restarts the accumulator).
+2. **Inside paste framing (`200~`…`201~`):** printable chars append to
+   the line buffer (same cap rule); `\r`/`\n` do NOT evaluate — a
+   literal pasted newline clears the buffer and continues (a pasted
+   multi-line blob is not a submit); 0x03/0x04 are literal DATA, not
+   quit intents (they clear the buffer and mark it unmatchable);
+   0x7f/DEL is data too (same treatment). After `201~`, normal
+   classification resumes, so a following REAL Enter evaluates the
+   pasted line — pasting `/quit` then pressing Enter IS a quit intent.
+3. **Outside framing:** `\r`/`\n` → evaluate (trimmed buffer == "/quit"
+   or "/exit" ⇒ quit-intent), then clear the buffer; printable
+   (` `..`~` or non-ASCII) → append (if the cap is hit, mark the line
+   unmatchable until the next newline); 0x7f/0x08 (backspace) → pop one.
+4. 0x03 (Ctrl+C) / 0x04 (Ctrl+D) outside framing → quit-intent
+   immediately + clear buffer.
+5. Any OTHER control byte or unrecognized escape run → clear the buffer
+   and mark unmatchable until the next newline (arrow-key/TUI-menu
+   escape sequences make the buffer meaningless — that narrow slice,
+   e.g. a TUI menu quit via arrows+Enter, remains
+   agent-evidence-dependent; it is named in the residual note, along
+   with the paste-embedded-newline shape `/exit\r` INSIDE one paste,
+   which rule 2 deliberately clears).
 
 **Interfaces:**
 - Produces in `signal.rs`:
@@ -3454,15 +4359,23 @@ agent-evidence-dependent; it is named in the residual note).
 pub struct QuitIntentState {
     line: String,
     unmatchable: bool,
+    /// Inside xterm.js bracketed-paste framing (ESC[200~ … ESC[201~).
+    in_paste: bool,
+    /// Partial escape run carried across chunk boundaries while we
+    /// decide whether it is a paste marker or a DECRQM report.
+    pending_esc: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputClass {
-    /// Ctrl+C / Ctrl+D, or a submitted line equal to /quit or /exit.
+    /// Ctrl+C / Ctrl+D (outside paste framing), or a submitted line
+    /// equal to /quit or /exit — including a pasted one evaluated by a
+    /// later real Enter.
     QuitIntent,
     /// A submitted line that is NOT a quit command.
     NonQuitSubmit,
-    /// Anything else (typing, escape sequences, partial chunks).
+    /// Anything else (typing, escape sequences, paste content, partial
+    /// chunks).
     Other,
 }
 
@@ -3511,11 +4424,72 @@ at ~:283):
         // …and the poison clears after that newline.
         assert_eq!(classify_input(&mut s, "/quit\r"), InputClass::QuitIntent);
     }
+
+    #[test]
+    fn bracketed_paste_framing_rules() {
+        // A16 validated: both agent TUIs enable DECSET 2004, so xterm.js
+        // frames EVERY paste as \x1b[200~ + text + \x1b[201~ (with \n
+        // normalized to \r). The framing is not user line content: it
+        // must not poison, and the pasted text is literal.
+        let mut s = QuitIntentState::default();
+
+        // Pasted "/exit" then a real Enter (the exact wire shape:
+        // one framed chunk, then a separate "\r") ⇒ QuitIntent.
+        assert_eq!(
+            classify_input(&mut s, "\u{1b}[200~/exit\u{1b}[201~"),
+            InputClass::Other
+        );
+        assert_eq!(classify_input(&mut s, "\r"), InputClass::QuitIntent);
+
+        // 0x03 INSIDE framing is literal pasted data, NOT a quit gesture.
+        assert_eq!(
+            classify_input(&mut s, "\u{1b}[200~ab\u{3}cd\u{1b}[201~"),
+            InputClass::Other
+        );
+        assert_eq!(classify_input(&mut s, "\r"), InputClass::NonQuitSubmit);
+
+        // A literal pasted newline clears the buffer (a multi-line blob
+        // is not a submit); the last pasted line still evaluates at the
+        // following REAL Enter.
+        assert_eq!(
+            classify_input(&mut s, "\u{1b}[200~echo hi\rls\u{1b}[201~"),
+            InputClass::Other
+        );
+        assert_eq!(classify_input(&mut s, "\r"), InputClass::NonQuitSubmit);
+
+        // Markers split across chunks (paste atomicity is observed, not
+        // contractual — reconnect buffering can slice anywhere).
+        assert_eq!(classify_input(&mut s, "\u{1b}[20"), InputClass::Other);
+        assert_eq!(classify_input(&mut s, "0~/quit"), InputClass::Other);
+        assert_eq!(classify_input(&mut s, "\u{1b}[201~"), InputClass::Other);
+        assert_eq!(classify_input(&mut s, "\r"), InputClass::QuitIntent);
+    }
+
+    #[test]
+    fn decrqm_reports_do_not_poison() {
+        // A16.2: freshell's own client auto-answers DECRQM as synthetic
+        // INPUT (\x1b[?<mode>;<status>$y, request-mode-bypass.ts:256).
+        // Exact-grammar skip — a user typing /quit right after such a
+        // reply (no intervening Enter) must still be detected.
+        let mut s = QuitIntentState::default();
+        assert_eq!(classify_input(&mut s, "\u{1b}[?2004;1$y"), InputClass::Other);
+        assert_eq!(classify_input(&mut s, "/quit\r"), InputClass::QuitIntent);
+
+        // Split across chunks too.
+        assert_eq!(classify_input(&mut s, "\u{1b}[?20"), InputClass::Other);
+        assert_eq!(classify_input(&mut s, "04;1$y/exit\r"), InputClass::QuitIntent);
+
+        // A NEAR-miss (wrong grammar) still poisons like any other
+        // escape sequence — the skip is exact, not a heuristic.
+        assert_eq!(classify_input(&mut s, "\u{1b}[?2004;1$z"), InputClass::Other);
+        assert_eq!(classify_input(&mut s, "/quit\r"), InputClass::NonQuitSubmit);
+        assert_eq!(classify_input(&mut s, "/quit\r"), InputClass::QuitIntent);
+    }
 ```
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `cargo test -p freshell-activity quit_intent_classification`
+Run: `cargo test -p freshell-activity quit_intent_classification bracketed_paste_framing decrqm_reports`
 Expected: compile FAIL.
 
 - [ ] **Step 3: Implement the classifier**
@@ -3524,16 +4498,145 @@ In `signal.rs`:
 
 ```rust
 /// #612: deterministic quit-intent detection on freshell's own PTY input
-/// stream. Rules (exact, stated): Ctrl+C/Ctrl+D are immediate quit
-/// intents; a submitted line equal to "/quit" or "/exit" (after trimming)
-/// is a quit intent; escape sequences poison the line buffer until the
+/// stream (tapped at freshell-terminal registry.rs:1338). Rules (exact,
+/// stated): Ctrl+C/Ctrl+D outside paste framing are immediate quit
+/// intents; a submitted line equal to "/quit" or "/exit" (after
+/// trimming) is a quit intent — including a PASTED one evaluated by a
+/// later real Enter (both agent TUIs enable DECSET 2004, so xterm.js
+/// frames every paste as ESC[200~…ESC[201~; the framing is unwrapped
+/// here and never poisons); well-formed DECRQM reports
+/// (ESC [ ? digits ; digit $ y — freshell's own client injects them as
+/// synthetic input replies) are consumed without poisoning; any OTHER
+/// escape sequence or control byte poisons the line buffer until the
 /// next newline (TUI-menu quits are NOT detectable here — that residual
 /// stays agent-evidence-dependent, idle.rs entry 11).
 const QUIT_LINE_CAP: usize = 32;
 
+/// What a partially-accumulated escape run currently is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscMatch {
+    /// A proper prefix of a recognized sequence — keep accumulating
+    /// (this is what tolerates markers split across input chunks:
+    /// paste atomicity is observed, not contractual).
+    Prefix,
+    PasteBegin,
+    PasteEnd,
+    /// A complete DECRQM report — consume WITHOUT poisoning.
+    Decrqm,
+    /// Cannot become any recognized sequence: unrecognized escape —
+    /// the poison rule applies.
+    Fail,
+}
+
+/// Exact-grammar matcher for the three escape sequences the classifier
+/// understands: ESC[200~, ESC[201~, and ESC [ ? <digits> ; <digit> $ y.
+/// Deterministic — an exact grammar, not a general escape parser.
+fn match_esc(seq: &str) -> EscMatch {
+    const BEGIN: &str = "\u{1b}[200~";
+    const END: &str = "\u{1b}[201~";
+    if seq == BEGIN {
+        return EscMatch::PasteBegin;
+    }
+    if seq == END {
+        return EscMatch::PasteEnd;
+    }
+    let paste_prefix = BEGIN.starts_with(seq) || END.starts_with(seq);
+    // DECRQM state machine; st == 8 means a complete report.
+    let mut st = 0u8;
+    let mut decrqm = true;
+    for c in seq.chars() {
+        st = match (st, c) {
+            (0, '\u{1b}') => 1,
+            (1, '[') => 2,
+            (2, '?') => 3,
+            (3, d) if d.is_ascii_digit() => 4,
+            (4, d) if d.is_ascii_digit() => 4,
+            (4, ';') => 5,
+            (5, d) if d.is_ascii_digit() => 6,
+            (6, '$') => 7,
+            (7, 'y') => 8,
+            _ => {
+                decrqm = false;
+                break;
+            }
+        };
+    }
+    if decrqm && st == 8 {
+        return EscMatch::Decrqm;
+    }
+    if paste_prefix || (decrqm && st < 8) {
+        return EscMatch::Prefix;
+    }
+    EscMatch::Fail
+}
+
 pub fn classify_input(state: &mut QuitIntentState, data: &str) -> InputClass {
     let mut class = InputClass::Other;
     for c in data.chars() {
+        // --- escape accumulator (paste markers + DECRQM), runs first ---
+        if !state.pending_esc.is_empty() {
+            state.pending_esc.push(c);
+            match match_esc(&state.pending_esc) {
+                EscMatch::Prefix => continue,
+                EscMatch::PasteBegin => {
+                    state.pending_esc.clear();
+                    state.in_paste = true; // framing itself never poisons
+                    continue;
+                }
+                EscMatch::PasteEnd => {
+                    state.pending_esc.clear();
+                    state.in_paste = false; // normal classification resumes
+                    continue;
+                }
+                EscMatch::Decrqm => {
+                    // Synthetic client reply (request-mode-bypass.ts:256)
+                    // — consumed, no poison.
+                    state.pending_esc.clear();
+                    continue;
+                }
+                EscMatch::Fail => {
+                    // Unrecognized escape: the poison rule — then this
+                    // final char is REPROCESSED below (a trailing \r
+                    // must still evaluate; a fresh ESC restarts the
+                    // accumulator).
+                    state.pending_esc.clear();
+                    state.line.clear();
+                    state.unmatchable = true;
+                }
+            }
+        }
+        if c == '\u{1b}' {
+            state.pending_esc.push(c);
+            continue;
+        }
+        if state.in_paste {
+            // Inside bracketed-paste framing: EVERYTHING is literal
+            // pasted data.
+            match c {
+                '\r' | '\n' => {
+                    // A literal pasted newline: a multi-line blob is not
+                    // a submit — drop the finished line; the LAST pasted
+                    // line remains evaluable by a later real Enter.
+                    state.line.clear();
+                    state.unmatchable = false;
+                }
+                c if c >= ' ' && c != '\u{7f}' => {
+                    if state.line.len() >= QUIT_LINE_CAP {
+                        state.unmatchable = true;
+                    } else if !state.unmatchable {
+                        state.line.push(c);
+                    }
+                }
+                _ => {
+                    // Pasted control bytes — including 0x03/0x04 — are
+                    // DATA, not quit gestures; they also make the pasted
+                    // line meaningless.
+                    state.line.clear();
+                    state.unmatchable = true;
+                }
+            }
+            continue;
+        }
         match c {
             '\u{3}' | '\u{4}' => {
                 state.line.clear();
@@ -3546,7 +4649,13 @@ pub fn classify_input(state: &mut QuitIntentState, data: &str) -> InputClass {
                 // A quit anywhere in the chunk wins over a later submit.
                 if is_quit {
                     class = InputClass::QuitIntent;
-                } else if class != InputClass::QuitIntent && !line.is_empty() {
+                } else if class != InputClass::QuitIntent
+                    && (!line.is_empty() || state.unmatchable)
+                {
+                    // A poisoned line still SUBMITTED something — the
+                    // user is driving the pane, so this counts as a
+                    // NonQuitSubmit (marker clears). A bare Enter on a
+                    // clean empty buffer stays Other.
                     class = InputClass::NonQuitSubmit;
                 }
                 state.line.clear();
@@ -3563,8 +4672,8 @@ pub fn classify_input(state: &mut QuitIntentState, data: &str) -> InputClass {
                 }
             }
             _ => {
-                // ESC / other control bytes: the buffer no longer
-                // represents the visible line.
+                // Other control bytes: the buffer no longer represents
+                // the visible line.
                 state.line.clear();
                 state.unmatchable = true;
             }
@@ -3574,10 +4683,15 @@ pub fn classify_input(state: &mut QuitIntentState, data: &str) -> InputClass {
 }
 ```
 
-(Note: a bare Enter on an empty buffer is `Other` — it neither sets nor
-clears the marker; that keeps stray-Enter noise out of the marker rules.)
+(Notes: a bare Enter on a clean empty buffer is `Other` — it neither
+sets nor clears the marker, keeping stray-Enter noise out of the marker
+rules. An Enter on a POISONED line is `NonQuitSubmit` — something was
+submitted, the user is driving the pane — which the escape-poison test
+above pins. Framing state is per-terminal and survives chunk
+boundaries; the `Fail` arm reprocesses its final char so a split
+unrecognized sequence ending in `\r` still evaluates.)
 
-Run: `cargo test -p freshell-activity quit_intent_classification` — PASS.
+Run: `cargo test -p freshell-activity quit_intent_classification bracketed_paste_framing decrqm_reports` — PASS.
 
 - [ ] **Step 4: Write the failing hub tests**
 
@@ -3676,10 +4790,15 @@ rings) and `freshell_initiated_kill_while_busy_stays_silent`.
 //!  (#612, 2026-08-06) User-typed quits through freshell's own input
 //!  stream — /quit, /exit, Ctrl+D, Ctrl+C — now suppress the death bell
 //!  via a 15s quit-intent marker (signal::classify_input; exact rules
-//!  there). Remaining residuals, adjudicated: out-of-band kill -9 RINGS
-//!  (intended — a working agent killed externally is worth announcing);
-//!  TUI-menu quits driven by escape sequences produce no detectable byte
-//!  sequence and stay agent-evidence-dependent; /quit typed as literal
+//!  there, including bracketed-paste unwrapping — a PASTED /quit
+//!  evaluated by a real Enter is detected — and the DECRQM
+//!  exact-grammar skip for freshell's own synthetic replies). Remaining
+//!  residuals, adjudicated: out-of-band kill -9 RINGS (intended — a
+//!  working agent killed externally is worth announcing); TUI-menu
+//!  quits driven by escape sequences produce no detectable byte
+//!  sequence and stay agent-evidence-dependent; a paste that embeds its
+//!  own newline after the quit line ("/exit\r…" INSIDE one paste) is
+//!  treated as a multi-line blob, not a submit; /quit typed as literal
 //!  prompt text followed by a crash within 15s is the one accepted
 //!  false-suppress.
 ```
@@ -3854,7 +4973,10 @@ not exist):
             // this script every build in that state (4 subprocess calls,
             // an acceptable deterministic cost) — which guarantees a
             // later fetch/ff-pull writing the ref LOOSE can never be
-            // missed by the stamp.
+            // missed by the stamp. Files-backend assumed (which is what
+            // this repo uses): with git's reftable backend the loose-ref
+            // path NEVER exists, so this watch degrades to permanent
+            // re-runs and provides no ref-update signal from this path.
             paths.push(PathBuf::from(ref_path));
         }
     }
@@ -3989,7 +5111,7 @@ is out of scope: do NOT touch the live server.
 
 ```bash
 cargo fmt --all --check
-cargo clippy -p freshell-activity -p freshell-ws -p freshell-server --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p freshell-activity
 cargo test -p freshell-ws
 cargo test -p freshell-server
@@ -3997,14 +5119,26 @@ cargo test -p freshell-protocol
 ./scripts/build-stamp-check.sh
 ```
 
+(The clippy line is CI PARITY — workspace-wide, all targets, warnings
+denied — so a local green here guarantees the PR check cannot fail on
+lint.) Keep `CARGO_TARGET_DIR` unset and run cargo from the worktree —
+that is the audited-safe configuration (the live server's binary lives
+outside this worktree's `target/`).
+
 Expected: all green. Fix any fmt/clippy fallout (formatting-only commits
 are fine: `style: cargo fmt fallout`).
 
 - [ ] **Step 2: Node suite (no TS was modified — regression gate only)**
 
 ```bash
-npm run test:vitest
+CI=1 npm run test:vitest
 ```
+
+(`CI=1` forces non-interactive run mode — never leave vitest in watch
+mode. GUARD: the bare `test:vitest` script is CLIENT-scoped and safe;
+NEVER run server-scoped vitest configs on this host without HOME
+isolation — `test/server/fresh-agent-extras` writes the real
+`~/.freshell`.)
 
 Expected: green (identical to a pre-branch run). If a failure appears,
 bisect against `origin/main` before assuming it is ours — this plan
@@ -4024,18 +5158,25 @@ source before changing any light; verify-probe failure = crash semantics
 
 - #603/#604: opencode deadman verifies via GET /session/status through
   the lane (current cycle/stream stamps); snapshot parse trouble degrades
-  toward busy or fails loud; permission.v2.*/question.* vocabulary;
-  drift contradiction detector (+ server-info counter).
+  toward busy or fails loud; permission.* + question.* vocabulary in
+  BOTH v1 and v2 families (v1 is what TUI-driven turns emit at 1.18.14;
+  rejection = replied with reply:"reject"); transition-contradiction
+  drift detector (+ server-info counter).
 - #609/#610: per-pane lane busy roots bind identity directly (first-turn
   bells + death rings); Ambiguous re-promotes from a single-busy-root
   verify snapshot.
-- #608: GET /permission resync on reconnect; busy snapshots no longer
-  clear an outstanding pause.
-- #606/#611: claude session-JSONL truth source (spike-verified on
-  2.1.223): deadman verifies (verified end RINGS, probe failure rings
-  attention); bare Enter is provisional busy confirmed by an
-  offset-based JSONL probe (phantom submits revert silently; the
-  phantom-BEL completion skew is gone).
+- #608: GET /permission AND GET /question resync on reconnect (disjoint
+  pending stores; version floor 1.18.x) with stale-pause reconciliation;
+  busy snapshots no longer clear an outstanding pause.
+- #606/#611: claude session-JSONL truth source (corpus-validated
+  2026-08-06, 1561 files/240k records, claude-code 2.1.223): deadman
+  verifies with activity-after-end classification and an adaptive tail
+  window (verified end RINGS, probe failure rings attention); in-TUI
+  /resume //clear rebinds now reach the tracker (new
+  bind_claude_session producer); bare Enter is provisional busy
+  confirmed by a session-scoped offset probe accepting any appended
+  transcript activity (phantom submits revert silently; the phantom-BEL
+  completion skew is gone); A8 format-drift tripwire counter.
 - #605: amplifier signal loss verifies via force-read; lane retries
   cap-and-repeat forever; exhaustion rings attention (no more
   lane-dead-forever).
@@ -4072,38 +5213,59 @@ anything; the live server keeps running its current build.
 Map). Owner rulings: ruling 1 (probe failure = crash) is implemented for
 #603/#604 (Tasks 1-3: `note_verify_failed` + `SnapshotFailed`), #605
 (Task 12 escalation), #606 (Task 10 `Unavailable → note_verify_failed`,
-explicitly including never-bound sessions), #609/#610 (the same opencode
-`note_verify_failed` path covers verify failures in every ownership state,
-Task 1's test pins the mid-pause case). Ruling 2 (#607) → Task 14. Ruling
-3 (#612) → Task 13, both directions pinned. Ruling 4 (#611) → the spike
-succeeded, Task 11 is verify-backed; the bounded-gate fallback is
-deliberately NOT built.
+explicitly including never-bound sessions AND format anomalies caught by
+the A8 tripwire), #609/#610 (the same opencode `note_verify_failed` path
+covers verify failures in every ownership state, Task 1's test pins the
+mid-pause case). Ruling 2 (#607) → Task 14. Ruling 3 (#612) → Task 13,
+both directions pinned, now on the VALIDATED byte shapes (bracketed-paste
+framing + DECRQM exact-grammar skip; the naive raw-bytes model is gone).
+Ruling 4 (#611) → the spike succeeded and was corpus-validated (1561
+files / 240k records) with its falsified clauses corrected in place:
+submit confirmation on ANY appended transcript record (slash turns write
+no promptSource), turn-end via activity-after-boundary (hook/slash
+continuations), array-wrapped interrupt matched by prefix, adaptive tail
+window, resume-forks-new-file handled by session-scoped offsets +
+the Task 10 rebind producer. The bounded-gate fallback is deliberately
+NOT built. Additionally covered from the validation wave: the falsified
+"busy && zero events ⇒ drift" rule was REPLACED (Task 5) by the
+transition/asked-listing contradictions, not merely tuned; the missing
+claude rebind producer (A4) is closed in Task 10; the /question pending
+store and event-less dispose drain (A12) are closed in Task 8.
 
 **1b. No silent deferrals.** Production outcomes are real, not stubbed:
 the opencode verify uses the production lane HTTP seam (fakes exist only
 in tests, as they already do today); `FsClaudeTruth` is production file IO
-installed at boot (Task 10 Step 4.5) and unit-tested against real record
-shapes; the amplifier path reuses the production tailer. Named residuals
-are all OWNER-ADJUDICATED scope statements, not silent deferrals:
+installed at boot (Task 10 Step 4.5) and unit-tested against real
+corpus-shaped records (array interrupt, oversized lines, post-td
+continuations); the amplifier path reuses the production tailer. Named
+residuals are all ADJUDICATED scope statements, not silent deferrals:
 shared-endpoint opencode panes (#609, ruling in issue), genuinely-plural
-busy roots (#610), unmanaged codex approvals (#607, ruling 2), external
-kill -9 rings (#612, ruling 3), TUI-menu quits + the 15s literal-text
-false-suppress (#612 — the issue itself requires "stated rules", which
-Task 13 states and documents in idle.rs), buildDirty worktree staleness
-(#613 — the issue's own fix direction says leave as-is absent a closure
-ruling). #604's "loud surface" ships BOTH the error-level log and the
-`/api/server-info` counter. No task leaves a TODO, stub, or "future work"
-in production code.
+busy roots + deliberate `opencode run --attach` foreign roots (#609/#610),
+unmanaged codex approvals (#607, ruling 2), external kill -9 rings (#612,
+ruling 3), TUI-menu quits + paste-embedded-newline quits + the 15s
+literal-text false-suppress (#612 — the issue itself requires "stated
+rules", which Task 13 states and documents in idle.rs), early-ESC stale
+blue that self-heals (#606, idle.rs entry 13), the amplifier DD6
+fresh-restart legacy gap + ring-on-inert-growth (#605, named in Task 12
+and scoped OUT — `resume <sid>` is covered), buildDirty worktree
+staleness and the reftable caveat (#613). #604's "loud surface" ships
+BOTH the error-level log and the `/api/server-info` counter; #606 ships
+the parallel `claudeTruthAnomalies` tripwire. No task leaves a TODO,
+stub, or "future work" in production code.
 
 **2. Placeholder scan.** Two `…` ellipses remain by design: (a) inside
 test-skeleton blocks that are immediately followed by concrete build
 instructions naming the exact events, fakes, and assertions to use (Tasks
-2/6/10/11/13 hub tests — the harness helpers are quoted from the existing
-suite and the assertion targets are named exactly); (b) "existing code
-unchanged — move verbatim" markers (Task 2's pump body, Task 7's
-empty-roots arm) where copying the current code into this document would
-only invite drift. Every new function, test constant, and rule is given in
-full. No TBD/TODO/"handle edge cases" anywhere.
+2/3/6/10/11/13 hub/lane tests — the harness helpers are quoted from the
+existing suite and the assertion targets are named exactly); (b)
+"existing code unchanged — move verbatim" markers (Task 2's pump body,
+Task 7's empty-roots arm) where copying the current code into this
+document would only invite drift. Every new function, test constant, and
+rule is given in full — including the rewritten `claude_truth.rs`
+(adaptive window, activity-after-boundary classification, anomaly
+tripwire), the redesigned drift predicates, the `resync_pending`/
+`note_permissions_synced` pair, and the full paste/DECRQM classifier.
+No TBD/TODO/"handle edge cases" anywhere.
 
 **3. Type consistency.** Checked: `TrackerEffect` variant spellings match
 `lib.rs:41-57`; `note_verify_failed(&mut self, terminal_id: &str, at: i64)`
@@ -4111,16 +5273,44 @@ is uniform across opencode/claude/amplifier; `claude_frames` and
 `opencode_frames` both change to the `(Vec<ServerMessage>, Vec<String>)`
 shape `codex_frames` already has; `ClaudeTruth` method names
 (`probe_turn_state`/`transcript_len`/`probe_submit`) are identical in
-Task 9 (definition) and Tasks 10/11 (consumers); `spawn_opencode_lane`'s
-new return tuple is consumed with the same shape in the attach arm and the
-Task 2 lane test; `classify_input`/`QuitIntentState`/`InputClass` match
-between signal.rs (Task 13 Step 3) and the hub intake (Step 5).
+Task 9 (definition) and Tasks 10/11 (consumers), and `probe_submit`'s
+corrected any-transcript-record semantics is what Task 11's design text
+now describes; `HubInner.claude_submit_offsets` is
+`HashMap<String, (String, u64)>` in Task 11's interface bullet, its
+Input-arm insert (`(session_id.clone(), len)`), and its confirm-flavor
+destructure (`Some((stashed_session, offset))`) — all three agree;
+`bind_claude_session(terminal_id, session_id)` matches the tracker's
+existing `bind_session` seam and the `claude_signal.rs` call site;
+`CLAUDE_TRUTH_ANOMALIES`/`OPENCODE_DRIFT_EVENTS` are both `AtomicU64`
+statics read by `diag.rs` the same way; `drift_contradiction(Option<bool>,
+bool, u64)` matches its unit test and the pump-arm call site;
+`unseen_pending_asks(&[(String, String)], &HashSet<String>)` matches its
+Task 5 test and Task 8's `resync_pending` caller; `fetch_permissions`/
+`fetch_questions` share one `(session_id, ask_id)` return shape consumed
+by `resync_pending`; `note_permissions_synced(&str, &[String], i64)`
+matches the `PermissionsSynced { pending_ids: Vec<String> }` intake arm;
+`spawn_opencode_lane`'s new return tuple is consumed with the same shape
+in the attach arm and the Task 2 lane test; `classify_input`/
+`QuitIntentState` (now with `in_paste` + `pending_esc`)/`InputClass`
+match between signal.rs (Task 13 Step 3) and the hub intake (Step 5);
 `lane_retry_delay_ms` changes from `Option<i64>` to `i64` in exactly one
 task (12) and both its callers (`note_lane_failure`, the schedule test)
-are updated there.
+are updated there. Cross-references audited after this revision: Task 5
+↔ Task 8 (rule (b) predicate defined in 5, wired in 8; `verify()`
+returns `Option<bool>` from Task 5 onward and Task 8 adds resync at the
+call sites, not inside `verify()`), Task 9 ↔ Tasks 10/11 (probe
+semantics + tripwire counter surfaced in Task 10 Step 4.8), Task 10 ↔
+Task 11 (rebind producer is what makes the session-scoped stash
+meaningful), Task 13's tap cite (freshell-terminal registry.rs:1338),
+and the Global Constraints boundary-last ordering contract that every
+crash-semantics test asserts.
 
-**Known execution-order note:** Tasks 10 and 11 both touch
+**Known execution-order notes:** Tasks 10 and 11 both touch
 `claude.rs`/`activity.rs`; Task 11's Step 3.4 amends Task 10's
 `note_verified_ended`/`note_verify_failed` (two added field resets) —
-executed in order, this is a plain edit, and the plan states it explicitly
-in Task 11's interface notes.
+executed in order, this is a plain edit, and the plan states it
+explicitly in Task 11's interface notes. The lane's `verify()` evolves
+across Tasks 2 → 5 → 8 (`()` → `Option<bool>` → unchanged signature with
+`resync_pending` added at its pump-arm call site); each task states the
+delta it owns, and the between-cycles arm discards the `#[must_use]`
+Option explicitly from Task 5 onward.
