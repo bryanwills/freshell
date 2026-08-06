@@ -191,6 +191,10 @@ impl Lane {
                             %error,
                             "opencode lane snapshot failed; backing off"
                         );
+                        // #604: a failing snapshot probe must not read
+                        // as idle — surface it (crash semantics in the
+                        // hub) rather than silently holding state.
+                        self.note(cycle, stream, OpencodeLaneEvent::SnapshotFailed { error });
                         break 'cycle false;
                     }
                 };
@@ -323,10 +327,10 @@ impl Lane {
     }
 
     /// Step 3: GET {base}/session/status → object map. Entries whose
-    /// `status.type` is busy/retry map to Busy/Retry; a literal
-    /// `{"type":"idle"}` entry parses as Idle (defensive — the live server
-    /// DROPS idle sessions; absence == idle; opencode 1.18.11). Unknown
-    /// status vocabulary is skipped: the transport stays conservative.
+    /// `status.type` is busy/retry/idle map to Busy/Retry/Idle. Unknown
+    /// status vocabulary degrades toward Busy (conservative-toward-busy,
+    /// matching the stream translation's `_ => Busy`) + one warn. A shape
+    /// break (entry is not an object with a string `type`) is a hard Err.
     async fn fetch_snapshot(&self) -> Result<Vec<(String, OpencodeStatus)>, String> {
         let url = format!("{}/session/status", self.base_url);
         let (status, body) = self.deps.http.get_json(&url).await?;
@@ -342,7 +346,25 @@ impl Lane {
                 Some("busy") => statuses.push((session_id.clone(), OpencodeStatus::Busy)),
                 Some("retry") => statuses.push((session_id.clone(), OpencodeStatus::Retry)),
                 Some("idle") => statuses.push((session_id.clone(), OpencodeStatus::Idle)),
-                _ => {}
+                Some(other) => {
+                    // #604: unknown status VOCABULARY degrades toward busy
+                    // (same conservative direction as the stream
+                    // translation's `_ => Busy`) — a drifted vocabulary must
+                    // never render a working agent as idle-green.
+                    tracing::warn!(
+                        terminal_id = %self.terminal_id,
+                        session_id = %session_id,
+                        status = %other,
+                        "opencode /session/status: unknown status vocabulary; treating as busy"
+                    );
+                    statuses.push((session_id.clone(), OpencodeStatus::Busy));
+                }
+                None => {
+                    // Shape break: the endpoint contract itself drifted.
+                    return Err(format!(
+                        "GET /session/status: entry for {session_id} is not an object with a string `type`"
+                    ));
+                }
             }
         }
         Ok(statuses)
@@ -1492,6 +1514,160 @@ mod tests {
             other => panic!("expected SnapshotFailed, got {other:?}"),
         }
         assert_eq!(snapshot_calls.load(Ordering::SeqCst), 3);
+        lane.abort();
+    }
+
+    /// #604: /session/status parse trouble must never read as "all idle".
+    /// Unknown status VOCABULARY degrades toward busy; a SHAPE break is a
+    /// probe failure (crash semantics downstream) — pinned both ways.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn snapshot_unknown_vocabulary_is_busy_and_shape_break_is_failure() {
+        let log: CallLog = Arc::new(Mutex::new(Vec::new()));
+        let snapshot_calls = Arc::new(AtomicUsize::new(0));
+        let snapshot_calls_in_responder = snapshot_calls.clone();
+        let http = FakeLaneHttp {
+            log: log.clone(),
+            respond: Box::new(move |url| {
+                if url.ends_with("/global/health") {
+                    return Ok((200, json!({"healthy": true, "version": "1.18.14"})));
+                }
+                if url.ends_with("/session/status") {
+                    let n = snapshot_calls_in_responder.fetch_add(1, Ordering::SeqCst);
+                    match n {
+                        // Connect-cycle snapshot: empty
+                        0 => return Ok((200, json!({}))),
+                        // First verify: unknown vocabulary "hyperbusy" → Busy + warn
+                        1 => return Ok((200, json!({"ses-1": {"type": "hyperbusy"}}))),
+                        // Second verify: retry (named so the retrying-turn light can never drift idle)
+                        2 => return Ok((200, json!({"ses-1": {"type": "retry"}}))),
+                        // Third verify: shape break (not an object)
+                        _ => return Ok((200, json!({"ses-1": 42}))),
+                    }
+                }
+                if url.ends_with("/session/ses-1") {
+                    return Ok((200, json!({"id": "ses-1"})));
+                }
+                Ok((404, json!({})))
+            }),
+        };
+        let stream = FakeLaneStream {
+            log: log.clone(),
+            scripts: Mutex::new(VecDeque::from([StreamScript {
+                buffered: vec![],
+                live: vec![],
+                finish: false, // park: the cycle stays open for verify requests
+            }])),
+        };
+        let (hub, _rx) = hub();
+        hub.register_opencode_lane_for_tests("t1", 7);
+        let deps = Arc::new(OpencodeLaneDeps {
+            http: Arc::new(http),
+            events: Arc::new(stream),
+        });
+        let (lane, verify_tx) = spawn_opencode_lane(
+            deps,
+            hub.clone(),
+            "t1".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            7,
+        );
+        // Connect snapshot arrives first (empty, no sessions).
+        let log1 = wait_for_ingress(&hub, 1, 2000).await; // Snapshot (empty)
+        let (gen0, cycle0, stream0, _) = log1[log1.len() - 1].clone();
+
+        // First verify: unknown vocabulary "hyperbusy" → Busy + warn
+        verify_tx.send(()).expect("verify channel open");
+        let log2 = wait_for_ingress(&hub, 3, 2000).await; // SessionCreated + Snapshot
+        let (gen1, cycle1, stream1, event1) = log2[log2.len() - 1].clone();
+        assert_eq!((gen1, cycle1, stream1), (gen0, cycle0, stream0));
+        assert_eq!(
+            event1,
+            OpencodeLaneEvent::Snapshot {
+                statuses: vec![("ses-1".to_string(), OpencodeStatus::Busy)]
+            },
+            "unknown vocabulary 'hyperbusy' degrades to Busy"
+        );
+
+        // Second verify: retry (named so the retrying-turn light can never drift idle)
+        verify_tx.send(()).expect("verify channel open");
+        let log3 = wait_for_ingress(&hub, 4, 2000).await;
+        let (gen2, cycle2, stream2, event2) = log3[log3.len() - 1].clone();
+        assert_eq!((gen2, cycle2, stream2), (gen0, cycle0, stream0));
+        assert_eq!(
+            event2,
+            OpencodeLaneEvent::Snapshot {
+                statuses: vec![("ses-1".to_string(), OpencodeStatus::Retry)]
+            },
+            "retry is Busy everywhere (D6): the light stays on"
+        );
+
+        // Third verify: shape break (not an object) → SnapshotFailed
+        verify_tx.send(()).expect("verify channel open");
+        let log4 = wait_for_ingress(&hub, 5, 2000).await;
+        match &log4[log4.len() - 1].3 {
+            OpencodeLaneEvent::SnapshotFailed { error } => {
+                assert!(
+                    error.contains("not an object"),
+                    "expected 'not an object' in error, got: {error}"
+                );
+            }
+            other => panic!("expected SnapshotFailed, got {other:?}"),
+        }
+        assert_eq!(snapshot_calls.load(Ordering::SeqCst), 4);
+        lane.abort();
+    }
+
+    /// A failing CONNECT-cycle snapshot notes SnapshotFailed (loud, crash
+    /// semantics) instead of silently backing off.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_snapshot_failure_is_noted() {
+        let log: CallLog = Arc::new(Mutex::new(Vec::new()));
+        let http = FakeLaneHttp {
+            log: log.clone(),
+            respond: Box::new(|url| {
+                if url.ends_with("/global/health") {
+                    return Ok((200, json!({"healthy": true, "version": "1.18.14"})));
+                }
+                if url.ends_with("/session/status") {
+                    return Err("boom".to_string());
+                }
+                Ok((404, json!({})))
+            }),
+        };
+        let stream = FakeLaneStream {
+            log: log.clone(),
+            scripts: Mutex::new(VecDeque::from([StreamScript {
+                buffered: vec![],
+                live: vec![],
+                finish: false, // one parked stream
+            }])),
+        };
+        let (hub, _rx) = hub();
+        hub.register_opencode_lane_for_tests("t1", 7);
+        let deps = Arc::new(OpencodeLaneDeps {
+            http: Arc::new(http),
+            events: Arc::new(stream),
+        });
+        let (lane, _verify_tx) = spawn_opencode_lane(
+            deps,
+            hub.clone(),
+            "t1".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            7,
+        );
+
+        // The FIRST ingress entry should be SnapshotFailed (noting the failure
+        // on the connect-cycle snapshot, loud crash semantics).
+        let ingress = wait_for_ingress(&hub, 1, 2000).await;
+        match &ingress[0].3 {
+            OpencodeLaneEvent::SnapshotFailed { error } => {
+                assert!(
+                    error.contains("boom"),
+                    "expected 'boom' in error, got: {error}"
+                );
+            }
+            other => panic!("expected SnapshotFailed as first ingress, got {other:?}"),
+        }
         lane.abort();
     }
 }
