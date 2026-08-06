@@ -32,9 +32,12 @@
 //!     packed rather than loose (e.g. after `git gc`/`git pack-refs`).
 //!
 //! Any step that can't resolve a path (git missing, detached HEAD with no
-//! symbolic ref, a path that doesn't exist) is simply skipped -- this
-//! degrades to cargo's normal source-file-based rerun heuristics, never a
-//! build failure.
+//! symbolic ref) is simply skipped -- this degrades to cargo's normal
+//! source-file-based rerun heuristics, never a build failure. Existence
+//! gates apply only to `packed-refs` and `index` (which genuinely may not
+//! exist); the resolved loose-ref path is watched UNCONDITIONALLY (#613) --
+//! see the comment in `rerun_paths` for why a missing watched path is the
+//! point, not a bug.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -103,10 +106,17 @@ fn rerun_paths() -> Vec<PathBuf> {
 
     if let Some(ref_name) = run_git(&["symbolic-ref", "-q", "HEAD"]) {
         if let Some(ref_path) = run_git(&["rev-parse", "--git-path", &ref_name]) {
-            let path = PathBuf::from(ref_path);
-            if path.exists() {
-                paths.push(path);
-            }
+            // #613: watch the resolved loose-ref path UNCONDITIONALLY.
+            // When the ref is packed the loose file is absent — cargo
+            // treats a watched-but-missing path as changed and reruns
+            // this script every build in that state (4 subprocess calls,
+            // an acceptable deterministic cost) — which guarantees a
+            // later fetch/ff-pull writing the ref LOOSE can never be
+            // missed by the stamp. Files-backend assumed (which is what
+            // this repo uses): with git's reftable backend the loose-ref
+            // path NEVER exists, so this watch degrades to permanent
+            // re-runs and provides no ref-update signal from this path.
+            paths.push(PathBuf::from(ref_path));
         }
     }
 

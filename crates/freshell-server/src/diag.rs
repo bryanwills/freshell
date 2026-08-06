@@ -133,6 +133,49 @@ fn build_dirty() -> bool {
     !matches!(option_env!("FRESHELL_BUILD_DIRTY"), Some("false"))
 }
 
+/// The raw build-time dirty string for the boot line (`"true"` / `"false"`,
+/// or the fail-closed literal `"unknown"` when git was unavailable at build
+/// time) — `build_dirty()` collapses `"unknown"` into `true` for the JSON
+/// bool, but the boot line preserves the distinction for log forensics.
+pub(crate) fn build_dirty_str() -> &'static str {
+    option_env!("FRESHELL_BUILD_DIRTY").unwrap_or("unknown")
+}
+
+/// #613: one self-identifying boot line — timestamp + pid + commit +
+/// dirty — so append-mode logs with multiple runs can always attribute a
+/// line to a binary. Pure formatter; unit-tested.
+pub(crate) fn boot_line(
+    addr: &str,
+    commit: &str,
+    dirty: &str,
+    pid: u32,
+    timestamp_utc: &str,
+) -> String {
+    format!(
+        "[{timestamp_utc}] freshell-server listening on http://{addr} (ws://{addr}/ws) [pid {pid}] [commit {commit}] [dirty {dirty}]"
+    )
+}
+
+/// Minimal std-only ISO-8601 UTC (seconds precision) from unix seconds —
+/// civil-from-days per Howard Hinnant's algorithm; avoids adding a chrono
+/// dependency for one log line.
+pub(crate) fn iso8601_utc(unix_seconds: i64) -> String {
+    let days = unix_seconds.div_euclid(86_400);
+    let secs = unix_seconds.rem_euclid(86_400);
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
 // ---------------------------------------------------------------------
 // GET /api/debug
 // ---------------------------------------------------------------------
@@ -701,5 +744,30 @@ mod tests {
         assert_eq!(response.status(), axum::http::StatusCode::OK);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- boot line (#613) ----
+
+    #[test]
+    fn boot_line_is_self_identifying() {
+        // #613 forensics: timestamp + pid + commit + dirty on ONE line —
+        // an append-mode log can always attribute a boot line to a run.
+        let line = boot_line(
+            "127.0.0.1:3001",
+            "abc123",
+            "false",
+            4242,
+            "2026-08-06T12:34:56Z",
+        );
+        assert_eq!(
+            line,
+            "[2026-08-06T12:34:56Z] freshell-server listening on http://127.0.0.1:3001 (ws://127.0.0.1:3001/ws) [pid 4242] [commit abc123] [dirty false]"
+        );
+    }
+
+    #[test]
+    fn iso8601_utc_formats_epoch_seconds() {
+        assert_eq!(iso8601_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso8601_utc(1_754_500_000), "2025-08-06T17:06:40Z");
     }
 }
