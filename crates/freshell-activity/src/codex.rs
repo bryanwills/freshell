@@ -150,7 +150,10 @@ struct TerminalActivity {
     /// turn and is a no-op by construction. `None` falls back to phase
     /// semantics (older protocols omit turnId).
     current_proxy_turn_id: Option<String>,
-    /// Outstanding server→client approval request ids (managed proxy lane).
+    /// Outstanding server→client approval request ids (managed proxy lane
+    /// ONLY — the approval-notification promise is scoped to managed
+    /// panes per owner ruling 2026-08-05, #607; unmanaged/PTY-only panes
+    /// have no approval signal and stay honestly busy).
     pending_approvals: std::collections::HashSet<String>,
     /// True when the approval pause demoted a working phase; the resolve
     /// restores Busy. False when the approval arrived while already idle.

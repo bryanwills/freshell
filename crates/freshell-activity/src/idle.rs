@@ -77,7 +77,16 @@
 //!     pane's port can DELIBERATELY mint foreign busy roots — named,
 //!     accepted (it requires local intent, and two busy roots still
 //!     demote to Ambiguous, which stays honest-blue and death-silent).
-//! 7. Unmanaged/PTY-only codex has no approval signal — documented limitation.
+//!  7. (ADJUDICATED by owner ruling 2026-08-05, #607) Unmanaged/PTY-only
+//!     codex panes make NO approval-notification promise: when codex
+//!     pauses for approval, such panes keep an honest busy light until
+//!     the turn resumes or ends. The approval-pause guarantee (demote +
+//!     attention boundary + death-bell engagement) is scoped to MANAGED
+//!     proxy-lane panes (note_approval_requested/resolved). PTY
+//!     text-parsing heuristics were considered and REJECTED (owner
+//!     policy: no heuristics). Freshell-launched codex panes use the
+//!     managed lane, so the unmanaged population is externally-attached
+//!     panes only.
 //!  8. (CLOSED by #608, 2026-08-06) SSE reconnect resyncs outstanding
 //!     asks via GET /permission AND GET /question (disjoint pending
 //!     stores at v1.18.14; both replayed BEFORE the snapshot), busy
