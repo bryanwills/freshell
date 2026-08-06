@@ -276,6 +276,214 @@ pub fn extract_turn_complete_signals(
     (cleaned, count)
 }
 
+/// #612: deterministic quit-intent detection on freshell's own PTY input
+/// stream (tapped at freshell-terminal registry.rs:1338). Rules (exact,
+/// stated): Ctrl+C/Ctrl+D outside paste framing are immediate quit
+/// intents; a submitted line equal to "/quit" or "/exit" (after
+/// trimming) is a quit intent — including a PASTED one evaluated by a
+/// later real Enter (both agent TUIs enable DECSET 2004, so xterm.js
+/// frames every paste as ESC[200~…ESC[201~; the framing is unwrapped
+/// here and never poisons); well-formed DECRQM reports
+/// (ESC [ ? digits ; digit $ y — freshell's own client injects them as
+/// synthetic input replies) are consumed without poisoning; any OTHER
+/// escape sequence or control byte poisons the line buffer until the
+/// next newline (TUI-menu quits are NOT detectable here — that residual
+/// stays agent-evidence-dependent, idle.rs entry 11).
+const QUIT_LINE_CAP: usize = 32;
+
+#[derive(Debug, Default)]
+pub struct QuitIntentState {
+    line: String,
+    unmatchable: bool,
+    /// Inside xterm.js bracketed-paste framing (ESC[200~ … ESC[201~).
+    in_paste: bool,
+    /// Partial escape run carried across chunk boundaries while we
+    /// decide whether it is a paste marker or a DECRQM report.
+    pending_esc: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputClass {
+    /// Ctrl+C / Ctrl+D (outside paste framing), or a submitted line
+    /// equal to /quit or /exit — including a pasted one evaluated by a
+    /// later real Enter.
+    QuitIntent,
+    /// A submitted line that is NOT a quit command.
+    NonQuitSubmit,
+    /// Anything else (typing, escape sequences, paste content, partial
+    /// chunks).
+    Other,
+}
+
+/// What a partially-accumulated escape run currently is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscMatch {
+    /// A proper prefix of a recognized sequence — keep accumulating
+    /// (this is what tolerates markers split across input chunks:
+    /// paste atomicity is observed, not contractual).
+    Prefix,
+    PasteBegin,
+    PasteEnd,
+    /// A complete DECRQM report — consume WITHOUT poisoning.
+    Decrqm,
+    /// Cannot become any recognized sequence: unrecognized escape —
+    /// the poison rule applies.
+    Fail,
+}
+
+/// Exact-grammar matcher for the three escape sequences the classifier
+/// understands: ESC[200~, ESC[201~, and ESC [ ? <digits> ; <digit> $ y.
+/// Deterministic — an exact grammar, not a general escape parser.
+fn match_esc(seq: &str) -> EscMatch {
+    const BEGIN: &str = "\u{1b}[200~";
+    const END: &str = "\u{1b}[201~";
+    if seq == BEGIN {
+        return EscMatch::PasteBegin;
+    }
+    if seq == END {
+        return EscMatch::PasteEnd;
+    }
+    let paste_prefix = BEGIN.starts_with(seq) || END.starts_with(seq);
+    // DECRQM state machine; st == 8 means a complete report.
+    let mut st = 0u8;
+    let mut decrqm = true;
+    for c in seq.chars() {
+        st = match (st, c) {
+            (0, '\u{1b}') => 1,
+            (1, '[') => 2,
+            (2, '?') => 3,
+            (3, d) if d.is_ascii_digit() => 4,
+            (4, d) if d.is_ascii_digit() => 4,
+            (4, ';') => 5,
+            (5, d) if d.is_ascii_digit() => 6,
+            (6, '$') => 7,
+            (7, 'y') => 8,
+            _ => {
+                decrqm = false;
+                break;
+            }
+        };
+    }
+    if decrqm && st == 8 {
+        return EscMatch::Decrqm;
+    }
+    if paste_prefix || (decrqm && st < 8) {
+        return EscMatch::Prefix;
+    }
+    EscMatch::Fail
+}
+
+pub fn classify_input(state: &mut QuitIntentState, data: &str) -> InputClass {
+    let mut class = InputClass::Other;
+    for c in data.chars() {
+        // --- escape accumulator (paste markers + DECRQM), runs first ---
+        if !state.pending_esc.is_empty() {
+            state.pending_esc.push(c);
+            match match_esc(&state.pending_esc) {
+                EscMatch::Prefix => continue,
+                EscMatch::PasteBegin => {
+                    state.pending_esc.clear();
+                    state.in_paste = true; // framing itself never poisons
+                    continue;
+                }
+                EscMatch::PasteEnd => {
+                    state.pending_esc.clear();
+                    state.in_paste = false; // normal classification resumes
+                    continue;
+                }
+                EscMatch::Decrqm => {
+                    // Synthetic client reply (request-mode-bypass.ts:256)
+                    // — consumed, no poison.
+                    state.pending_esc.clear();
+                    continue;
+                }
+                EscMatch::Fail => {
+                    // Unrecognized escape: the poison rule — then this
+                    // final char is REPROCESSED below (a trailing \r
+                    // must still evaluate; a fresh ESC restarts the
+                    // accumulator).
+                    state.pending_esc.clear();
+                    state.line.clear();
+                    state.unmatchable = true;
+                }
+            }
+        }
+        if c == '\u{1b}' {
+            state.pending_esc.push(c);
+            continue;
+        }
+        if state.in_paste {
+            // Inside bracketed-paste framing: EVERYTHING is literal
+            // pasted data.
+            match c {
+                '\r' | '\n' => {
+                    // A literal pasted newline: a multi-line blob is not
+                    // a submit — drop the finished line; the LAST pasted
+                    // line remains evaluable by a later real Enter.
+                    state.line.clear();
+                    state.unmatchable = false;
+                }
+                c if c >= ' ' && c != '\u{7f}' => {
+                    if state.line.len() >= QUIT_LINE_CAP {
+                        state.unmatchable = true;
+                    } else if !state.unmatchable {
+                        state.line.push(c);
+                    }
+                }
+                _ => {
+                    // Pasted control bytes — including 0x03/0x04 — are
+                    // DATA, not quit gestures; they also make the pasted
+                    // line meaningless.
+                    state.line.clear();
+                    state.unmatchable = true;
+                }
+            }
+            continue;
+        }
+        match c {
+            '\u{3}' | '\u{4}' => {
+                state.line.clear();
+                state.unmatchable = false;
+                class = InputClass::QuitIntent;
+            }
+            '\r' | '\n' => {
+                let line = state.line.trim();
+                let is_quit = !state.unmatchable && (line == "/quit" || line == "/exit");
+                // A quit anywhere in the chunk wins over a later submit.
+                if is_quit {
+                    class = InputClass::QuitIntent;
+                } else if class != InputClass::QuitIntent && (!line.is_empty() || state.unmatchable)
+                {
+                    // A poisoned line still SUBMITTED something — the
+                    // user is driving the pane, so this counts as a
+                    // NonQuitSubmit (marker clears). A bare Enter on a
+                    // clean empty buffer stays Other.
+                    class = InputClass::NonQuitSubmit;
+                }
+                state.line.clear();
+                state.unmatchable = false;
+            }
+            '\u{7f}' | '\u{8}' => {
+                state.line.pop();
+            }
+            c if c >= ' ' => {
+                if state.line.len() >= QUIT_LINE_CAP {
+                    state.unmatchable = true;
+                } else if !state.unmatchable {
+                    state.line.push(c);
+                }
+            }
+            _ => {
+                // Other control bytes: the buffer no longer represents
+                // the visible line.
+                state.line.clear();
+                state.unmatchable = true;
+            }
+        }
+    }
+    class
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,6 +498,111 @@ mod tests {
         assert!(!is_submit_input("a\r"));
         assert!(!is_submit_input("\ra"));
         assert!(!is_submit_input(" \r"));
+    }
+
+    #[test]
+    fn quit_intent_classification_rules() {
+        let mut s = QuitIntentState::default();
+        // Typed char-by-char: /quit + Enter.
+        for c in ["/", "q", "u", "i", "t"] {
+            assert_eq!(classify_input(&mut s, c), InputClass::Other);
+        }
+        assert_eq!(classify_input(&mut s, "\r"), InputClass::QuitIntent);
+
+        // Pasted whole line.
+        assert_eq!(classify_input(&mut s, "/exit\r"), InputClass::QuitIntent);
+
+        // Control-key quits.
+        assert_eq!(classify_input(&mut s, "\u{4}"), InputClass::QuitIntent);
+        assert_eq!(classify_input(&mut s, "\u{3}"), InputClass::QuitIntent);
+
+        // An ordinary prompt is a NonQuitSubmit at its Enter.
+        assert_eq!(classify_input(&mut s, "fix the bug"), InputClass::Other);
+        assert_eq!(classify_input(&mut s, "\r"), InputClass::NonQuitSubmit);
+
+        // Backspace editing: "/quitX" + BS + Enter is a quit.
+        assert_eq!(classify_input(&mut s, "/quitX"), InputClass::Other);
+        assert_eq!(classify_input(&mut s, "\u{7f}"), InputClass::Other);
+        assert_eq!(classify_input(&mut s, "\r"), InputClass::QuitIntent);
+
+        // An escape sequence poisons the line until the next newline:
+        // arrow-key navigation + Enter is NOT a detectable quit.
+        assert_eq!(classify_input(&mut s, "/quit"), InputClass::Other);
+        assert_eq!(classify_input(&mut s, "\u{1b}[A"), InputClass::Other);
+        assert_eq!(classify_input(&mut s, "\r"), InputClass::NonQuitSubmit);
+
+        // …and the poison clears after that newline.
+        assert_eq!(classify_input(&mut s, "/quit\r"), InputClass::QuitIntent);
+    }
+
+    #[test]
+    fn bracketed_paste_framing_rules() {
+        // A16 validated: both agent TUIs enable DECSET 2004, so xterm.js
+        // frames EVERY paste as \x1b[200~ + text + \x1b[201~ (with \n
+        // normalized to \r). The framing is not user line content: it
+        // must not poison, and the pasted text is literal.
+        let mut s = QuitIntentState::default();
+
+        // Pasted "/exit" then a real Enter (the exact wire shape:
+        // one framed chunk, then a separate "\r") ⇒ QuitIntent.
+        assert_eq!(
+            classify_input(&mut s, "\u{1b}[200~/exit\u{1b}[201~"),
+            InputClass::Other
+        );
+        assert_eq!(classify_input(&mut s, "\r"), InputClass::QuitIntent);
+
+        // 0x03 INSIDE framing is literal pasted data, NOT a quit gesture.
+        assert_eq!(
+            classify_input(&mut s, "\u{1b}[200~ab\u{3}cd\u{1b}[201~"),
+            InputClass::Other
+        );
+        assert_eq!(classify_input(&mut s, "\r"), InputClass::NonQuitSubmit);
+
+        // A literal pasted newline clears the buffer (a multi-line blob
+        // is not a submit); the last pasted line still evaluates at the
+        // following REAL Enter.
+        assert_eq!(
+            classify_input(&mut s, "\u{1b}[200~echo hi\rls\u{1b}[201~"),
+            InputClass::Other
+        );
+        assert_eq!(classify_input(&mut s, "\r"), InputClass::NonQuitSubmit);
+
+        // Markers split across chunks (paste atomicity is observed, not
+        // contractual — reconnect buffering can slice anywhere).
+        assert_eq!(classify_input(&mut s, "\u{1b}[20"), InputClass::Other);
+        assert_eq!(classify_input(&mut s, "0~/quit"), InputClass::Other);
+        assert_eq!(classify_input(&mut s, "\u{1b}[201~"), InputClass::Other);
+        assert_eq!(classify_input(&mut s, "\r"), InputClass::QuitIntent);
+    }
+
+    #[test]
+    fn decrqm_reports_do_not_poison() {
+        // A16.2: freshell's own client auto-answers DECRQM as synthetic
+        // INPUT (\x1b[?<mode>;<status>$y, request-mode-bypass.ts:256).
+        // Exact-grammar skip — a user typing /quit right after such a
+        // reply (no intervening Enter) must still be detected.
+        let mut s = QuitIntentState::default();
+        assert_eq!(
+            classify_input(&mut s, "\u{1b}[?2004;1$y"),
+            InputClass::Other
+        );
+        assert_eq!(classify_input(&mut s, "/quit\r"), InputClass::QuitIntent);
+
+        // Split across chunks too.
+        assert_eq!(classify_input(&mut s, "\u{1b}[?20"), InputClass::Other);
+        assert_eq!(
+            classify_input(&mut s, "04;1$y/exit\r"),
+            InputClass::QuitIntent
+        );
+
+        // A NEAR-miss (wrong grammar) still poisons like any other
+        // escape sequence — the skip is exact, not a heuristic.
+        assert_eq!(
+            classify_input(&mut s, "\u{1b}[?2004;1$z"),
+            InputClass::Other
+        );
+        assert_eq!(classify_input(&mut s, "/quit\r"), InputClass::NonQuitSubmit);
+        assert_eq!(classify_input(&mut s, "/quit\r"), InputClass::QuitIntent);
     }
 
     #[test]

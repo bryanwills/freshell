@@ -97,6 +97,18 @@ pub(crate) fn lane_retry_delay_ms(failures: u32) -> i64 {
         .unwrap_or(AMPLIFIER_LANE_RETRY_CAP_MS)
 }
 
+/// #612: how long an observed quit-intent input suppresses the death bell.
+/// Covers slow TUI shutdowns (including opencode's 5s dispose cap) while a
+/// "much later" real crash still rings.
+pub(crate) const QUIT_INTENT_TTL_MS: i64 = 15_000;
+
+/// #612: is a quit-intent marker still live at exit time? Marker rules:
+/// set (overwrite) at each quit-intent input; cleared by a later
+/// NonQuitSubmit; expired `QUIT_INTENT_TTL_MS` after it was set.
+pub(crate) fn quit_intent_active(marker_at: Option<i64>, exit_at: i64) -> bool {
+    marker_at.is_some_and(|t| exit_at - t <= QUIT_INTENT_TTL_MS)
+}
+
 /// G9: resolve a resumed codex terminal's session id to its rollout file
 /// (ownership-proof walk of the codex sessions root). `None` -> the terminal
 /// runs the PTY-only lane, same degradation as the amplifier resolver.
@@ -328,6 +340,14 @@ struct HubInner {
     /// load-bearing: A7's resume/fork mints a new file, and Task 10's
     /// rebinds re-point the tracker mid-flight.
     claude_submit_offsets: HashMap<String, (String, u64)>,
+    /// #612: terminal id → per-terminal quit-intent line-buffer state
+    /// (bracketed-paste framing + escape accumulator survive chunk
+    /// boundaries; see `signal::classify_input` for the exact rules).
+    quit_intent_lines: HashMap<String, freshell_activity::signal::QuitIntentState>,
+    /// #612: terminal id → timestamp of the last observed quit-intent
+    /// input. Set (overwritten) on QuitIntent, cleared on NonQuitSubmit,
+    /// consulted (with the TTL) by the Exit arm's ring predicate.
+    quit_intents: HashMap<String, i64>,
     /// Test-only send-side recorder of `note_opencode_lane_event` calls:
     /// (generation, cycle, stream, event), in call order. The stamps are
     /// not wire-visible, so lane tests pin them here.
@@ -1200,6 +1220,21 @@ impl ActivityHub {
                     if freshell_activity::signal::is_submit_input(&data) {
                         inner.idle.note_busy(&terminal_id);
                     }
+                    // #612: quit-intent bookkeeping on the input stream
+                    // freshell owns. Rules: see signal::classify_input.
+                    let quit_state = inner
+                        .quit_intent_lines
+                        .entry(terminal_id.clone())
+                        .or_default();
+                    match freshell_activity::signal::classify_input(quit_state, &data) {
+                        freshell_activity::signal::InputClass::QuitIntent => {
+                            inner.quit_intents.insert(terminal_id.clone(), at);
+                        }
+                        freshell_activity::signal::InputClass::NonQuitSubmit => {
+                            inner.quit_intents.remove(&terminal_id);
+                        }
+                        freshell_activity::signal::InputClass::Other => {}
+                    }
                     match mode.as_str() {
                         "claude" => {
                             let confirmable = if freshell_activity::signal::is_submit_input(&data) {
@@ -1319,11 +1354,24 @@ impl ActivityHub {
                     // the opencode tracker doesn't know, so claude/codex/amplifier
                     // behavior is unchanged.
                     let opencode_death_eligible = !inner.opencode.blocks_death_bell(&terminal_id);
+                    // #612: an unexpired quit-intent marker (user-typed
+                    // /quit, /exit, Ctrl+C, Ctrl+D on freshell's own input
+                    // stream) suppresses the death bell — external kills
+                    // still ring (owner ruling 6).
+                    let quit_intent =
+                        quit_intent_active(inner.quit_intents.get(&terminal_id).copied(), at);
                     let ring_death_bell = spontaneous
+                        && !quit_intent
                         && ((inner.idle.is_engaged(&terminal_id) && opencode_death_eligible)
                             || inner.codex.has_pending_approvals(&terminal_id)
                             || (inner.opencode.has_pending_permissions(&terminal_id)
                                 && opencode_death_eligible));
+                    if spontaneous && quit_intent {
+                        tracing::info!(
+                            terminal_id = %terminal_id,
+                            "death bell suppressed: human quit intent observed on the input stream (#612)"
+                        );
+                    }
                     let mut frames = Vec::new();
                     if ring_death_bell {
                         // Spontaneous death while engaged: same frame, same reason —
@@ -1348,6 +1396,8 @@ impl ActivityHub {
                         inner.idle.note_exit(&terminal_id);
                         inner.lanes.remove(&terminal_id);
                         inner.claude_submit_offsets.remove(&terminal_id);
+                        inner.quit_intents.remove(&terminal_id);
+                        inner.quit_intent_lines.remove(&terminal_id);
                         inner.lane_retries.remove(&terminal_id);
                         inner.codex_lanes.remove(&terminal_id);
                         if let Some((_, lane_task, _)) = inner.opencode_lanes.remove(&terminal_id) {
@@ -2576,6 +2626,153 @@ mod tests {
                 .is_none(),
             "a requested exit must never ring the death bell"
         );
+    }
+
+    #[test]
+    fn quit_intent_activity_window() {
+        assert!(quit_intent_active(Some(1_000), 1_000 + QUIT_INTENT_TTL_MS));
+        assert!(!quit_intent_active(Some(1_000), 1_001 + QUIT_INTENT_TTL_MS));
+        assert!(!quit_intent_active(None, 5_000));
+    }
+
+    /// #612: busy pane + observed quit input + spontaneous exit ⇒ NO
+    /// death bell; busy pane + ordinary input + spontaneous exit ⇒ the
+    /// bell still rings (both directions pinned).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quit_intent_suppresses_the_death_bell_and_ordinary_input_does_not() {
+        let (hub, mut rx) = hub();
+
+        // Terminal 1: busy, then Ctrl+D (quit intent), then a
+        // spontaneous exit — the death bell is SUPPRESSED.
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "claude".into(),
+                resume_session_id: None,
+                at: now_ms(),
+            },
+        );
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "t1".into(),
+                data: "\r".into(),
+                at: now_ms(),
+            },
+        );
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "t1".into(),
+                data: "\u{4}".into(),
+                at: now_ms(),
+            },
+        );
+        observer_send(
+            &hub,
+            ActivityEvent::Exit {
+                terminal_id: "t1".into(),
+                at: now_ms(),
+                spontaneous: true,
+            },
+        );
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.idle", 300)
+                .await
+                .is_none(),
+            "an observed human quit intent must suppress the death bell"
+        );
+
+        // Terminal 2: busy, ordinary (non-quit) input, spontaneous exit
+        // — the death bell still RINGS.
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t2".into(),
+                mode: "claude".into(),
+                resume_session_id: None,
+                at: now_ms(),
+            },
+        );
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "t2".into(),
+                data: "\r".into(),
+                at: now_ms(),
+            },
+        );
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "t2".into(),
+                data: "fix it\r".into(),
+                at: now_ms(),
+            },
+        );
+        observer_send(
+            &hub,
+            ActivityEvent::Exit {
+                terminal_id: "t2".into(),
+                at: now_ms(),
+                spontaneous: true,
+            },
+        );
+        let idle =
+            next_frame_matching(&mut rx, "terminal.idle", 3_000, |v| v["terminalId"] == "t2")
+                .await
+                .expect("ordinary input must not suppress the death bell");
+        assert_eq!(idle["reason"], "grace");
+
+        // Terminal 3: the clearing rule — a quit-intent marker followed
+        // by a NonQuitSubmit is CLEARED, so the exit rings.
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t3".into(),
+                mode: "claude".into(),
+                resume_session_id: None,
+                at: now_ms(),
+            },
+        );
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "t3".into(),
+                data: "\r".into(),
+                at: now_ms(),
+            },
+        );
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "t3".into(),
+                data: "\u{4}".into(),
+                at: now_ms(),
+            },
+        );
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "t3".into(),
+                data: "continue\r".into(),
+                at: now_ms(),
+            },
+        );
+        observer_send(
+            &hub,
+            ActivityEvent::Exit {
+                terminal_id: "t3".into(),
+                at: now_ms(),
+                spontaneous: true,
+            },
+        );
+        let idle =
+            next_frame_matching(&mut rx, "terminal.idle", 3_000, |v| v["terminalId"] == "t3")
+                .await
+                .expect("a NonQuitSubmit after the quit intent must clear the marker");
+        assert_eq!(idle["reason"], "grace");
     }
 
     /// Decision 3: exit while idle (no engagement) is silent — a human

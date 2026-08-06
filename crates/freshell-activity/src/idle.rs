@@ -35,15 +35,28 @@
 //! # Accepted Residuals
 //!
 //! The following edge cases are accepted design trade-offs (not deferrals):
-//! 1. Mid-turn `/quit`/Ctrl+D: codex sends NO `Op::Interrupt` on Ctrl+D, and
-//!    the TUI's ~2s shutdown budget can exit before the abort evidence lands
-//!    — may ring on a human force-quit of a visibly-working pane. No in-band
-//!    discriminator exists; accepted.
+//! 1. (CLOSED for freshell-owned input by #612, 2026-08-06) Mid-turn
+//!    `/quit`/Ctrl+D: codex sends NO `Op::Interrupt` on Ctrl+D, and the
+//!    TUI's ~2s shutdown budget can exit before the abort evidence lands —
+//!    could ring on a human force-quit of a visibly-working pane. User-typed
+//!    quits through freshell's own input stream — /quit, /exit, Ctrl+D,
+//!    Ctrl+C — now suppress the death bell via a 15s quit-intent marker
+//!    (signal::classify_input; exact rules there, including bracketed-paste
+//!    unwrapping — a PASTED /quit evaluated by a real Enter is detected —
+//!    and the DECRQM exact-grammar skip for freshell's own synthetic
+//!    replies). Remaining residual, adjudicated: /quit typed as literal
+//!    prompt text followed by a crash within 15s is the one accepted
+//!    false-suppress.
 //! 2. Out-of-band `kill -9`/SIGTERM of the CLI by the user: observationally
-//!    identical to a crash — rings; accepted.
-//! 3. Claude/amplifier Enter-executed quits (`/exit`): input-driven Busy is
-//!    those trackers' ONLY turn evidence, so it stays death-bell engagement;
-//!    same residual family as (1); accepted.
+//!    identical to a crash — rings; accepted. (#612, 2026-08-06)
+//!    Adjudicated: out-of-band kill -9 RINGS (intended — a working agent
+//!    killed externally is worth announcing).
+//! 3. (CLOSED for freshell-owned input by #612, 2026-08-06) Claude/amplifier
+//!    Enter-executed quits (`/exit`): input-driven Busy is those trackers'
+//!    ONLY turn evidence, so it stays death-bell engagement — but the same
+//!    15s quit-intent marker as entry 1 (signal::classify_input) now
+//!    suppresses the bell when the quit line arrived through freshell's own
+//!    input stream; same residual family as (1); accepted.
 //! 4. Node 120s busy-deadman swallow (audit A17): a recovery window longer
 //!    than `BUSY_DEADMAN_MS` demotes busy→unknown and `unknown` never arms the
 //!    death bell — a MISSED bell (never a false ring); accepted.
@@ -100,7 +113,16 @@
 //!     rare human quits. Normal quit paths verified to abort+drain (all four
 //!     quit inputs dispose runners via the abort path before exit); the
 //!     wire-flush instant is unprovable from code but mitigated upstream by
-//!     graceful SSE stream termination.
+//!     graceful SSE stream termination. (#612, 2026-08-06) The 15s
+//!     quit-intent marker (signal::classify_input) now suppresses the death
+//!     bell for quits observed on freshell's own input stream — the TTL
+//!     covers slow TUI shutdowns including opencode's 5s dispose cap.
+//!     Remaining residuals, adjudicated: TUI-menu quits driven by escape
+//!     sequences produce no detectable byte sequence and stay
+//!     agent-evidence-dependent; a paste that embeds its own newline after
+//!     the quit line ("/exit\r…" INSIDE one paste) is treated as a
+//!     multi-line blob, not a submit; a raw SIGTERM is out-of-band input
+//!     and RINGS (entry 2's adjudication).
 //! 12. (CLOSED by #603, 2026-08-06) The opencode busy deadman no longer
 //!     drops the record on event silence: it verifies via GET
 //!     /session/status through the lane and stays busy; a failed probe
