@@ -1556,8 +1556,43 @@ after, so instead pin the INVERSE guard: add a sibling
 `opencode_ambiguous_exit_stays_silent` (two busy roots, then spontaneous
 exit ⇒ NO terminal.idle within 300ms) so D4's remaining gate is pinned.
 
-Run: `cargo test -p freshell-ws opencode_first_turn opencode_ambiguous_exit`
-Expected: PASS.
+**Existing hub tests to update deliberately (same #609 inversion — these
+two pin the Candidate detour at the HUB level and cannot pass once
+Step 3 lands; update them in this task so the full `freshell-ws` suite
+is green at this task's gate, not discovered broken later):**
+- `resume_created_opencode_terminal_binds_identity_via_bind_ingress`
+  (~:4640) — REWRITE as
+  `restore_created_opencode_terminal_completes_first_turn_directly`:
+  keep the same setup (`Created{resume_session_id: None}`,
+  `register_opencode_lane_for_tests("t-oc", 1)`, gen-1 busy
+  `Status{session_id:"ses-x"}`), but the busy edge now binds directly
+  (KnownBusy), so after `SessionIdle{"ses-x"}` assert the completion
+  mints IMMEDIATELY: a `terminal.turn.complete` with
+  `terminalId == "t-oc"` and `provider == "opencode"`, then exactly one
+  `terminal.idle{reason:"grace"}` (keep the trailing
+  exactly-one-idle guard). DROP the `assert_no_attention_frames`
+  deferral window and the `bind_opencode_session` release step — the
+  D3 deferred-completion contract no longer applies to lane busy
+  edges. Update the doc comment in lockstep; `bind_opencode_session`
+  (`activity.rs:416`) remains for the locator/plugin producers and
+  keeps tracker-level coverage via `bind_session`'s own tests.
+- `opencode_death_while_candidate_or_idle_is_silent_and_freshell_kill_is_silent`
+  (~:4775) — sections (a) and (b) build "candidate" via
+  `Created{resume_session_id: None}` + a gen-1 busy edge; under #609
+  that pane is KnownBusy and death-eligible, so their
+  NO-`terminal.idle` silence assertions invert: (a)'s ringing behavior
+  is exactly what `opencode_first_turn_spontaneous_exit_rings` above
+  pins, and (b)'s armed-pause variant also rings now (KnownBusy is
+  death-eligible regardless of a pending pause). DELETE sections
+  (a)/(b), keep (c) quiet-idle silence and (d) freshell-kill silence
+  unchanged, RENAME to
+  `opencode_death_while_idle_is_silent_and_freshell_kill_is_silent`,
+  and update the doc comment in lockstep (candidate death-silence is
+  superseded on the lane path; Ambiguous death-silence stays pinned by
+  `opencode_ambiguous_exit_stays_silent`).
+
+Run: `cargo test -p freshell-ws opencode_first_turn opencode_ambiguous_exit restore_created_opencode opencode_death_while && cargo test -p freshell-ws`
+Expected: PASS (the two deliberate hub-test updates included).
 
 - [ ] **Step 6: Update the residual registry**
 
@@ -4119,7 +4154,21 @@ REPLACE `lane_retry_schedule_is_bounded` (~:2687) with:
 
 REWRITE `exhausted_lane_retries_give_up_loudly` (~:2817) as
 `exhausted_lane_retries_ring_and_keep_retrying`: same failure-injection
-setup, but assert that after the 4th consecutive failure (a) an
+setup PLUS a confirmed-busy step — the old setup NEVER leaves Idle (its
+only record is `session:start`, phase-inert per the reducer's catch-all
+arm at reducer.rs:221-224, and no `Input` event is sent), and
+`note_verify_failed` no-ops unless Busy, so without this step assertion
+(a) below is unreachable. Concretely: after the sessionId-bind upsert
+gate and BEFORE the `remove_file`/`remove_dir_all` injection, append
+`amplifier_line("prompt:submit")` to the events file and await the
+`phase == "busy"` upsert for `"t1"` (the append-after-attach pattern
+`degraded_lane_reattaches_and_recovers` uses at ~:2783-2805;
+`std::io::Write` is already in scope at :1850). The busy upsert MUST be
+awaited before the delete, or the drain races the injection. (Under the
+new Step 3 tracker semantics the degrades that follow HOLD busy — the
+confirmed-busy `ForceRead` is dropped at the `Degraded` arm per Step 5
+item 4 — so no intermediate idle upsert precedes the escalation.) Then
+assert that after the 4th consecutive failure (a) an
 `amplifier.activity.updated` upsert with `phase == "idle"` AND a
 `terminal.idle` frame (reason `grace`) are broadcast, and (b) the
 `lane_retries` entry STILL exists with `next_attempt_at == Some(now + 3000)`
@@ -4129,6 +4178,28 @@ at ~:2696 shows the pattern), and (c) no `amplifier_events_lane_dead` state
 exists (the tracker still accepts a later `Created`/re-attach — assert a
 subsequent successful attach+read drives a busy record again, following
 `degraded_lane_reattaches_and_recovers` at ~:2716).
+
+REWRITE `schema_mismatch_gives_up_immediately_without_retries` (~:2882)
+— it pins the OLD permanent give-up (a client-visible `remove` frame +
+`lane_retries.is_empty()`), both of which Step 5 removes: the new
+`note_lane_failure` has no give-up arm, never emits a `remove`, and
+ALWAYS schedules a retry (`permanent` failures escalate immediately and
+keep retrying — a later fixed/replaced events file recovers). Rewrite
+as `schema_mismatch_escalates_immediately_and_keeps_retrying`: same
+seeded-bad-schema setup, but assert (a) NO `amplifier.activity.updated`
+`remove` frame for `"t1"` arrives (bounded negative wait, ~1s), (b) the
+tracker record SURVIVES (`hub.amplifier_list()` still contains `"t1"`),
+and (c) a `lane_retries` entry exists with
+`next_attempt_at == Some(now + 250)` — `permanent` controls only the
+immediate escalation, not the delay, so the ladder still walks from its
+first rung (assert via the same `hub_next_deadline`/accessor pattern as
+above). NOTE: in this test's setup the tracker is Idle throughout (a
+bad-schema record never drives busy — the schema gate degrades before
+the reducer's event match), so the immediate escalation's crash
+semantics no-op: no idle upsert and no bell is expected here; the
+busy-pane ring is pinned by
+`exhausted_lane_retries_ring_and_keep_retrying` above. Update the
+test's name and comments in lockstep.
 
 - [ ] **Step 5: Implement the hub half**
 
