@@ -107,6 +107,11 @@ fn server_info_body(state: &DiagState) -> Value {
         // one — same rule as commit/buildDirty).
         "opencodeDriftEvents": freshell_ws::opencode_lane::OPENCODE_DRIFT_EVENTS
             .load(std::sync::atomic::Ordering::SeqCst),
+        // #606 (A8): claude transcript-format anomalies seen by the
+        // JSONL truth source since boot — the drift tripwire that makes
+        // a claude self-update format break visible instead of silent.
+        "claudeTruthAnomalies": freshell_ws::claude_truth::CLAUDE_TRUTH_ANOMALIES
+            .load(std::sync::atomic::Ordering::SeqCst),
     })
 }
 
@@ -423,6 +428,13 @@ mod tests {
                 .and_then(|v| v.as_u64())
                 .is_some(),
             "server-info surfaces the opencode drift counter (#604)"
+        );
+
+        assert!(
+            body.get("claudeTruthAnomalies")
+                .and_then(|v| v.as_u64())
+                .is_some(),
+            "server-info surfaces the claude format-anomaly tripwire (#606/A8)"
         );
 
         std::fs::remove_dir_all(&dir).ok();

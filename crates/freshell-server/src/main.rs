@@ -520,6 +520,12 @@ async fn main() -> ExitCode {
             events: std::sync::Arc::new(freshell_ws::opencode_lane::ReqwestLaneStream::new()),
         },
     ));
+    // #606: the claude deadman's session-JSONL truth source (verify-then-
+    // decide; fakes in tests). Unset would make every deadman verify fail
+    // (crash semantics).
+    activity_hub.set_claude_truth(std::sync::Arc::new(
+        freshell_ws::claude_truth::FsClaudeTruth::from_env(),
+    ));
     // Resolved ONCE so the rate-limit knobs and the gate the handlers consult
     // are guaranteed to come from the same env snapshot.
     let create_protect = freshell_ws::create_limit::CreateProtectConfig::from_env();

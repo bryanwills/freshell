@@ -9,8 +9,11 @@
 //!   decrements in-flight turns and, while a turn was actually in flight,
 //!   emits one turn.complete. A BEL while idle is ignored (false-positive
 //!   guard).
-//! * A busy terminal silent past the deadman self-heals to idle (no
-//!   completion event — it is a stuck recovery, not a real turn end).
+//! * A busy terminal silent past the deadman requests a verify (`ForceRead`)
+//!   and STAYS busy (#606); the hub answers from the session-JSONL truth
+//!   source via [`ClaudeActivityTracker::note_verified_busy`] /
+//!   [`ClaudeActivityTracker::note_verified_ended`] /
+//!   [`ClaudeActivityTracker::note_verify_failed`].
 //!
 //! Zero-polling deviation from the reference: instead of a 5s sweep interval,
 //! [`ClaudeActivityTracker::next_deadline`] reports the earliest instant
@@ -61,15 +64,38 @@ fn has_public_change(previous: Option<&ClaudeActivityRecord>, next: &ClaudeActiv
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ClaudeActivityTracker {
     states: HashMap<String, TerminalActivity>,
     ledger: TurnCompletionLedger,
+    /// Busy-deadman window; [`CLAUDE_BUSY_DEADMAN_MS`] in production.
+    /// Test-scale hook, same shape as the codex/opencode trackers'.
+    busy_deadman_ms: i64,
+}
+
+impl Default for ClaudeActivityTracker {
+    fn default() -> Self {
+        Self {
+            states: HashMap::new(),
+            ledger: TurnCompletionLedger::default(),
+            busy_deadman_ms: CLAUDE_BUSY_DEADMAN_MS,
+        }
+    }
 }
 
 impl ClaudeActivityTracker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn set_busy_deadman_ms(&mut self, ms: i64) {
+        self.busy_deadman_ms = ms;
+    }
+
+    pub fn session_id_of(&self, terminal_id: &str) -> Option<String> {
+        self.states
+            .get(terminal_id)
+            .and_then(|s| s.session_id.clone())
     }
 
     pub fn list(&self) -> Vec<ClaudeActivityRecord> {
@@ -204,8 +230,13 @@ impl ClaudeActivityTracker {
         }]
     }
 
-    /// Busy-deadman self-heal. Deadline-driven: the hub calls this when the
-    /// one-shot timer armed from [`Self::next_deadline`] fires.
+    /// Busy-deadman — verify-then-decide (#606). Emits a verify request
+    /// (`ForceRead`) and STAYS busy; the hub answers from the session
+    /// JSONL truth source: verified-busy → refreshed, verified-ended →
+    /// [`Self::note_verified_ended`] (idle WITH the completion the old
+    /// deadman swallowed), probe failure → [`Self::note_verify_failed`]
+    /// (crash semantics). Re-arms via `last_observed_at` so a wedged
+    /// probe cannot hot-loop.
     pub fn expire(&mut self, at: i64) -> Vec<ClaudeEffect> {
         let mut effects = Vec::new();
         for state in self.states.values_mut() {
@@ -213,24 +244,91 @@ impl ClaudeActivityTracker {
                 continue;
             }
             let idle_age_ms = at - state.last_observed_at;
-            if idle_age_ms <= CLAUDE_BUSY_DEADMAN_MS {
+            if idle_age_ms <= self.busy_deadman_ms {
                 continue;
             }
-            let previous = state.to_record();
-            state.phase = ClaudePhase::Idle;
-            state.in_flight = 0;
-            state.updated_at = at;
             state.last_observed_at = at;
             tracing::warn!(
                 component = "claude-activity-tracker",
-                event = "claude_activity_deadman",
+                event = "claude_activity_deadman_verify",
                 terminal_id = %state.terminal_id,
                 age_ms = idle_age_ms,
-                "Claude terminal stuck busy past deadman; clearing to idle."
+                "Claude terminal silent past deadman; requesting JSONL verify (staying busy)."
             );
-            let next = state.to_record();
-            effects.extend(commit_change(Some(&previous), next));
+            effects.push(TrackerEffect::ForceRead {
+                terminal_id: state.terminal_id.clone(),
+                at,
+            });
         }
+        effects
+    }
+
+    /// Truth source says the turn is still in flight: refresh liveness.
+    pub fn note_verified_busy(&mut self, terminal_id: &str, at: i64) -> Vec<ClaudeEffect> {
+        if let Some(state) = self.states.get_mut(terminal_id) {
+            if state.phase == ClaudePhase::Busy {
+                state.last_observed_at = at;
+            }
+        }
+        Vec::new()
+    }
+
+    /// Truth source says the turn ENDED (turn_duration / interrupt): clear
+    /// busy WITH the completion the old silent deadman swallowed.
+    pub fn note_verified_ended(&mut self, terminal_id: &str, at: i64) -> Vec<ClaudeEffect> {
+        let Some(state) = self.states.get_mut(terminal_id) else {
+            return Vec::new();
+        };
+        if state.phase != ClaudePhase::Busy {
+            return Vec::new();
+        }
+        let previous = state.to_record();
+        state.phase = ClaudePhase::Idle;
+        state.in_flight = 0;
+        state.updated_at = at;
+        state.last_observed_at = at;
+        let next = state.to_record();
+        let mut effects = commit_change(Some(&previous), next);
+        let seq = self.ledger.record_turn_completion(terminal_id, at);
+        effects.push(TrackerEffect::TurnComplete {
+            terminal_id: terminal_id.to_string(),
+            session_id: self
+                .states
+                .get(terminal_id)
+                .and_then(|s| s.session_id.clone()),
+            at,
+            completion_seq: seq,
+        });
+        effects
+    }
+
+    /// The verify probe failed (no JSONL / unreadable / no bound session /
+    /// no truth source installed). Owner ruling: crash semantics — clear
+    /// busy AND fire the attention/death engagement signal.
+    pub fn note_verify_failed(&mut self, terminal_id: &str, at: i64) -> Vec<ClaudeEffect> {
+        let Some(state) = self.states.get_mut(terminal_id) else {
+            return Vec::new();
+        };
+        if state.phase != ClaudePhase::Busy {
+            return Vec::new();
+        }
+        tracing::error!(
+            component = "claude-activity-tracker",
+            event = "claude_verify_failed",
+            terminal_id = %state.terminal_id,
+            "claude verify probe failed; clearing busy and ringing attention (owner ruling: probe failure = crash)"
+        );
+        let previous = state.to_record();
+        state.phase = ClaudePhase::Idle;
+        state.in_flight = 0;
+        state.updated_at = at;
+        state.last_observed_at = at;
+        let next = state.to_record();
+        let mut effects = commit_change(Some(&previous), next);
+        effects.push(TrackerEffect::AttentionBoundary {
+            terminal_id: terminal_id.to_string(),
+            at,
+        });
         effects
     }
 
@@ -240,7 +338,7 @@ impl ClaudeActivityTracker {
         self.states
             .values()
             .filter(|s| s.phase == ClaudePhase::Busy)
-            .map(|s| s.last_observed_at + CLAUDE_BUSY_DEADMAN_MS + 1)
+            .map(|s| s.last_observed_at + self.busy_deadman_ms + 1)
             .min()
     }
 }
@@ -358,19 +456,60 @@ mod tests {
     }
 
     #[test]
-    fn deadman_clears_stuck_busy_without_completion() {
+    fn deadman_requests_verify_and_stays_busy() {
+        let mut tracker = ClaudeActivityTracker::new();
+        tracker.set_busy_deadman_ms(1000);
+        tracker.track_terminal("t1", None, 0);
+        tracker.note_input("t1", "\r", 10);
+        assert!(tracker.expire(1010).is_empty(), "not past the window yet");
+        let effects = tracker.expire(1011 + 1);
+        assert_eq!(
+            effects,
+            vec![TrackerEffect::ForceRead {
+                terminal_id: "t1".to_string(),
+                at: 1012,
+            }]
+        );
+        assert_eq!(tracker.list()[0].phase, ClaudePhase::Busy);
+        assert!(tracker.next_deadline().is_some(), "re-armed, no hot loop");
+        assert!(completions(&effects).is_empty());
+    }
+
+    #[test]
+    fn verified_ended_clears_with_a_completion_bell() {
+        // The old deadman swallowed the bell; the verified end mints it.
         let mut tracker = ClaudeActivityTracker::new();
         tracker.track_terminal("t1", None, 0);
         tracker.note_input("t1", "\r", 10);
-
-        // Before the deadman: nothing.
-        assert!(tracker.expire(10 + CLAUDE_BUSY_DEADMAN_MS).is_empty());
-        // Past it: idle, but NO completion (stuck recovery, not a turn end).
-        let effects = tracker.expire(11 + CLAUDE_BUSY_DEADMAN_MS);
+        let effects = tracker.note_verified_ended("t1", 500);
         assert_eq!(
             busy_upserts(&effects),
             vec![("t1".into(), ClaudePhase::Idle)]
         );
+        assert_eq!(completions(&effects), vec![1]);
+        // A stray later BEL is a false positive: ignored (in_flight == 0).
+        assert!(completions(&tracker.note_output("t1", "\u{07}", 600)).is_empty());
+    }
+
+    #[test]
+    fn verified_busy_refreshes_and_verify_failed_rings_attention() {
+        let mut tracker = ClaudeActivityTracker::new();
+        tracker.set_busy_deadman_ms(1000);
+        tracker.track_terminal("t1", None, 0);
+        tracker.note_input("t1", "\r", 10);
+        tracker.expire(2000); // verify requested
+        assert!(tracker.note_verified_busy("t1", 2100).is_empty());
+        assert_eq!(tracker.next_deadline(), Some(2100 + 1000 + 1));
+        // Probe failure: crash semantics — idle + attention boundary.
+        let effects = tracker.note_verify_failed("t1", 3000);
+        assert_eq!(
+            busy_upserts(&effects),
+            vec![("t1".into(), ClaudePhase::Idle)]
+        );
+        assert!(matches!(
+            effects.last(),
+            Some(TrackerEffect::AttentionBoundary { at: 3000, .. })
+        ));
         assert!(completions(&effects).is_empty());
     }
 
@@ -383,9 +522,9 @@ mod tests {
         // Silence measured from the LAST output, not the submit.
         assert!(tracker.expire(10 + CLAUDE_BUSY_DEADMAN_MS + 1).is_empty());
         let effects = tracker.expire(100_001 + CLAUDE_BUSY_DEADMAN_MS);
-        assert_eq!(
-            busy_upserts(&effects),
-            vec![("t1".into(), ClaudePhase::Idle)]
+        assert!(
+            matches!(effects.as_slice(), [TrackerEffect::ForceRead { .. }]),
+            "past the window: verify, don't demote (#606); got {effects:?}"
         );
     }
 

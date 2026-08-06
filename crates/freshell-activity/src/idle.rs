@@ -106,6 +106,14 @@
 //!     /session/status through the lane and stays busy; a failed probe
 //!     clears busy AND rings the attention boundary (owner ruling:
 //!     verify-probe failure = crash/needs-attention).
+//! 13. (NAMED by #606, 2026-08-06) An EARLY-ESC interrupt — ESC before
+//!     any assistant output — writes NO transcript record at all
+//!     (corpus-verified), so the JSONL truth source cannot distinguish
+//!     it from a long silent tool call: the pane keeps an honest-stale
+//!     blue until the user's next input, at which point the submit
+//!     probe / deadman verify self-heals it. Accepted: no deterministic
+//!     discriminator exists, and a stale blue that self-heals is the
+//!     conservative direction (never a false green).
 
 use std::collections::HashMap;
 

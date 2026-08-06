@@ -300,6 +300,11 @@ struct HubInner {
     /// (Task 10 wires the reqwest impls at boot); attach without deps only
     /// retires old lanes.
     opencode_lane_deps: Option<Arc<crate::opencode_lane::OpencodeLaneDeps>>,
+    /// #606: the claude session-JSONL truth source answering deadman
+    /// verifies. `None` until installed at boot (`FsClaudeTruth`) or by
+    /// tests (fakes) — no truth source = probe failure = crash semantics
+    /// (owner ruling).
+    claude_truth: Option<Arc<dyn crate::claude_truth::ClaudeTruth>>,
     /// Test-only send-side recorder of `note_opencode_lane_event` calls:
     /// (generation, cycle, stream, event), in call order. The stamps are
     /// not wire-visible, so lane tests pin them here.
@@ -545,6 +550,54 @@ impl ActivityHub {
             .expect("activity hub lock")
             .opencode
             .set_busy_deadman_ms(ms);
+    }
+
+    /// #606: install the claude session-JSONL truth source (production:
+    /// `FsClaudeTruth::from_env()` at boot, next to the opencode lane
+    /// deps; tests inject fakes). Unset = every deadman verify fails =
+    /// crash semantics.
+    pub fn set_claude_truth(&self, truth: std::sync::Arc<dyn crate::claude_truth::ClaudeTruth>) {
+        self.inner.lock().expect("activity hub lock").claude_truth = Some(truth);
+    }
+
+    /// Test-scale hook: shrink the claude busy-deadman window. Call
+    /// BEFORE driving any busy event (same ordering rule as
+    /// `set_opencode_busy_deadman_for_tests`).
+    #[cfg(test)]
+    pub(crate) fn set_claude_busy_deadman_for_tests(&self, ms: i64) {
+        self.inner
+            .lock()
+            .expect("activity hub lock")
+            .claude
+            .set_busy_deadman_ms(ms);
+    }
+
+    /// Test-only view of the claude tracker's bound session id.
+    #[cfg(test)]
+    pub(crate) fn claude_session_id_for_tests(&self, terminal_id: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("activity hub lock")
+            .claude
+            .session_id_of(terminal_id)
+    }
+
+    /// #606/#611: bind the claude tracker to the pane's CURRENT session.
+    /// This is the producer that was missing: the SessionStart rebind
+    /// path updated identity/registry/ledger but never the activity
+    /// tracker, so after an in-TUI /resume or /clear the deadman verify
+    /// and submit probes read the OLD session's JSONL (and resume/fork
+    /// mints a NEW <session-id>.jsonl, so "old" also means "no longer
+    /// written"). Called from apply_claude_signal's rebind tail.
+    pub fn bind_claude_session(&self, terminal_id: &str, session_id: &str) {
+        let frames = {
+            let mut inner = self.inner.lock().expect("activity hub lock");
+            let effects = inner.claude.bind_session(terminal_id, session_id);
+            // ForceRead only arises from expire()
+            let (frames, _) = claude_frames(&mut inner.idle, effects);
+            frames
+        };
+        self.emit(frames);
     }
 
     /// Install the resume-time rollout locator (called once from
@@ -1015,7 +1068,9 @@ impl ActivityHub {
                                 resume_session_id.as_deref(),
                                 at,
                             );
-                            frames.extend(claude_frames(&mut inner.idle, effects));
+                            // ForceRead only arises from expire()
+                            let (mut f, _) = claude_frames(&mut inner.idle, effects);
+                            frames.append(&mut f);
                         }
                         "codex" => {
                             inner.modes.insert(terminal_id.clone(), mode.clone());
@@ -1125,7 +1180,9 @@ impl ActivityHub {
                     match mode.as_str() {
                         "claude" => {
                             let effects = inner.claude.note_input(&terminal_id, &data, at);
-                            claude_frames(&mut inner.idle, effects)
+                            // ForceRead only arises from expire()
+                            let (frames, _) = claude_frames(&mut inner.idle, effects);
+                            frames
                         }
                         "codex" => {
                             let effects = inner.codex.note_input(&terminal_id, &data, at);
@@ -1158,7 +1215,9 @@ impl ActivityHub {
                     match mode.as_str() {
                         "claude" => {
                             let effects = inner.claude.note_output(&terminal_id, &data, at);
-                            claude_frames(&mut inner.idle, effects)
+                            // ForceRead only arises from expire()
+                            let (frames, _) = claude_frames(&mut inner.idle, effects);
+                            frames
                         }
                         "codex" => {
                             let effects = inner.codex.note_output(&terminal_id, &data, at);
@@ -1235,7 +1294,9 @@ impl ActivityHub {
                         let tracker_frames = match mode.as_str() {
                             "claude" => {
                                 let effects = inner.claude.note_exit(&terminal_id);
-                                claude_frames(&mut inner.idle, effects)
+                                // ForceRead only arises from expire()
+                                let (frames, _) = claude_frames(&mut inner.idle, effects);
+                                frames
                             }
                             "codex" => {
                                 let effects = inner.codex.note_exit(&terminal_id);
@@ -1532,15 +1593,24 @@ impl ActivityHub {
     }
 
     /// The one-shot deadline fired: run every tracker's expiry + the idle
-    /// gate, then service any codex + amplifier force-read requests and
-    /// opencode verify requests (#603).
+    /// gate, then service any codex + amplifier force-read requests,
+    /// opencode verify requests (#603), and claude JSONL verify requests
+    /// (#606).
     fn expire_due(&self) {
         let now = now_ms();
-        let (frames, codex_force_reads, force_reads, opencode_verifies, reattaches) = {
+        let (
+            frames,
+            codex_force_reads,
+            force_reads,
+            opencode_verifies,
+            claude_verifies,
+            reattaches,
+        ) = {
             let mut inner = self.inner.lock().expect("activity hub lock");
             let mut frames = Vec::new();
             let claude = inner.claude.expire(now);
-            frames.extend(claude_frames(&mut inner.idle, claude));
+            let (mut f, claude_verifies) = claude_frames(&mut inner.idle, claude);
+            frames.append(&mut f);
             let codex = inner.codex.expire(now);
             let (mut f, codex_force_reads) = codex_frames(&mut inner.idle, codex);
             frames.append(&mut f);
@@ -1575,6 +1645,7 @@ impl ActivityHub {
                 codex_force_reads,
                 force_reads,
                 opencode_verifies,
+                claude_verifies,
                 reattaches,
             )
         };
@@ -1591,6 +1662,9 @@ impl ActivityHub {
         }
         for terminal_id in opencode_verifies {
             self.request_opencode_verify(&terminal_id);
+        }
+        for terminal_id in claude_verifies {
+            self.service_claude_verify(&terminal_id);
         }
         for (terminal_id, session_id, stored_path) in reattaches {
             // Port of the legacy resolveEventsPath semantics: the path is
@@ -1637,6 +1711,37 @@ impl ActivityHub {
             };
             self.emit(frames);
         }
+    }
+
+    /// #606: answer a claude deadman verify from the session-JSONL truth
+    /// source. Probe runs OUTSIDE the hub lock (file IO). No bound
+    /// session / no truth source / unreadable transcript = probe failure
+    /// = crash semantics (owner ruling).
+    fn service_claude_verify(&self, terminal_id: &str) {
+        use crate::claude_truth::TurnProbe;
+        let (session, truth) = {
+            let inner = self.inner.lock().expect("activity hub lock");
+            (
+                inner.claude.session_id_of(terminal_id),
+                inner.claude_truth.clone(),
+            )
+        };
+        let probe = match (&session, &truth) {
+            (Some(session_id), Some(truth)) => truth.probe_turn_state(session_id),
+            _ => TurnProbe::Unavailable,
+        };
+        let frames = {
+            let mut inner = self.inner.lock().expect("activity hub lock");
+            let at = now_ms();
+            let effects = match probe {
+                TurnProbe::InFlight => inner.claude.note_verified_busy(terminal_id, at),
+                TurnProbe::Ended => inner.claude.note_verified_ended(terminal_id, at),
+                TurnProbe::Unavailable => inner.claude.note_verify_failed(terminal_id, at),
+            };
+            let (frames, _) = claude_frames(&mut inner.idle, effects);
+            frames
+        };
+        self.emit(frames);
     }
 }
 
@@ -1690,11 +1795,15 @@ fn hub_next_deadline(inner: &HubInner) -> Option<i64> {
 }
 
 /// Map claude tracker effects onto wire frames + idle-gate interactions.
+/// Claude effects additionally surface deadman verify requests
+/// (`ForceRead`, #606) — the hub answers them from the session-JSONL
+/// truth source after the lock is released (expire_due only).
 fn claude_frames(
     idle: &mut IdleGate,
     effects: Vec<TrackerEffect<ClaudeActivityRecord>>,
-) -> Vec<ServerMessage> {
+) -> (Vec<ServerMessage>, Vec<String>) {
     let mut frames = Vec::new();
+    let mut force_reads = Vec::new();
     for effect in effects {
         match effect {
             TrackerEffect::Changed { upsert, remove } => {
@@ -1731,12 +1840,18 @@ fn claude_frames(
                     completion_seq,
                 ));
             }
-            TrackerEffect::ForceRead { .. } => {}
-            // Codex-only (approval pauses); never emitted by the claude tracker.
-            TrackerEffect::AttentionBoundary { .. } => {}
+            // #606: the deadman's verify request — the hub answers it from
+            // the session-JSONL truth source (expire_due only).
+            TrackerEffect::ForceRead { terminal_id, .. } => force_reads.push(terminal_id),
+            TrackerEffect::AttentionBoundary { terminal_id, at } => {
+                // Arm the gate WITHOUT a terminal.turn.complete frame — an approval
+                // pause is not a turn end. Effect order guarantees the Idle phase
+                // Changed was processed first, so the boundary arms.
+                idle.note_turn_boundary(&terminal_id, at);
+            }
         }
     }
-    frames
+    (frames, force_reads)
 }
 
 /// Codex effects additionally surface force-read requests (the lane drains
@@ -5522,5 +5637,207 @@ mod tests {
                 .await
                 .expect("verify-probe failure rings the attention bell");
         assert_eq!(idle["reason"], "grace");
+    }
+
+    // ---- #606: claude deadman verified against the JSONL truth source ----
+
+    /// Fake truth source for the claude deadman tests: a settable
+    /// `TurnProbe` plus a log of every probed session id (the rebind
+    /// test asserts the probe follows the NEW session). `transcript_len
+    /// → None` — IMPORTANT: `None` keeps these deadman tests on the
+    /// legacy confirmed-busy input flavor once Task 11 lands, so they
+    /// stay valid; `probe_submit → SubmitProbe::Unavailable`.
+    struct FakeClaudeTruth {
+        probe: Mutex<crate::claude_truth::TurnProbe>,
+        probed: Mutex<Vec<String>>,
+    }
+
+    impl FakeClaudeTruth {
+        fn new(probe: crate::claude_truth::TurnProbe) -> Self {
+            Self {
+                probe: Mutex::new(probe),
+                probed: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl crate::claude_truth::ClaudeTruth for FakeClaudeTruth {
+        fn probe_turn_state(&self, session_id: &str) -> crate::claude_truth::TurnProbe {
+            self.probed
+                .lock()
+                .expect("probed log")
+                .push(session_id.to_string());
+            *self.probe.lock().expect("fake probe")
+        }
+
+        fn transcript_len(&self, _session_id: &str) -> Option<u64> {
+            None
+        }
+
+        fn probe_submit(
+            &self,
+            _session_id: &str,
+            _from_offset: u64,
+        ) -> crate::claude_truth::SubmitProbe {
+            crate::claude_truth::SubmitProbe::Unavailable
+        }
+    }
+
+    /// Shared setup: install the fake truth, shrink the deadman BEFORE
+    /// driving any busy event (ordering is load-bearing — see
+    /// `verified_busy_opencode_terminal`), create the claude pane bound
+    /// to `session`, submit, and wait for the busy upsert.
+    async fn verified_busy_claude_terminal(
+        hub: &ActivityHub,
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+        fake: Arc<FakeClaudeTruth>,
+        session: &str,
+    ) {
+        hub.set_claude_truth(fake);
+        hub.set_claude_busy_deadman_for_tests(300);
+        observer_send(
+            hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "claude".into(),
+                resume_session_id: Some(session.to_string()),
+                at: now_ms(),
+            },
+        );
+        observer_send(
+            hub,
+            ActivityEvent::Input {
+                terminal_id: "t1".into(),
+                data: "\r".into(),
+                at: now_ms(),
+            },
+        );
+        next_frame_matching(rx, "claude.activity.updated", 3_000, |v| {
+            v["upsert"][0]["phase"] == "busy" && v["upsert"][0]["terminalId"] == "t1"
+        })
+        .await
+        .expect("busy upsert from the submit");
+    }
+
+    /// #606 end-to-end: deadman → JSONL probe; InFlight keeps busy on the
+    /// wire; Ended emits idle + terminal.turn.complete; Unavailable rings
+    /// the attention boundary.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn claude_deadman_probes_the_jsonl_truth_source() {
+        let (hub, mut rx) = hub();
+        let fake = Arc::new(FakeClaudeTruth::new(
+            crate::claude_truth::TurnProbe::InFlight,
+        ));
+        verified_busy_claude_terminal(&hub, &mut rx, fake.clone(), "S").await;
+
+        // InFlight: the deadman (300ms) fires at least once in this window;
+        // the record must stay busy — no idle upsert, no terminal.idle.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(700);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(frame)) => {
+                    let value: serde_json::Value =
+                        serde_json::from_str(&frame).expect("frame json");
+                    assert!(
+                        !(value["type"] == "claude.activity.updated"
+                            && value["upsert"].as_array().is_some_and(|u| {
+                                u.iter()
+                                    .any(|r| r["terminalId"] == "t1" && r["phase"] == "idle")
+                            })),
+                        "verified-busy record demoted to idle: {frame}"
+                    );
+                    assert!(
+                        value["type"] != "terminal.idle",
+                        "idle rang during a verified-busy turn: {frame}"
+                    );
+                }
+                _ => break,
+            }
+        }
+        assert!(
+            fake.probed
+                .lock()
+                .expect("probed log")
+                .iter()
+                .any(|s| s == "S"),
+            "the deadman verified against the bound session's JSONL"
+        );
+
+        // Flip the truth to Ended: the NEXT verify mints the completion the
+        // old silent deadman swallowed.
+        *fake.probe.lock().expect("fake probe") = crate::claude_truth::TurnProbe::Ended;
+        next_frame_matching(&mut rx, "terminal.turn.complete", 5_000, |v| {
+            v["provider"] == "claude" && v["terminalId"] == "t1"
+        })
+        .await
+        .expect("verified end mints the completion bell");
+    }
+
+    /// #606 sibling: no reachable truth (probe Unavailable) = crash
+    /// semantics — busy clears AND the attention bell rings
+    /// (terminal.idle, reason grace).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn claude_deadman_unavailable_truth_rings_attention() {
+        let (hub, mut rx) = hub();
+        let fake = Arc::new(FakeClaudeTruth::new(
+            crate::claude_truth::TurnProbe::Unavailable,
+        ));
+        verified_busy_claude_terminal(&hub, &mut rx, fake, "S").await;
+
+        // Deadman fires → probe Unavailable → crash semantics: the Idle
+        // upsert lands first (boundary is LAST in the effect batch)...
+        next_frame_matching(&mut rx, "claude.activity.updated", 5_000, |v| {
+            v["upsert"].as_array().is_some_and(|u| {
+                u.iter()
+                    .any(|r| r["terminalId"] == "t1" && r["phase"] == "idle")
+            })
+        })
+        .await
+        .expect("crash semantics clear the busy record");
+
+        // ...and the attention bell rings after the grace.
+        let idle =
+            next_frame_matching(&mut rx, "terminal.idle", 6_000, |v| v["terminalId"] == "t1")
+                .await
+                .expect("unavailable truth rings the attention bell");
+        assert_eq!(idle["reason"], "grace");
+    }
+
+    /// #606/#611 (A4): an in-TUI /resume or /clear rebinds the pane to a
+    /// NEW session id; the tracker must follow or every later probe
+    /// reads the OLD session's JSONL. Red until bind_claude_session
+    /// exists and is wired.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn claude_rebind_reaches_the_tracker_and_probes_the_new_session() {
+        let (hub, mut rx) = hub();
+        let fake = Arc::new(FakeClaudeTruth::new(
+            crate::claude_truth::TurnProbe::InFlight,
+        ));
+        verified_busy_claude_terminal(&hub, &mut rx, fake.clone(), "S1").await;
+
+        hub.bind_claude_session("t1", "S2");
+        assert_eq!(
+            hub.claude_session_id_for_tests("t1"),
+            Some("S2".to_string()),
+            "the rebind reached the tracker"
+        );
+
+        // Sleep past the deadman: the probe after rebind targets the NEW
+        // session's JSONL, never the stale one.
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        let probed = fake.probed.lock().expect("probed log").clone();
+        assert!(
+            probed.iter().any(|s| s == "S2"),
+            "expected a probe against the rebound session, got {probed:?}"
+        );
+        assert_ne!(
+            probed.last().map(String::as_str),
+            Some("S1"),
+            "the LAST probe still targets the stale session: {probed:?}"
+        );
     }
 }

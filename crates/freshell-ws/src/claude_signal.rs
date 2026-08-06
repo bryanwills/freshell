@@ -323,6 +323,12 @@ async fn apply_claude_signal(state: &WsState, sig: &ClaudeSignal) -> SignalDispo
         Some("claude".to_string()),
         Some(sig.session_id.clone()),
     );
+    // #606/#611: the activity tracker must follow the rebind or every
+    // later JSONL probe targets a stale session (validated: zero
+    // production bind_session callers before this line).
+    if let Some(hub) = state.activity.as_ref() {
+        hub.bind_claude_session(&sig.terminal_id, &sig.session_id);
+    }
     crate::pane_ledger::ledger_resolve_identity(
         state,
         &sig.terminal_id,
