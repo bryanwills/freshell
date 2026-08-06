@@ -3459,9 +3459,10 @@ option; the codex-style fixed pending gate is NOT used):**
 - Probe results: `Confirmed → busy_confirmed = true, in_flight = 1` (turn
   is real; BEL machinery proceeds as today); `NoTurnStarted` → immediate
   silent revert; `Unavailable` → keep provisional busy and STOP probing
-  (clear the grace deadline; the #606 deadman verify is the backstop and
-  will apply crash semantics at the 120s mark if the truth source is still
-  unreachable).
+  (clear the grace deadline — which also EXITS the awaiting-confirm state,
+  so the pane's NEXT `ForceRead` routes to the deadman-verify flavor; the
+  #606 deadman verify is the backstop and will apply crash semantics at
+  the 120s mark if the truth source is still unreachable).
 - A Stop-BEL arriving DURING provisional busy confirms and completes in
   one step (a real fast turn must not lose its bell): mint one completion,
   go Idle.
@@ -3481,8 +3482,8 @@ option; the codex-style fixed pending gate is NOT used):**
   - `pub fn note_input(&mut self, terminal_id: &str, data: &str, at: i64, confirmable: bool) -> Vec<ClaudeEffect>` — SIGNATURE CHANGE (callers updated: hub Input arm passes the computed flag; existing tracker tests pass `false` to keep legacy pins, new tests pass `true`).
   - `pub fn note_submit_confirmed(&mut self, terminal_id: &str, at: i64) -> Vec<ClaudeEffect>` — sets `busy_confirmed = true; in_flight = 1; submit_grace_deadline = None` when provisional; no public change.
   - `pub fn note_submit_unconfirmed(&mut self, terminal_id: &str, at: i64) -> Vec<ClaudeEffect>` — silent revert when provisional: phase→Idle, no completion.
-  - `pub fn note_submit_probe_unavailable(&mut self, terminal_id: &str)` — clears the grace deadline, keeps provisional busy (deadman backstop takes over).
-  - `pub fn is_awaiting_submit_confirm(&self, terminal_id: &str) -> bool` — hub routing: distinguishes the confirm-probe flavor from the deadman-verify flavor of `ForceRead`.
+  - `pub fn note_submit_probe_unavailable(&mut self, terminal_id: &str)` — clears the grace deadline, keeps provisional busy, and thereby EXITS the awaiting-confirm state (deadman backstop takes over; see `is_awaiting_submit_confirm`).
+  - `pub fn is_awaiting_submit_confirm(&self, terminal_id: &str) -> bool` — hub routing: distinguishes the confirm-probe flavor from the deadman-verify flavor of `ForceRead`. Defined as `Busy && !busy_confirmed && submit_grace_deadline.is_some()` — the deadline term is LOAD-BEARING: every probe resolution (`Confirmed`/`NoTurnStarted`/`Unavailable`) clears the deadline, so after resolution the 120s deadman `ForceRead` falls through to the turn-state verify flavor and crash semantics stay reachable. Without it, one `Unavailable` probe would wedge the pane: every later `ForceRead` would re-enter the confirm flavor and no-op forever (a permanent false-blue).
   - Hub: `HubInner.claude_submit_offsets: HashMap<String, (String, u64)>` — `(session_id, offset)` stashed at submit time in the Input arm; consumed by the confirm probe ONLY when the currently-bound session id equals the stashed one (else the probe is `Unavailable` — deadman backstop). Session-scoping is load-bearing: A7's resume/fork mints a new file, and Task 10's rebinds re-point the tracker mid-flight.
 
 - [ ] **Step 1: Write the failing tracker tests**
@@ -3554,6 +3555,11 @@ option; the codex-style fixed pending gate is NOT used):**
         tracker.note_input("t1", "\r", 200, true);
         tracker.note_submit_probe_unavailable("t1");
         assert_eq!(tracker.list()[0].phase, ClaudePhase::Busy);
+        assert!(
+            !tracker.is_awaiting_submit_confirm("t1"),
+            "Unavailable exits the confirm flavor — the next ForceRead \
+             must route to the #606 deadman verify, not back here"
+        );
         assert_eq!(
             tracker.next_deadline(),
             Some(200 + CLAUDE_BUSY_DEADMAN_MS + 1),
@@ -3745,14 +3751,28 @@ Expected: compile FAIL (signature/methods), then behavior failures.
 
     pub fn note_submit_probe_unavailable(&mut self, terminal_id: &str) {
         if let Some(state) = self.states.get_mut(terminal_id) {
+            // Clearing the deadline also exits the awaiting-confirm state
+            // (see is_awaiting_submit_confirm) — the pane's next ForceRead
+            // routes to the #606 deadman-verify flavor.
             state.submit_grace_deadline = None; // deadman backstop takes over
         }
     }
 
     pub fn is_awaiting_submit_confirm(&self, terminal_id: &str) -> bool {
+        // The deadline term is LOAD-BEARING: it is Some for exactly the
+        // window between a confirmable submit and the probe's resolution
+        // (Confirmed / NoTurnStarted / Unavailable all clear it). After
+        // resolution, a deadman ForceRead must fall through to the
+        // turn-state verify flavor — without this term, one Unavailable
+        // probe would wedge the pane busy forever (every later ForceRead
+        // re-entering the confirm flavor and no-oping).
         self.states
             .get(terminal_id)
-            .map(|s| s.phase == ClaudePhase::Busy && !s.busy_confirmed)
+            .map(|s| {
+                s.phase == ClaudePhase::Busy
+                    && !s.busy_confirmed
+                    && s.submit_grace_deadline.is_some()
+            })
             .unwrap_or(false)
     }
 ```
@@ -3841,6 +3861,12 @@ In `activity.rs`:
                         inner.claude.note_submit_unconfirmed(terminal_id, at)
                     }
                     SubmitProbe::Unavailable => {
+                        // Dead stash — drop it. The tracker call clears the
+                        // grace deadline and thereby exits the awaiting-
+                        // confirm state, so the pane's NEXT ForceRead falls
+                        // through to the deadman-verify flavor below and
+                        // crash semantics stay reachable at the 120s mark.
+                        inner.claude_submit_offsets.remove(terminal_id);
                         inner.claude.note_submit_probe_unavailable(terminal_id);
                         Vec::new()
                     }
@@ -3883,7 +3909,10 @@ a foreign file), the pane stays provisionally busy (no idle upsert
 within the grace window — `note_submit_probe_unavailable` cleared the
 grace), and the #606 deadman path remains armed
 (`hub.set_claude_busy_deadman_for_tests` + the fake's turn-state probe
-eventually fires against `"S2"`).
+eventually fires against `"S2"` — reachable because the `Unavailable`
+resolution cleared the grace deadline and with it
+`is_awaiting_submit_confirm`, so the deadman `ForceRead` routes to the
+turn-state verify flavor rather than re-entering the confirm flavor).
 
 Run: `cargo test -p freshell-ws claude_bare_enter claude_rebind_between && cargo test -p freshell-activity && cargo test -p freshell-ws`
 Expected: PASS.
@@ -3925,13 +3954,16 @@ inversion — the silent revert IS bug #605):
         let mut tracker = AmplifierActivityTracker::new();
         tracker.track_terminal("t1", Some("sess-1"), 0);
         tracker.note_input("t1", "\r", 10);
-        // Confirm busy via the reducer's TurnBegan (same helper the
-        // existing tests use — see pty_enter_is_provisional_and_prompt_submit_confirms
-        // at :499 for the apply_lifecycle call shape).
+        // Confirm busy via the reducer's TurnBegan (same apply_lifecycle
+        // shape the existing tests use — see
+        // pty_enter_is_provisional_and_prompt_submit_confirms at :507 and
+        // prompt_complete_is_the_single_boundary_and_emits_one_completion
+        // at :540).
         confirm_busy(&mut tracker, "t1", 20);
         let effects = tracker.note_events_signal_lost("t1", 100);
-        assert_eq!(force_reads(&effects), vec!["t1".to_string()]);
-        assert_eq!(phases(&tracker), vec![("t1".into(), AmplifierPhase::Busy)]);
+        assert_eq!(force_reads(&effects), 1);
+        assert!(phases(&effects).is_empty(), "no public flap — stays busy");
+        assert_eq!(tracker.list()[0].phase, AmplifierPhase::Busy);
     }
 
     #[test]
@@ -3941,9 +3973,9 @@ inversion — the silent revert IS bug #605):
         tracker.track_terminal("t1", Some("sess-1"), 0);
         tracker.note_input("t1", "\r", 10);
         let effects = tracker.note_events_signal_lost("t1", 100);
-        assert_eq!(phases(&tracker), vec![("t1".into(), AmplifierPhase::Idle)]);
+        assert_eq!(phases(&effects), vec![AmplifierPhase::Idle]);
         assert!(completions(&effects).is_empty());
-        assert!(force_reads(&effects).is_empty());
+        assert_eq!(force_reads(&effects), 0);
     }
 
     #[test]
@@ -3953,7 +3985,8 @@ inversion — the silent revert IS bug #605):
         tracker.note_input("t1", "\r", 10);
         confirm_busy(&mut tracker, "t1", 20);
         let effects = tracker.note_verify_failed("t1", 5000);
-        assert_eq!(phases(&tracker), vec![("t1".into(), AmplifierPhase::Idle)]);
+        assert_eq!(phases(&effects), vec![AmplifierPhase::Idle]);
+        assert_eq!(tracker.list()[0].phase, AmplifierPhase::Idle);
         assert!(completions(&effects).is_empty());
         assert!(effects
             .iter()
@@ -3964,22 +3997,26 @@ inversion — the silent revert IS bug #605):
 ```
 
 Add the small helper next to the existing ones (`phases`/`completions`/
-`force_reads` at :454-482), modeled on how
-`prompt_complete_is_the_single_boundary_and_emits_one_completion` (:536)
-confirms busy — check that test for the exact `apply_lifecycle` /
-`ReducerEffect::TurnBegan` construction and extract:
+`force_reads` at :454-482). NOTE the existing helpers' real shapes — the
+new tests above are written against them: `phases`/`completions` take the
+EFFECTS slice (`&[AmplifierEffect]`), not the tracker, and return
+`Vec<AmplifierPhase>` / `Vec<i64>`; `force_reads(&effects)` returns a
+`usize` COUNT. Current-state phase asserts go through
+`tracker.list()[0].phase` (the pattern
+`pty_enter_is_provisional_and_prompt_submit_confirms` uses at :514).
 
 ```rust
     fn confirm_busy(tracker: &mut AmplifierActivityTracker, terminal_id: &str, at: i64) {
-        // Exact ReducerEffect variant per reducer.rs — mirror the
-        // TurnBegan application used by the existing confirmation tests.
-        tracker.apply_lifecycle(terminal_id, &ReducerEffect::TurnBegan { at }, at);
+        // Mirrors the TurnBegan application the existing confirmation
+        // tests use verbatim (tracker.rs:507 and :540).
+        tracker.apply_lifecycle(terminal_id, &ReducerEffect::TurnBegan { at: None }, at);
     }
 ```
 
-(Adjust the `TurnBegan` field list to the real `ReducerEffect` definition
-in `crates/freshell-activity/src/amplifier/reducer.rs` — the existing
-tests at :499/:536 show it.)
+(`ReducerEffect::TurnBegan`'s only field is `at: Option<String>` —
+reducer.rs:123-126 — so the record timestamp is `None` here and the
+helper's `i64` argument is `apply_lifecycle`'s `now` parameter, exactly
+as the existing tests at :507/:540 do.)
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -4720,9 +4757,13 @@ Build the async test on a `mode:"claude"` pane: `Created` →
 Then a second terminal: `Created` → `Input{"\r"}` → `Input{"fix it\r"}`
 (NonQuitSubmit clears nothing here — no marker set) →
 `Exit{spontaneous:true}` → assert the `terminal.idle` frame ARRIVES. Also
-pin the clearing rule with a third terminal: `Input{"\u{4}"}` (marker) →
-`Input{"continue\r"}` (NonQuitSubmit clears) → `Exit{spontaneous:true}` →
-bell RINGS.
+pin the clearing rule with a third terminal: `Created` → `Input{"\r"}`
+(busy/engaged — REQUIRED: the Exit arm's ring predicate only fires on an
+engaged pane, and `is_submit_input` matches only pure CR/LF runs, so
+neither `\u{4}` nor `"continue\r"` engages it; this mirrors the busy step
+both earlier terminals use, and a bare Enter is `Other` so it leaves the
+marker rules untouched) → `Input{"\u{4}"}` (marker) → `Input{"continue\r"}`
+(NonQuitSubmit clears) → `Exit{spontaneous:true}` → bell RINGS.
 
 - [ ] **Step 5: Implement the hub half**
 
@@ -5147,7 +5188,7 @@ touches no `server/`, `shared/`, or `src/` TypeScript.
 - [ ] **Step 3: Push and open the PR**
 
 ```bash
-git push -u origin attention-bell-wrong-signals
+git push -u origin fix/attention-bell-wrong-signals
 gh pr create --base main --title "fix(activity): attention-bell wrong-signal fixes — verify-before-change across all four trackers (#603-#613)" --body "$(cat <<'EOF'
 Lands the attention-bell wrong-signal audit fixes. Closes #603, #604,
 #605, #606, #607, #608, #609, #610, #611, #612, #613.
