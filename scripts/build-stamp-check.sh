@@ -7,6 +7,14 @@
 # and PASSES after the unconditional ref watch.
 set -euo pipefail
 
+# Isolate from the ambient environment: the assertions below run
+# ./target/debug/stampcheck, so a user-level CARGO_TARGET_DIR would
+# redirect the build elsewhere and break them; and the throwaway repo's
+# commits must not pick up global/system git config (commit.gpgsign=true
+# would prompt or fail).
+unset CARGO_TARGET_DIR
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
