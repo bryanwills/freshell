@@ -1210,14 +1210,23 @@ impl ActivityHub {
                 data,
                 at,
             } => {
-                let frames = {
+                let submit = freshell_activity::signal::is_submit_input(&data);
+                // The claude confirmable-submit path needs
+                // `transcript_len`, which does a locate() directory scan —
+                // filesystem IO that must NOT run under the hub lock.
+                // Convention (see service_claude_verify): snapshot what the
+                // probe needs under a short lock, drop it, do the IO,
+                // re-lock to apply. Every other mode (and every claude
+                // input that cannot probe) completes under the first lock
+                // exactly as before.
+                let (frames, probe) = {
                     let mut inner = self.inner.lock().expect("activity hub lock");
                     let Some(mode) = inner.modes.get(&terminal_id).cloned() else {
                         return;
                     };
                     // Any submit-shaped input means "a turn may be starting":
                     // cancel a pending idle window before the tracker runs.
-                    if freshell_activity::signal::is_submit_input(&data) {
+                    if submit {
                         inner.idle.note_busy(&terminal_id);
                     }
                     // #612: quit-intent bookkeeping on the input stream
@@ -1237,68 +1246,85 @@ impl ActivityHub {
                     }
                     match mode.as_str() {
                         "claude" => {
-                            let confirmable = if freshell_activity::signal::is_submit_input(&data) {
-                                let session = inner.claude.session_id_of(&terminal_id);
-                                let truth = inner.claude_truth.clone();
-                                match (&session, &truth) {
-                                    (Some(session_id), Some(truth)) => {
-                                        match truth.transcript_len(session_id) {
-                                            Some(len) => {
-                                                // #611 + A7: the offset is
-                                                // valid ONLY for this
-                                                // session — resume/fork
-                                                // mints a new file.
-                                                // Double-Enter: keep the
-                                                // FIRST offset. ANY activity
-                                                // after the FIRST Enter is
-                                                // the correct confirmation
-                                                // baseline; re-stashing here
-                                                // would re-baseline past a
-                                                // live turn's evidence (the
-                                                // prompt record Enter #1
-                                                // appended) and falsely
-                                                // revert it.
-                                                if !inner
-                                                    .claude
-                                                    .is_awaiting_submit_confirm(&terminal_id)
-                                                {
-                                                    inner.claude_submit_offsets.insert(
-                                                        terminal_id.clone(),
-                                                        (session_id.clone(), len),
-                                                    );
-                                                }
-                                                true
-                                            }
-                                            None => false,
-                                        }
-                                    }
-                                    _ => false,
+                            let probe = if submit {
+                                match (
+                                    inner.claude.session_id_of(&terminal_id),
+                                    inner.claude_truth.clone(),
+                                ) {
+                                    (Some(session_id), Some(truth)) => Some((session_id, truth)),
+                                    _ => None,
                                 }
                             } else {
-                                false
+                                None
                             };
-                            let effects =
-                                inner
-                                    .claude
-                                    .note_input(&terminal_id, &data, at, confirmable);
-                            let (frames, _) = claude_frames(&mut inner.idle, effects);
-                            frames
+                            if probe.is_some() {
+                                // note_input is deferred to the re-locked
+                                // apply phase: `confirmable` depends on the
+                                // probe result.
+                                (Vec::new(), probe)
+                            } else {
+                                // No session/truth (or not a submit):
+                                // confirmable is false, no IO — complete
+                                // under this lock as before.
+                                let effects =
+                                    inner.claude.note_input(&terminal_id, &data, at, false);
+                                let (frames, _) = claude_frames(&mut inner.idle, effects);
+                                (frames, None)
+                            }
                         }
                         "codex" => {
                             let effects = inner.codex.note_input(&terminal_id, &data, at);
                             let (frames, _force_reads) = codex_frames(&mut inner.idle, effects);
-                            frames
+                            (frames, None)
                         }
                         "amplifier" => {
                             let effects = inner.amplifier.note_input(&terminal_id, &data, at);
                             let (frames, _force) = amplifier_frames(&mut inner.idle, effects);
-                            frames
+                            (frames, None)
                         }
                         // Task 8: SSE-driven — PTY bytes carry no protocol
                         // signal for opencode, NO heuristic bells.
-                        "opencode" => Vec::new(),
-                        _ => Vec::new(),
+                        "opencode" => (Vec::new(), None),
+                        _ => (Vec::new(), None),
                     }
+                };
+                let frames = if let Some((session_id, truth)) = probe {
+                    // Filesystem IO with the hub lock released.
+                    let len = truth.transcript_len(&session_id);
+                    let mut inner = self.inner.lock().expect("activity hub lock");
+                    let confirmable = match len {
+                        Some(len) => {
+                            // #611 + A7: the offset is valid ONLY for this
+                            // session — resume/fork mints a new file.
+                            // Double-Enter: keep the FIRST offset. ANY
+                            // activity after the FIRST Enter is the correct
+                            // confirmation baseline; re-stashing here would
+                            // re-baseline past a live turn's evidence (the
+                            // prompt record Enter #1 appended) and falsely
+                            // revert it. The awaiting-confirm guard is
+                            // decided HERE, at stash time under the
+                            // re-acquired lock — atomic with the insert and
+                            // the note_input below, exactly as the pre-split
+                            // single-lock code had it. A snapshot taken
+                            // before the IO could go stale against a
+                            // concurrent resolution and re-stash over a
+                            // live turn's baseline.
+                            if !inner.claude.is_awaiting_submit_confirm(&terminal_id) {
+                                inner
+                                    .claude_submit_offsets
+                                    .insert(terminal_id.clone(), (session_id.clone(), len));
+                            }
+                            true
+                        }
+                        None => false,
+                    };
+                    let effects = inner
+                        .claude
+                        .note_input(&terminal_id, &data, at, confirmable);
+                    let (frames, _) = claude_frames(&mut inner.idle, effects);
+                    frames
+                } else {
+                    frames
                 };
                 self.emit(frames);
             }
