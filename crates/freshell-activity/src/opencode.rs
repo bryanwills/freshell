@@ -614,14 +614,75 @@ impl OpencodeActivityTracker {
         }
     }
 
-    /// Busy-deadman sweep: silence past the window drops the record with NO
-    /// completion (deadman swallow is silent, residual D8(e)). Ownership
-    /// survives, so the turn's eventual idle edge still completes it.
+    /// The deadman verify probe itself failed (serve unreachable, snapshot
+    /// endpoint broken). Owner ruling (2026-08-05): treat as
+    /// crash/needs-attention — clear busy AND fire the attention/death
+    /// engagement signal. Deterministic; never a silent clear, never an
+    /// "unknown" state. Ownership resets to Quiet (keeping the confirmed
+    /// identity when there is one) so a later reconnect re-establishes
+    /// cleanly; the pending-permission set is retired with the episode.
+    pub fn note_verify_failed(&mut self, terminal_id: &str, at: i64) -> Vec<OpencodeEffect> {
+        let Some(state) = self.states.get_mut(terminal_id) else {
+            return Vec::new();
+        };
+        let had_record = state.record.is_some();
+        let had_pause = !state.pending_permissions.is_empty();
+        if !had_record && !had_pause {
+            return Vec::new(); // nothing to correct
+        }
+        tracing::error!(
+            component = "opencode-activity-tracker",
+            event = "opencode_verify_failed",
+            terminal_id = %state.terminal_id,
+            "opencode verify probe failed; clearing busy and ringing attention (owner ruling: probe failure = crash)"
+        );
+        state.pending_permissions.clear();
+        let known = match &state.ownership {
+            Ownership::Quiet { known_session_id } => known_session_id.clone(),
+            Ownership::KnownBusy { session_id, .. } => Some(session_id.clone()),
+            Ownership::Candidate { previous_known, .. }
+            | Ownership::AwaitingAssociation { previous_known, .. } => previous_known.clone(),
+            Ownership::Ambiguous { known_session_id, .. } => known_session_id.clone(),
+        };
+        state.ownership = Ownership::Quiet {
+            known_session_id: known,
+        };
+        // Force the remove even when the record is already absent (a
+        // mid-pause crash must cancel the armed pause window on the gate),
+        // then arm the attention boundary — D7 order: remove FIRST.
+        let mut effects = clear_record(state, true);
+        effects.push(TrackerEffect::AttentionBoundary {
+            terminal_id: state.terminal_id.clone(),
+            at,
+        });
+        effects
+    }
+
+    /// Busy-deadman sweep — verify-then-decide (#603). Silence past the
+    /// window no longer drops the record: it emits a verify request
+    /// (`ForceRead`) and STAYS busy; the hub answers by re-fetching
+    /// `/session/status` through the lane, and the snapshot reducer
+    /// decides (busy → refreshed, empty → cleared WITH completion gating,
+    /// probe failure → [`Self::note_verify_failed`]). `last_observed_at`
+    /// re-arms here so a wedged verify cannot hot-loop (the codex
+    /// anchor-disarm lesson, codex.rs:49-53).
+    ///
+    /// Turn-start gap note (source-verified opencode v1.18.14): the serve
+    /// registers busy only at runLoop start (prompt.ts:1089), a beat
+    /// after prompt accept — but a LIT pane cannot false-green from that
+    /// gap: lighting this record required a busy publish, which implies
+    /// status-map membership, and removal from the map implies an idle
+    /// publish (the turn truly ended). Empty snapshot ⇒
+    /// clear-with-completion is therefore sound for lit panes.
     pub fn expire(&mut self, at: i64) -> Vec<OpencodeEffect> {
         let mut effects = Vec::new();
         for state in self.states.values_mut() {
             if state.record.is_some() && at - state.last_observed_at > self.busy_deadman_ms {
-                effects.extend(clear_record(state, false));
+                state.last_observed_at = at;
+                effects.push(TrackerEffect::ForceRead {
+                    terminal_id: state.terminal_id.clone(),
+                    at,
+                });
             }
         }
         effects
@@ -1302,7 +1363,9 @@ mod tests {
     }
 
     #[test]
-    fn deadman_expiry_removes_silently() {
+    fn deadman_expiry_requests_verify_and_stays_busy() {
+        // #603: the deadman is verify-then-decide, mirroring the codex
+        // self-heal (codex.rs:44-56). No silent record drop, ever.
         let mut tracker = OpencodeActivityTracker::new();
         tracker.set_busy_deadman_ms(1000);
         tracker.track_terminal("t1", Some("ses-r"), 0);
@@ -1312,10 +1375,74 @@ mod tests {
             tracker.expire(1000).is_empty(),
             "not yet silent PAST the window"
         );
-        // Silence past the window: record dropped, NO completion (D8(e)).
-        assert_eq!(tracker.expire(2000), vec![remove()]);
+        // Past the window: a verify request, record RETAINED, deadline
+        // re-armed (a wedged verify cannot hot-loop — anchor-disarm lesson).
+        assert_eq!(
+            tracker.expire(2000),
+            vec![TrackerEffect::ForceRead {
+                terminal_id: "t1".to_string(),
+                at: 2000,
+            }]
+        );
+        assert_eq!(tracker.list(), vec![rec(Some("ses-r"), 0)]);
+        assert_eq!(tracker.next_deadline(), Some(3000));
         assert!(tracker.list_latest_completions().is_empty());
+    }
+
+    #[test]
+    fn verify_snapshot_busy_keeps_the_record_and_empty_clears_with_completion() {
+        // The verify answer flows through the EXISTING note_snapshot path.
+        let mut tracker = OpencodeActivityTracker::new();
+        tracker.set_busy_deadman_ms(1000);
+        tracker.track_terminal("t1", Some("ses-r"), 0);
+        tracker.note_status("t1", "ses-r", OpencodeStatus::Busy, 1, 1, 0);
+        tracker.expire(2000); // verify requested, still busy
+        // Verify answer: still busy — record retained, deadman re-armed.
+        assert!(tracker
+            .note_snapshot(
+                "t1",
+                &[("ses-r".to_string(), OpencodeStatus::Busy)],
+                1,
+                1,
+                2100
+            )
+            .is_empty()); // same-session busy refresh is not a public change
+        assert_eq!(tracker.list(), vec![rec(Some("ses-r"), 2100)]);
+        assert_eq!(tracker.next_deadline(), Some(3100));
+        // Next window: verify again; answer: idle — clear WITH completion.
+        assert_eq!(
+            tracker.expire(3200),
+            vec![TrackerEffect::ForceRead {
+                terminal_id: "t1".to_string(),
+                at: 3200,
+            }]
+        );
+        assert_eq!(
+            tracker.note_snapshot("t1", &[], 1, 1, 3300),
+            vec![remove(), turn_complete("ses-r", 3300, 1)]
+        );
+    }
+
+    #[test]
+    fn verify_failed_clears_busy_and_rings_attention() {
+        // Owner ruling: verify-probe failure = crash/needs-attention —
+        // clear busy AND fire the engagement signal. Never silent.
+        let mut tracker = OpencodeActivityTracker::new();
+        tracker.track_terminal("t1", Some("ses-r"), 0);
+        tracker.note_status("t1", "ses-r", OpencodeStatus::Busy, 1, 1, 100);
+        tracker.note_permission_asked("t1", "ses-r", "perm-1", 150);
+        assert_eq!(
+            tracker.note_verify_failed("t1", 200),
+            // Record was already removed by the pause; the forced remove
+            // still emits (mid-pause crash must cancel the client's state)
+            // followed by the attention boundary.
+            vec![remove(), boundary(200)]
+        );
+        assert!(!tracker.has_pending_permissions("t1"));
+        assert!(!tracker.blocks_death_bell("t1"));
         assert_eq!(tracker.next_deadline(), None);
+        // No record, no pause: probe failure is a no-op.
+        assert!(tracker.note_verify_failed("t1", 300).is_empty());
     }
 
     #[test]
