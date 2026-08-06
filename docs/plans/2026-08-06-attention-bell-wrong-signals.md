@@ -317,7 +317,7 @@ drop IS bug #603) with:
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p freshell-activity deadman_expiry_requests_verify verify_snapshot_busy verify_failed_clears`
+Run: `cargo test -p freshell-activity -- deadman_expiry_requests_verify verify_snapshot_busy verify_failed_clears`
 (also confirm the old `deadman_expiry_removes_silently` no longer exists:
 `grep -n "deadman_expiry_removes_silently" crates/freshell-activity/src/opencode.rs` returns nothing)
 Expected: compile FAILS with `no method named note_verify_failed`, and after
@@ -753,14 +753,24 @@ at ~:2129+ / lane deps installation as in `opencode_lane.rs` tests):
 
 Build it as: install fake lane deps whose `/session/status` always returns
 `{"ses-1": {"type":"busy"}}`; send the `Created{mode:"opencode"}` registry
-event + `OpencodeAttach`; drive a busy `Status` lane event via the real
+event + `OpencodeAttach`; call
+`hub.set_opencode_busy_deadman_for_tests(500)` BEFORE driving any busy
+event — ORDERING IS LOAD-BEARING: the hub scheduler (`spawn_task`)
+recomputes its one-shot deadline only when a `HubEvent` arrives or the
+armed timer fires, and this lock-and-set hook neither sends a `HubEvent`
+nor wakes the select loop, so the shrunk window must already be in effect
+when the busy edge is handled (shrinking after the busy event leaves the
+production 120s deadline armed and the test can never observe the deadman;
+this is the same shrink-before-busy order the claude deadman recipes use
+in Tasks 10/11); then drive a busy `Status` lane event via the real
 lane (or `note_opencode_lane_event` with the attach generation);
-`hub.set_opencode_busy_deadman_for_tests(500)`; sleep ~1.2s; assert (a) the
+sleep ~1.2s; assert (a) the
 shared `CallLog` contains ≥2 `GET …/session/status` entries, and (b) NO
 `opencode.activity.updated` frame with `remove:["t1"]` and NO
 `terminal.idle` was broadcast in the interval (poll the broadcast receiver
 with `next_frame_matching(…, 200ms, …)` returning `None`). Follow with a
-sibling test `opencode_deadman_verify_failure_rings`: same setup but
+sibling test `opencode_deadman_verify_failure_rings`: same setup
+(including the shrink-before-busy ordering) but
 `/session/status` starts failing after the connect snapshot — assert the
 removal frame AND a `terminal.idle` (reason `grace`) arrive.
 
@@ -852,7 +862,7 @@ stream script; assert the FIRST ingress entry is `SnapshotFailed`).
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `cargo test -p freshell-ws snapshot_unknown_vocabulary connect_snapshot_failure`
+Run: `cargo test -p freshell-ws -- snapshot_unknown_vocabulary connect_snapshot_failure`
 Expected: FAIL — today an unknown `status.type` is skipped (test sees an
 EMPTY snapshot, not Busy) and a connect snapshot failure notes nothing.
 (The `retry` row may already pass — it is a deliberate named pin, not a
@@ -1222,7 +1232,7 @@ In `crates/freshell-server/src/diag.rs`, find the existing unit test of
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `cargo test -p freshell-ws drift_contradiction_rule unseen_pending_asks_rule && cargo test -p freshell-server server_info`
+Run: `cargo test -p freshell-ws -- drift_contradiction_rule unseen_pending_asks_rule && cargo test -p freshell-server server_info`
 Expected: compile FAIL (`drift_contradiction`, `unseen_pending_asks`, and
 the field don't exist).
 
@@ -1461,7 +1471,7 @@ In `opencode.rs` tests, add:
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `cargo test -p freshell-activity first_turn_busy_root superseded_session`
+Run: `cargo test -p freshell-activity -- first_turn_busy_root superseded_session`
 Expected: FAIL — today both go `Candidate` (`blocks_death_bell` true,
 completion deferred).
 
@@ -1591,7 +1601,7 @@ is green at this task's gate, not discovered broken later):**
   superseded on the lane path; Ambiguous death-silence stays pinned by
   `opencode_ambiguous_exit_stays_silent`).
 
-Run: `cargo test -p freshell-ws opencode_first_turn opencode_ambiguous_exit restore_created_opencode opencode_death_while && cargo test -p freshell-ws`
+Run: `cargo test -p freshell-ws -- opencode_first_turn opencode_ambiguous_exit restore_created_opencode opencode_death_while && cargo test -p freshell-ws`
 Expected: PASS (the two deliberate hub-test updates included).
 
 - [ ] **Step 6: Update the residual registry**
@@ -1701,7 +1711,7 @@ git commit -m "fix(opencode): per-pane lane busy roots bind identity directly; f
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `cargo test -p freshell-activity ambiguous_repromotes ambiguous_with_two_true_roots`
+Run: `cargo test -p freshell-activity -- ambiguous_repromotes ambiguous_with_two_true_roots`
 Expected: `ambiguous_repromotes…` FAILS (today the snapshot updates the
 blocked set / keeps Ambiguous; no re-promotion upsert). The two-root test
 may already pass — keep it as the pin.
@@ -1854,7 +1864,7 @@ git commit -m "fix(opencode): ambiguous ownership re-promotes from a single-busy
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `cargo test -p freshell-activity busy_snapshot_does_not_clear_an_outstanding_pause permissions_sync_drains_stale_pauses`
+Run: `cargo test -p freshell-activity -- busy_snapshot_does_not_clear_an_outstanding_pause permissions_sync_drains_stale_pauses`
 Expected: compile FAIL (`note_permissions_synced` missing); after
 stubbing, `busy_snapshot…` FAILS — today the snapshot's KnownBusy
 single-matching-root arm clears `pending_permissions` (`:947`) and calls
@@ -3430,7 +3440,7 @@ entry is not `"S1"` — the probe after rebind targets the NEW session.
 by the existing `crates/freshell-ws/tests/claude_session_rebind.rs`
 integration suite compiling and passing with the hub present.)
 
-Run: `cargo test -p freshell-ws claude_deadman claude_rebind`
+Run: `cargo test -p freshell-ws -- claude_deadman claude_rebind`
 Expected: PASS.
 
 - [ ] **Step 6: Run full crate suites**
@@ -3949,7 +3959,7 @@ resolution cleared the grace deadline and with it
 `is_awaiting_submit_confirm`, so the deadman `ForceRead` routes to the
 turn-state verify flavor rather than re-entering the confirm flavor).
 
-Run: `cargo test -p freshell-ws claude_bare_enter claude_rebind_between && cargo test -p freshell-activity && cargo test -p freshell-ws`
+Run: `cargo test -p freshell-ws -- claude_bare_enter claude_rebind_between && cargo test -p freshell-activity && cargo test -p freshell-ws`
 Expected: PASS.
 
 - [ ] **Step 6: Commit**
@@ -4597,7 +4607,7 @@ at ~:283):
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `cargo test -p freshell-activity quit_intent_classification bracketed_paste_framing decrqm_reports`
+Run: `cargo test -p freshell-activity -- quit_intent_classification bracketed_paste_framing decrqm_reports`
 Expected: compile FAIL.
 
 - [ ] **Step 3: Implement the classifier**
@@ -4799,7 +4809,7 @@ above pins. Framing state is per-terminal and survives chunk
 boundaries; the `Fail` arm reprocesses its final char so a split
 unrecognized sequence ending in `\r` still evaluates.)
 
-Run: `cargo test -p freshell-activity quit_intent_classification bracketed_paste_framing decrqm_reports` — PASS.
+Run: `cargo test -p freshell-activity -- quit_intent_classification bracketed_paste_framing decrqm_reports` — PASS.
 
 - [ ] **Step 4: Write the failing hub tests**
 
@@ -5129,7 +5139,7 @@ In `crates/freshell-server/src/diag.rs`'s test module:
 (The second literal was verified with `date -u -d @1754500000 +%FT%TZ` →
 `2025-08-06T17:06:40Z`.)
 
-Run: `cargo test -p freshell-server boot_line iso8601`
+Run: `cargo test -p freshell-server -- boot_line iso8601`
 Expected: compile FAIL.
 
 - [ ] **Step 4: Implement the formatter (std-only — no new deps)**
