@@ -24,6 +24,7 @@ pub mod activity;
 pub mod auto_resume;
 pub mod backpressure;
 pub mod claude_signal;
+pub mod claude_truth;
 pub mod codex_association;
 pub(crate) mod codex_identity;
 pub mod codex_proxy_route;
