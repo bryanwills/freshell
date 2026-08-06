@@ -932,7 +932,8 @@ fn reduce_snapshot(
 ) -> Vec<OpencodeEffect> {
     match state.ownership.clone() {
         Ownership::Ambiguous {
-            known_session_id, ..
+            known_session_id,
+            blocked,
         } => {
             if busy_roots.is_empty() {
                 // Same staleness as the idle-edge drain: a pause claim that
@@ -940,38 +941,38 @@ fn reduce_snapshot(
                 // Quiet.
                 state.pending_permissions.clear();
                 state.ownership = Ownership::Quiet { known_session_id };
-                return clear_record(state, false);
+                clear_record(state, false)
+            } else if busy_roots.len() == 1 {
+                // #610: the snapshot's root collapse resolved the
+                // ambiguity — one busy root on the pane's own endpoint
+                // is the pane's session (same determinism as #609).
+                // Re-promote; the pause claim (if any) stays with the
+                // episode and drains via the normal D3 rules.
+                let root = busy_roots[0].clone();
+                state.ownership = Ownership::KnownBusy {
+                    session_id: root.clone(),
+                    cycle,
+                    stream,
+                    turn_aborted: false,
+                };
+                set_busy_record(state, Some(root), at)
+            } else {
+                // Genuinely plural busy roots: no deterministic single
+                // owner (adjudicated residual — structurally
+                // near-impossible on per-pane endpoints after #609).
+                tracing::warn!(
+                    component = "opencode-activity-tracker",
+                    terminal_id = %state.terminal_id,
+                    roots = busy_roots.len(),
+                    "opencode pane observes multiple busy ROOT sessions; staying conservatively silent (D8(a))"
+                );
+                state.ownership = Ownership::Ambiguous {
+                    known_session_id,
+                    blocked: unique_sorted(busy_roots),
+                };
+                let _ = blocked;
+                set_busy_record(state, None, at)
             }
-            if busy_roots.len() == 1 {
-                if let Some(known) = &known_session_id {
-                    if *known == busy_roots[0] {
-                        let known = known.clone();
-                        state.ownership = Ownership::KnownBusy {
-                            session_id: known.clone(),
-                            cycle,
-                            stream,
-                            turn_aborted: false,
-                        };
-                        return set_busy_record(state, Some(known), at);
-                    }
-                } else {
-                    // Deliberately silent (Node reduceSnapshot:296-307).
-                    state.ownership = Ownership::Candidate {
-                        session_id: busy_roots[0].clone(),
-                        previous_known: None,
-                        cycle,
-                        stream,
-                        turn_aborted: false,
-                    };
-                    return Vec::new();
-                }
-            }
-            // Recompute the blocked set (recompute, not union).
-            state.ownership = Ownership::Ambiguous {
-                known_session_id,
-                blocked: busy_roots,
-            };
-            Vec::new()
         }
         Ownership::KnownBusy {
             session_id: own,
@@ -1834,5 +1835,63 @@ mod tests {
             tracker.note_session_idle("t1", "ses-r", 3, 1, 400),
             vec![remove(), turn_complete("ses-r", 400, 1)]
         );
+    }
+
+    #[test]
+    fn ambiguous_repromotes_on_single_root_snapshot_and_then_bells() {
+        // #610: resolve the ambiguity deterministically instead of
+        // waiting it out — the verify snapshot's root collapse picks the
+        // one true root; the next idle edge mints the completion that the
+        // old quiet drain silently skipped.
+        let mut tracker = OpencodeActivityTracker::new();
+        tracker.track_terminal("t1", None, 0);
+        tracker.note_status("t1", "ses-a", OpencodeStatus::Busy, 1, 1, 100);
+        // ses-c was mis-seen as a root during an SSE gap (D8(c)) → Ambiguous.
+        tracker.note_status("t1", "ses-c", OpencodeStatus::Busy, 1, 1, 110);
+        assert!(tracker.blocks_death_bell("t1"));
+        // The lane's root resolution catches up: ses-c is a CHILD of ses-a.
+        tracker.note_session_created("t1", "ses-c", Some("ses-a"), 120);
+        // Verify snapshot: only ses-c busy — collapses to root ses-a.
+        assert_eq!(
+            tracker.note_snapshot(
+                "t1",
+                &[("ses-c".to_string(), OpencodeStatus::Busy)],
+                1,
+                1,
+                130
+            ),
+            vec![upsert(rec(Some("ses-a"), 130))],
+            "re-promotion restores the session on the record"
+        );
+        assert!(!tracker.blocks_death_bell("t1"));
+        // The turn's idle edge now MINTS the completion (the whole point).
+        assert_eq!(
+            tracker.note_session_idle("t1", "ses-a", 1, 1, 200),
+            vec![remove(), turn_complete("ses-a", 200, 1)]
+        );
+    }
+
+    #[test]
+    fn ambiguous_with_two_true_roots_stays_conservative() {
+        let mut tracker = OpencodeActivityTracker::new();
+        tracker.track_terminal("t1", None, 0);
+        tracker.note_status("t1", "ses-a", OpencodeStatus::Busy, 1, 1, 100);
+        tracker.note_status("t1", "ses-b", OpencodeStatus::Busy, 1, 1, 110);
+        // Two independent busy ROOTS in the snapshot: no deterministic
+        // single owner — stay Ambiguous (adjudicated residual), honest
+        // blue, quiet drain.
+        assert!(tracker
+            .note_snapshot(
+                "t1",
+                &[
+                    ("ses-a".to_string(), OpencodeStatus::Busy),
+                    ("ses-b".to_string(), OpencodeStatus::Busy)
+                ],
+                1,
+                1,
+                130
+            )
+            .is_empty());
+        assert!(tracker.blocks_death_bell("t1"));
     }
 }
