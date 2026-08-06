@@ -413,6 +413,11 @@ mod tests {
             body["buildDirty"]
         );
 
+        assert!(
+            body.get("opencodeDriftEvents").and_then(|v| v.as_u64()).is_some(),
+            "server-info surfaces the opencode drift counter (#604)"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

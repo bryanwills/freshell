@@ -1719,6 +1719,42 @@ mod tests {
         lane.abort();
     }
 
+    #[test]
+    fn drift_contradiction_rule() {
+        // Rule (a): a REST-observed status TRANSITION with no recognized
+        // stream counterpart is drift…
+        assert!(drift_contradiction(Some(true), false, 0));
+        assert!(drift_contradiction(Some(false), true, 0));
+        // …a transition WITH recognized stream traffic is normal…
+        assert!(!drift_contradiction(Some(true), false, 2));
+        assert!(!drift_contradiction(Some(false), true, 1));
+        // …and steady state across a silent window is a LONG TOOL CALL,
+        // not drift (the falsified draft rule: message.part.updated
+        // translates to None and session.status publishes on transitions
+        // only — never flag busy==busy silence).
+        assert!(!drift_contradiction(Some(true), true, 0));
+        assert!(!drift_contradiction(Some(false), false, 0));
+        // The first observation on a stream has no previous to diff.
+        assert!(!drift_contradiction(None, true, 0));
+        assert!(!drift_contradiction(None, false, 0));
+    }
+
+    #[test]
+    fn unseen_pending_asks_rule() {
+        // Rule (b): listed-but-never-asked ids are drift evidence; wiring
+        // lands with Task 8's pending resync.
+        let mut known = std::collections::HashSet::new();
+        known.insert("per-1".to_string());
+        let listed = vec![
+            ("ses-1".to_string(), "per-1".to_string()),
+            ("ses-1".to_string(), "que-9".to_string()),
+        ];
+        assert_eq!(unseen_pending_asks(&listed, &known), vec!["que-9".to_string()]);
+        known.insert("que-9".to_string());
+        assert!(unseen_pending_asks(&listed, &known).is_empty());
+        assert!(unseen_pending_asks(&[], &known).is_empty());
+    }
+
     /// A failing CONNECT-cycle snapshot notes SnapshotFailed (loud, crash
     /// semantics) instead of silently backing off.
     #[tokio::test(flavor = "multi_thread")]
