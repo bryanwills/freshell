@@ -13,7 +13,10 @@
 //! * PTY output only refreshes liveness (feeds the deadman). The deadman
 //!   never fabricates a completion: it requests a force-read of the events
 //!   tail and STAYS busy.
-//! * Signal loss (tailer degraded/detached) reverts busy to idle silently.
+//! * Signal loss on a CONFIRMED turn holds busy and force-reads the events
+//!   tail; only provisional busy reverts silently (#605). Exhausted
+//!   re-attach escalates to crash semantics (clear + attention) while
+//!   retries continue at a capped interval.
 //!
 //! Zero-polling deviations from the reference (adjudicated, see PR):
 //! * grace timers are deadlines processed by `expire(at)` + `next_deadline()`
@@ -154,17 +157,25 @@ impl AmplifierActivityTracker {
     }
 
     /// The events signal for this terminal is gone (tailer degraded or
-    /// detached). Busy reverts to idle silently — never a turn.complete.
+    /// detached). #605: a CONFIRMED busy turn holds its light and requests
+    /// a force-read — only disk truth (the events tail) may end it. A
+    /// PROVISIONAL busy (PTY Enter, never confirmed) reverts silently as
+    /// before: no confirmed turn existed.
     pub fn note_events_signal_lost(&mut self, terminal_id: &str, at: i64) -> Vec<AmplifierEffect> {
         let Some(state) = self.states.get_mut(terminal_id) else {
             return Vec::new();
         };
         state.submit_grace_deadline = None;
-        state.busy_confirmed = false;
         state.force_read_logged = false;
         state.next_force_read_at = None;
         if state.phase != AmplifierPhase::Busy {
             return Vec::new();
+        }
+        if state.busy_confirmed {
+            return vec![TrackerEffect::ForceRead {
+                terminal_id: terminal_id.to_string(),
+                at,
+            }];
         }
         let previous = state.to_record();
         state.phase = AmplifierPhase::Idle;
@@ -283,6 +294,39 @@ impl AmplifierActivityTracker {
             upsert: Vec::new(),
             remove: vec![terminal_id.to_string()],
         }]
+    }
+
+    /// The re-attach/verify path exhausted its bounded backoff — no
+    /// readable truth source. Owner ruling: crash semantics — clear busy
+    /// AND fire the attention/death engagement signal. No-op unless Busy
+    /// (so repeated escalations never double-ring).
+    pub fn note_verify_failed(&mut self, terminal_id: &str, at: i64) -> Vec<AmplifierEffect> {
+        let Some(state) = self.states.get_mut(terminal_id) else {
+            return Vec::new();
+        };
+        if state.phase != AmplifierPhase::Busy {
+            return Vec::new();
+        }
+        tracing::error!(
+            component = "amplifier-activity-tracker",
+            event = "amplifier_verify_failed",
+            terminal_id = %state.terminal_id,
+            "amplifier events lane unreadable past bounded retries; clearing busy and ringing attention (owner ruling: probe failure = crash)"
+        );
+        state.busy_confirmed = false;
+        state.submit_grace_deadline = None;
+        state.next_force_read_at = None;
+        let previous = state.to_record();
+        state.phase = AmplifierPhase::Idle;
+        state.updated_at = at;
+        state.last_observed_at = at;
+        let next = state.to_record();
+        let mut effects = changed(Some(&previous), next);
+        effects.push(TrackerEffect::AttentionBoundary {
+            terminal_id: terminal_id.to_string(),
+            at,
+        });
+        effects
     }
 
     /// Process due grace deadlines and the stuck-busy deadman.
@@ -481,6 +525,12 @@ mod tests {
             .count()
     }
 
+    fn confirm_busy(tracker: &mut AmplifierActivityTracker, terminal_id: &str, at: i64) {
+        // Mirrors the TurnBegan application the existing confirmation
+        // tests use verbatim (tracker.rs:507 and :540).
+        tracker.apply_lifecycle(terminal_id, &ReducerEffect::TurnBegan { at: None }, at);
+    }
+
     #[test]
     fn iso_parse_matches_known_values() {
         assert_eq!(
@@ -578,13 +628,55 @@ mod tests {
     }
 
     #[test]
-    fn signal_loss_reverts_busy_silently() {
+    fn signal_loss_on_confirmed_busy_verifies_and_stays_busy() {
+        // #605: losing the tailer is not evidence the turn ended — hold
+        // the light and force-read the events tail (disk truth decides).
         let mut tracker = AmplifierActivityTracker::new();
-        tracker.track_terminal("t1", None, 0);
-        tracker.apply_lifecycle("t1", &ReducerEffect::TurnBegan { at: None }, 10);
-        let effects = tracker.note_events_signal_lost("t1", 20);
+        tracker.track_terminal("t1", Some("sess-1"), 0);
+        tracker.note_input("t1", "\r", 10);
+        // Confirm busy via the reducer's TurnBegan (same apply_lifecycle
+        // shape the existing tests use — see
+        // pty_enter_is_provisional_and_prompt_submit_confirms at :507 and
+        // prompt_complete_is_the_single_boundary_and_emits_one_completion
+        // at :540).
+        confirm_busy(&mut tracker, "t1", 20);
+        let effects = tracker.note_events_signal_lost("t1", 100);
+        assert_eq!(force_reads(&effects), 1);
+        assert!(phases(&effects).is_empty(), "no public flap — stays busy");
+        assert_eq!(tracker.list()[0].phase, AmplifierPhase::Busy);
+    }
+
+    #[test]
+    fn signal_loss_on_provisional_busy_reverts_silently() {
+        // No confirmed turn existed — provisional reverts (unchanged).
+        let mut tracker = AmplifierActivityTracker::new();
+        tracker.track_terminal("t1", Some("sess-1"), 0);
+        tracker.note_input("t1", "\r", 10);
+        let effects = tracker.note_events_signal_lost("t1", 100);
         assert_eq!(phases(&effects), vec![AmplifierPhase::Idle]);
         assert!(completions(&effects).is_empty());
+        assert_eq!(force_reads(&effects), 0);
+    }
+
+    #[test]
+    fn verify_failed_clears_busy_and_rings_attention() {
+        let mut tracker = AmplifierActivityTracker::new();
+        tracker.track_terminal("t1", Some("sess-1"), 0);
+        tracker.note_input("t1", "\r", 10);
+        confirm_busy(&mut tracker, "t1", 20);
+        let effects = tracker.note_verify_failed("t1", 5000);
+        assert_eq!(phases(&effects), vec![AmplifierPhase::Idle]);
+        assert_eq!(tracker.list()[0].phase, AmplifierPhase::Idle);
+        assert!(completions(&effects).is_empty());
+        // Effect-order contract (Global Constraints): crash semantics is
+        // `[Changed{..}, AttentionBoundary{..}]` — the boundary must be the
+        // LAST element, so the gate arms only after the Idle upsert landed.
+        assert!(matches!(
+            effects.last(),
+            Some(TrackerEffect::AttentionBoundary { at: 5000, .. })
+        ));
+        // Idempotent: a second failure while idle is a no-op.
+        assert!(tracker.note_verify_failed("t1", 6000).is_empty());
     }
 
     #[test]
