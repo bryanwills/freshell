@@ -1197,10 +1197,25 @@ impl ActivityHub {
                                                 // valid ONLY for this
                                                 // session — resume/fork
                                                 // mints a new file.
-                                                inner.claude_submit_offsets.insert(
-                                                    terminal_id.clone(),
-                                                    (session_id.clone(), len),
-                                                );
+                                                // Double-Enter: keep the
+                                                // FIRST offset. ANY activity
+                                                // after the FIRST Enter is
+                                                // the correct confirmation
+                                                // baseline; re-stashing here
+                                                // would re-baseline past a
+                                                // live turn's evidence (the
+                                                // prompt record Enter #1
+                                                // appended) and falsely
+                                                // revert it.
+                                                if !inner
+                                                    .claude
+                                                    .is_awaiting_submit_confirm(&terminal_id)
+                                                {
+                                                    inner.claude_submit_offsets.insert(
+                                                        terminal_id.clone(),
+                                                        (session_id.clone(), len),
+                                                    );
+                                                }
                                                 true
                                             }
                                             None => false,
@@ -6085,5 +6100,118 @@ mod tests {
             "the deadman turn-state verify fires against the rebound \
              session, got {probed:?}"
         );
+    }
+
+    /// #611 double-Enter: the stash must keep the FIRST submit's offset.
+    /// Enter #1 starts a REAL turn and claude appends the prompt record
+    /// (len 100 → 150) before Enter #2 lands within the grace window.
+    /// Re-stashing at 150 would re-baseline past the live turn's
+    /// evidence — the confirm probe would see nothing appended past 150
+    /// (the first assistant record routinely takes >2s), silently revert
+    /// a live turn, and the eventual Stop-BEL would find in_flight == 0:
+    /// a lost bell. The probe must consume (S, 100).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn claude_double_enter_keeps_the_first_submit_offset() {
+        let (hub, mut rx) = hub();
+        let fake = Arc::new(FakeClaudeTruth::new(
+            crate::claude_truth::TurnProbe::InFlight,
+        ));
+        *fake.transcript_len.lock().expect("fake transcript len") = Some(100);
+        *fake.submit_probe.lock().expect("fake submit probe") =
+            crate::claude_truth::SubmitProbe::Confirmed;
+        // Production 120s deadman: the ONLY ForceRead in this window is
+        // the submit-grace lapse.
+        hub.set_claude_truth(fake.clone());
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "claude".into(),
+                resume_session_id: Some("S".to_string()),
+                at: now_ms(),
+            },
+        );
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "t1".into(),
+                data: "\r".into(),
+                at: now_ms(),
+            },
+        );
+        next_frame_matching(&mut rx, "claude.activity.updated", 3_000, |v| {
+            v["upsert"][0]["phase"] == "busy" && v["upsert"][0]["terminalId"] == "t1"
+        })
+        .await
+        .expect("provisional busy upsert from Enter #1");
+
+        // The real turn's prompt record lands: the transcript grows past
+        // the first baseline BEFORE the second Enter.
+        *fake.transcript_len.lock().expect("fake transcript len") = Some(150);
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "t1".into(),
+                data: "\r".into(),
+                at: now_ms(),
+            },
+        );
+
+        // Across the (re-armed) grace window up to past the confirm probe:
+        // the live turn must NOT be reverted and nothing may ring.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(2_800);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(frame)) => {
+                    let value: serde_json::Value =
+                        serde_json::from_str(&frame).expect("frame json");
+                    assert!(
+                        !(value["type"] == "claude.activity.updated"
+                            && value["upsert"].as_array().is_some_and(|u| {
+                                u.iter()
+                                    .any(|r| r["terminalId"] == "t1" && r["phase"] == "idle")
+                            })),
+                        "double-Enter silently reverted a LIVE turn: {frame}"
+                    );
+                    assert!(
+                        value["type"] != "terminal.idle",
+                        "double-Enter rang a bell during a live turn: {frame}"
+                    );
+                    assert!(
+                        value["type"] != "terminal.turn.complete",
+                        "no completion before the Stop-BEL: {frame}"
+                    );
+                }
+                _ => break,
+            }
+        }
+        // The pin: the confirm probe consumed the FIRST Enter's baseline,
+        // not Enter #2's re-baseline past the live turn's evidence.
+        assert_eq!(
+            fake.submit_probed
+                .lock()
+                .expect("submit probed log")
+                .clone(),
+            vec![("S".to_string(), 100)],
+            "the confirm probe must consume the FIRST submit offset"
+        );
+        // The confirmed turn still mints its bell on the Stop-BEL.
+        observer_send(
+            &hub,
+            ActivityEvent::Output {
+                terminal_id: "t1".into(),
+                data: "\u{07}".into(),
+                at: now_ms(),
+            },
+        );
+        next_frame_matching(&mut rx, "terminal.turn.complete", 3_000, |v| {
+            v["provider"] == "claude" && v["terminalId"] == "t1"
+        })
+        .await
+        .expect("the confirmed turn completes with its bell");
     }
 }
