@@ -84,7 +84,7 @@ Key facts:
 - **Restarting the live 3002 server still requires the user's explicit "APPROVED"** — `--restart`/`--stop` exist for approved deploys and for scratch instances on other ports, not as a license to bounce production.
 - The script is safe by construction: it only ever kills PIDs from its own pid file, after verifying the process is this repo's `freshell-server` binary (cwd + args match); if the port is held by anything else it refuses. Logs go to `~/.freshell/logs/rust-server-<port>.log`, pid to `~/.freshell/rust-server-<port>.pid`.
 - The server loads `.env` from its cwd (env vars win over the file) and refuses to start without `AUTH_TOKEN`. Note `.env`'s `PORT` may differ from the live port — the launcher passes `PORT` explicitly.
-- The startup log line includes the commit the binary was built from: `freshell-server listening on http://0.0.0.0:<port> (ws://...) [commit <sha>]`. Use it (or `~/.freshell/logs/rust-server-3002.log`) to check what the running server was built from when asking "are we running change X?".
+- The startup log line self-identifies the binary that produced it: `[<ISO-8601 UTC timestamp>] freshell-server listening on http://0.0.0.0:<port> (ws://0.0.0.0:<port>/ws) [pid <pid>] [commit <sha>] [dirty <true|false|unknown>]`. Use it (or `~/.freshell/logs/rust-server-3002.log`) to check what the running server was built from when asking "are we running change X?".
 - Health check: `curl http://127.0.0.1:<port>/api/health` (unauthenticated, rate-limit exempt).
 - **Detached launch:** `scripts/launch-rust.sh` starts the server in its own
   session (`setsid`, stdin from `/dev/null`). Closing the launching shell
