@@ -32,6 +32,9 @@ use crate::signal::{
 use crate::TrackerEffect;
 
 pub const CLAUDE_BUSY_DEADMAN_MS: i64 = 120_000;
+/// #611: window between a confirmable submit and its JSONL confirm probe
+/// (matches amplifier's submit-grace).
+pub const CLAUDE_SUBMIT_GRACE_MS: i64 = 2_000;
 
 pub type ClaudeEffect = TrackerEffect<ClaudeActivityRecord>;
 
@@ -44,6 +47,13 @@ struct TerminalActivity {
     in_flight: u32,
     last_observed_at: i64,
     parser_state: ParserState,
+    /// #611: false while a submit is PROVISIONAL (awaiting JSONL confirm).
+    busy_confirmed: bool,
+    /// #611: armed at a confirmable submit; cleared by every probe
+    /// resolution (Confirmed / NoTurnStarted / Unavailable).
+    submit_grace_deadline: Option<i64>,
+    /// #611: the first grace lapse probed and extended once already.
+    submit_grace_retried: bool,
 }
 
 impl TerminalActivity {
@@ -131,6 +141,9 @@ impl ClaudeActivityTracker {
             in_flight: 0,
             last_observed_at: at,
             parser_state: ParserState::new(),
+            busy_confirmed: false,
+            submit_grace_deadline: None,
+            submit_grace_retried: false,
         };
         let next = state.to_record();
         self.states.insert(terminal_id.to_string(), state);
@@ -150,20 +163,52 @@ impl ClaudeActivityTracker {
         commit_change(Some(&previous), next)
     }
 
-    pub fn note_input(&mut self, terminal_id: &str, data: &str, at: i64) -> Vec<ClaudeEffect> {
+    pub fn note_input(
+        &mut self,
+        terminal_id: &str,
+        data: &str,
+        at: i64,
+        confirmable: bool,
+    ) -> Vec<ClaudeEffect> {
         let Some(state) = self.states.get_mut(terminal_id) else {
             return Vec::new();
         };
         if !is_submit_input(data) {
             return Vec::new();
         }
-        let previous = state.to_record();
-        state.in_flight += 1;
         state.last_observed_at = at;
-        if state.phase != ClaudePhase::Busy {
-            state.phase = ClaudePhase::Busy;
-            state.updated_at = at;
+        if !confirmable {
+            // Legacy flavor (no truth source): today's contract — the
+            // #606 deadman verify is the backstop for phantoms.
+            let previous = state.to_record();
+            state.in_flight += 1;
+            state.busy_confirmed = true;
+            if state.phase != ClaudePhase::Busy {
+                state.phase = ClaudePhase::Busy;
+                state.updated_at = at;
+            }
+            let next = state.to_record();
+            return commit_change(Some(&previous), next);
         }
+        if state.phase == ClaudePhase::Busy {
+            if state.busy_confirmed {
+                // Queued turn while a confirmed turn runs — today's rule.
+                state.in_flight += 1;
+            } else {
+                // Repeated Enter while provisional: re-arm the grace.
+                state.submit_grace_deadline = Some(at + CLAUDE_SUBMIT_GRACE_MS);
+                state.submit_grace_retried = false;
+            }
+            return Vec::new();
+        }
+        // #611: provisional busy — no in_flight until the JSONL confirms
+        // a turn actually started (kills the phantom-BEL skew).
+        let previous = state.to_record();
+        state.phase = ClaudePhase::Busy;
+        state.updated_at = at;
+        state.busy_confirmed = false;
+        state.submit_grace_deadline = Some(at + CLAUDE_SUBMIT_GRACE_MS);
+        state.submit_grace_retried = false;
         let next = state.to_record();
         commit_change(Some(&previous), next)
     }
@@ -188,6 +233,15 @@ impl ClaudeActivityTracker {
                 state.last_observed_at = at;
             }
             return Vec::new();
+        }
+
+        // #611: a Stop-BEL during a PROVISIONAL turn is the strongest
+        // confirmation there is — confirm and complete in one step so a
+        // real fast turn (<grace) never loses its bell.
+        if clear_count > 0 && state.phase == ClaudePhase::Busy && !state.busy_confirmed {
+            state.busy_confirmed = true;
+            state.submit_grace_deadline = None;
+            state.in_flight = 1;
         }
 
         let previous = state.to_record();
@@ -240,6 +294,32 @@ impl ClaudeActivityTracker {
     pub fn expire(&mut self, at: i64) -> Vec<ClaudeEffect> {
         let mut effects = Vec::new();
         for state in self.states.values_mut() {
+            // #611 submit-grace: first lapse probes once and extends; the
+            // second silently reverts (no completion, no bell).
+            if let Some(deadline) = state.submit_grace_deadline {
+                if at >= deadline && state.phase == ClaudePhase::Busy && !state.busy_confirmed {
+                    if !state.submit_grace_retried {
+                        state.submit_grace_retried = true;
+                        state.submit_grace_deadline = Some(at + CLAUDE_SUBMIT_GRACE_MS);
+                        effects.push(TrackerEffect::ForceRead {
+                            terminal_id: state.terminal_id.clone(),
+                            at,
+                        });
+                    } else {
+                        state.submit_grace_deadline = None;
+                        let previous = state.to_record();
+                        state.phase = ClaudePhase::Idle;
+                        state.updated_at = at;
+                        state.last_observed_at = at;
+                        let next = state.to_record();
+                        effects.extend(commit_change(Some(&previous), next));
+                    }
+                    continue;
+                }
+                if at >= deadline {
+                    state.submit_grace_deadline = None;
+                }
+            }
             if state.phase != ClaudePhase::Busy {
                 continue;
             }
@@ -285,6 +365,8 @@ impl ClaudeActivityTracker {
         let previous = state.to_record();
         state.phase = ClaudePhase::Idle;
         state.in_flight = 0;
+        state.busy_confirmed = false;
+        state.submit_grace_deadline = None;
         state.updated_at = at;
         state.last_observed_at = at;
         let next = state.to_record();
@@ -321,6 +403,8 @@ impl ClaudeActivityTracker {
         let previous = state.to_record();
         state.phase = ClaudePhase::Idle;
         state.in_flight = 0;
+        state.busy_confirmed = false;
+        state.submit_grace_deadline = None;
         state.updated_at = at;
         state.last_observed_at = at;
         let next = state.to_record();
@@ -332,13 +416,88 @@ impl ClaudeActivityTracker {
         effects
     }
 
+    /// Truth source (probe_submit) confirmed the provisional turn: it is
+    /// real — `in_flight = 1` and the BEL machinery proceeds as today.
+    pub fn note_submit_confirmed(&mut self, terminal_id: &str, at: i64) -> Vec<ClaudeEffect> {
+        if let Some(state) = self.states.get_mut(terminal_id) {
+            if state.phase == ClaudePhase::Busy && !state.busy_confirmed {
+                state.busy_confirmed = true;
+                state.in_flight = 1;
+                state.submit_grace_deadline = None;
+                state.last_observed_at = at;
+            }
+        }
+        Vec::new()
+    }
+
+    /// Truth source says nothing was appended: the Enter was a no-op.
+    /// SILENT revert — idle, no completion, no bell (#611; amplifier
+    /// precedent — a no-op Enter is not attention-worthy).
+    pub fn note_submit_unconfirmed(&mut self, terminal_id: &str, at: i64) -> Vec<ClaudeEffect> {
+        let Some(state) = self.states.get_mut(terminal_id) else {
+            return Vec::new();
+        };
+        if state.phase != ClaudePhase::Busy || state.busy_confirmed {
+            return Vec::new();
+        }
+        state.submit_grace_deadline = None;
+        let previous = state.to_record();
+        state.phase = ClaudePhase::Idle;
+        state.updated_at = at;
+        state.last_observed_at = at;
+        let next = state.to_record();
+        commit_change(Some(&previous), next)
+    }
+
+    /// The confirm probe could not reach the truth source: keep the
+    /// provisional busy and stop probing.
+    pub fn note_submit_probe_unavailable(&mut self, terminal_id: &str) {
+        if let Some(state) = self.states.get_mut(terminal_id) {
+            // Clearing the deadline also exits the awaiting-confirm state
+            // (see is_awaiting_submit_confirm) — the pane's next ForceRead
+            // routes to the #606 deadman-verify flavor.
+            state.submit_grace_deadline = None; // deadman backstop takes over
+        }
+    }
+
+    /// Hub routing: distinguishes the confirm-probe flavor from the
+    /// deadman-verify flavor of `ForceRead`.
+    pub fn is_awaiting_submit_confirm(&self, terminal_id: &str) -> bool {
+        // The deadline term is LOAD-BEARING: it is Some for exactly the
+        // window between a confirmable submit and the probe's resolution
+        // (Confirmed / NoTurnStarted / Unavailable all clear it). After
+        // resolution, a deadman ForceRead must fall through to the
+        // turn-state verify flavor — without this term, one Unavailable
+        // probe would wedge the pane busy forever (every later ForceRead
+        // re-entering the confirm flavor and no-oping).
+        self.states
+            .get(terminal_id)
+            .map(|s| {
+                s.phase == ClaudePhase::Busy
+                    && !s.busy_confirmed
+                    && s.submit_grace_deadline.is_some()
+            })
+            .unwrap_or(false)
+    }
+
     /// Earliest instant at which [`Self::expire`] could change any state:
-    /// the soonest busy deadman. `None` when nothing is busy — zero timers.
+    /// per busy state the soonest of the submit-grace deadline (#611,
+    /// unconfirmed only) and the busy deadman (ANY confirmation state —
+    /// the deadman is the backstop for an unverifiable provisional pane).
+    /// `None` when nothing is busy — zero timers.
     pub fn next_deadline(&self) -> Option<i64> {
         self.states
             .values()
             .filter(|s| s.phase == ClaudePhase::Busy)
-            .map(|s| s.last_observed_at + self.busy_deadman_ms + 1)
+            .filter_map(|s| {
+                let deadman = s.last_observed_at + self.busy_deadman_ms + 1;
+                let grace = if s.busy_confirmed {
+                    None
+                } else {
+                    s.submit_grace_deadline
+                };
+                [Some(deadman), grace].into_iter().flatten().min()
+            })
             .min()
     }
 }
@@ -391,7 +550,7 @@ mod tests {
         let mut tracker = ClaudeActivityTracker::new();
         tracker.track_terminal("t1", None, 0);
 
-        let effects = tracker.note_input("t1", "\r", 10);
+        let effects = tracker.note_input("t1", "\r", 10, false);
         assert_eq!(
             busy_upserts(&effects),
             vec![("t1".into(), ClaudePhase::Busy)]
@@ -417,7 +576,7 @@ mod tests {
     fn bel_inside_osc_never_completes() {
         let mut tracker = ClaudeActivityTracker::new();
         tracker.track_terminal("t1", None, 0);
-        tracker.note_input("t1", "\r", 10);
+        tracker.note_input("t1", "\r", 10, false);
         let effects = tracker.note_output("t1", "\u{1b}]0;title\u{07}", 20);
         assert!(completions(&effects).is_empty());
         assert_eq!(tracker.list()[0].phase, ClaudePhase::Busy);
@@ -427,7 +586,7 @@ mod tests {
     fn sandwiched_bell_from_a_subtool_never_completes() {
         let mut tracker = ClaudeActivityTracker::new();
         tracker.track_terminal("t1", None, 0);
-        tracker.note_input("t1", "\r", 10);
+        tracker.note_input("t1", "\r", 10, false);
         let effects = tracker.note_output("t1", "out\u{07}more", 20);
         assert!(completions(&effects).is_empty());
         assert_eq!(tracker.list()[0].phase, ClaudePhase::Busy);
@@ -437,8 +596,8 @@ mod tests {
     fn stacked_submits_need_matching_bels() {
         let mut tracker = ClaudeActivityTracker::new();
         tracker.track_terminal("t1", None, 0);
-        tracker.note_input("t1", "\r", 10);
-        tracker.note_input("t1", "\r", 20); // queued second turn
+        tracker.note_input("t1", "\r", 10, false);
+        tracker.note_input("t1", "\r", 20, false); // queued second turn
 
         let effects = tracker.note_output("t1", "\u{07}", 30);
         // One down, still busy: busy→busy is not a PUBLIC change (the
@@ -460,7 +619,7 @@ mod tests {
         let mut tracker = ClaudeActivityTracker::new();
         tracker.set_busy_deadman_ms(1000);
         tracker.track_terminal("t1", None, 0);
-        tracker.note_input("t1", "\r", 10);
+        tracker.note_input("t1", "\r", 10, false);
         assert!(tracker.expire(1010).is_empty(), "not past the window yet");
         let effects = tracker.expire(1011 + 1);
         assert_eq!(
@@ -480,7 +639,7 @@ mod tests {
         // The old deadman swallowed the bell; the verified end mints it.
         let mut tracker = ClaudeActivityTracker::new();
         tracker.track_terminal("t1", None, 0);
-        tracker.note_input("t1", "\r", 10);
+        tracker.note_input("t1", "\r", 10, false);
         let effects = tracker.note_verified_ended("t1", 500);
         assert_eq!(
             busy_upserts(&effects),
@@ -496,7 +655,7 @@ mod tests {
         let mut tracker = ClaudeActivityTracker::new();
         tracker.set_busy_deadman_ms(1000);
         tracker.track_terminal("t1", None, 0);
-        tracker.note_input("t1", "\r", 10);
+        tracker.note_input("t1", "\r", 10, false);
         tracker.expire(2000); // verify requested
         assert!(tracker.note_verified_busy("t1", 2100).is_empty());
         assert_eq!(tracker.next_deadline(), Some(2100 + 1000 + 1));
@@ -517,7 +676,7 @@ mod tests {
     fn output_feeds_the_deadman() {
         let mut tracker = ClaudeActivityTracker::new();
         tracker.track_terminal("t1", None, 0);
-        tracker.note_input("t1", "\r", 10);
+        tracker.note_input("t1", "\r", 10, false);
         tracker.note_output("t1", "streamed output", 100_000);
         // Silence measured from the LAST output, not the submit.
         assert!(tracker.expire(10 + CLAUDE_BUSY_DEADMAN_MS + 1).is_empty());
@@ -532,7 +691,7 @@ mod tests {
     fn exit_removes_state_and_emits_remove() {
         let mut tracker = ClaudeActivityTracker::new();
         tracker.track_terminal("t1", None, 0);
-        tracker.note_input("t1", "\r", 10);
+        tracker.note_input("t1", "\r", 10, false);
         let effects = tracker.note_exit("t1");
         assert_eq!(
             effects,
@@ -551,7 +710,7 @@ mod tests {
         let mut tracker = ClaudeActivityTracker::new();
         tracker.track_terminal("t1", None, 0);
         assert_eq!(tracker.next_deadline(), None);
-        tracker.note_input("t1", "\r", 10);
+        tracker.note_input("t1", "\r", 10, false);
         assert_eq!(
             tracker.next_deadline(),
             Some(10 + CLAUDE_BUSY_DEADMAN_MS + 1)
@@ -566,12 +725,112 @@ mod tests {
         tracker.track_terminal("t1", None, 0);
         let effects = tracker.bind_session("t1", "sess-9");
         assert_eq!(effects.len(), 1);
-        tracker.note_input("t1", "\r", 10);
+        tracker.note_input("t1", "\r", 10, false);
         let effects = tracker.note_output("t1", "\u{07}", 20);
         let session = effects.iter().find_map(|e| match e {
             TrackerEffect::TurnComplete { session_id, .. } => Some(session_id.clone()),
             _ => None,
         });
         assert_eq!(session, Some(Some("sess-9".to_string())));
+    }
+
+    #[test]
+    fn confirmable_enter_is_provisional_and_silently_reverts() {
+        // #611: a bare Enter must not claim "working" for 120s. Amplifier
+        // contract: one confirm probe, one extension, then silent revert.
+        let mut tracker = ClaudeActivityTracker::new();
+        tracker.track_terminal("t1", Some("S"), 0);
+        let effects = tracker.note_input("t1", "\r", 10, true);
+        assert_eq!(
+            busy_upserts(&effects),
+            vec![("t1".into(), ClaudePhase::Busy)]
+        );
+        assert_eq!(tracker.next_deadline(), Some(10 + 2000));
+        // First grace lapse: ONE confirm probe, still busy, extended.
+        let effects = tracker.expire(2010);
+        assert!(matches!(
+            effects.as_slice(),
+            [TrackerEffect::ForceRead { .. }]
+        ));
+        assert_eq!(tracker.list()[0].phase, ClaudePhase::Busy);
+        // Second lapse: SILENT revert — idle, no completion, no boundary.
+        let effects = tracker.expire(4020);
+        assert_eq!(
+            busy_upserts(&effects),
+            vec![("t1".into(), ClaudePhase::Idle)]
+        );
+        assert!(completions(&effects).is_empty());
+        assert!(!effects
+            .iter()
+            .any(|e| matches!(e, TrackerEffect::AttentionBoundary { .. })));
+        // The phantom left NO in_flight skew: a real turn now completes
+        // with its own single BEL.
+        tracker.note_input("t1", "\r", 5000, true);
+        tracker.note_submit_confirmed("t1", 5100);
+        let effects = tracker.note_output("t1", "\u{07}", 6000);
+        assert_eq!(completions(&effects), vec![1]);
+        assert_eq!(tracker.list()[0].phase, ClaudePhase::Idle);
+    }
+
+    #[test]
+    fn confirmed_submit_behaves_like_todays_turn() {
+        let mut tracker = ClaudeActivityTracker::new();
+        tracker.track_terminal("t1", Some("S"), 0);
+        tracker.note_input("t1", "\r", 10, true);
+        assert!(tracker.note_submit_confirmed("t1", 200).is_empty());
+        // Grace is disarmed: nothing at the old deadline.
+        assert!(tracker.expire(2010).is_empty());
+        let effects = tracker.note_output("t1", "\u{07}", 3000);
+        assert_eq!(completions(&effects), vec![1]);
+    }
+
+    #[test]
+    fn probe_says_no_turn_reverts_immediately_and_unavailable_keeps_busy() {
+        let mut tracker = ClaudeActivityTracker::new();
+        tracker.track_terminal("t1", Some("S"), 0);
+        tracker.note_input("t1", "\r", 10, true);
+        let effects = tracker.note_submit_unconfirmed("t1", 100);
+        assert_eq!(
+            busy_upserts(&effects),
+            vec![("t1".into(), ClaudePhase::Idle)]
+        );
+        assert!(completions(&effects).is_empty());
+        // Unavailable: keep provisional busy, stop the grace probing —
+        // the #606 deadman verify is the deterministic backstop.
+        tracker.note_input("t1", "\r", 200, true);
+        tracker.note_submit_probe_unavailable("t1");
+        assert_eq!(tracker.list()[0].phase, ClaudePhase::Busy);
+        assert!(
+            !tracker.is_awaiting_submit_confirm("t1"),
+            "Unavailable exits the confirm flavor — the next ForceRead \
+             must route to the #606 deadman verify, not back here"
+        );
+        assert_eq!(
+            tracker.next_deadline(),
+            Some(200 + CLAUDE_BUSY_DEADMAN_MS + 1),
+            "grace disarmed; deadman remains"
+        );
+    }
+
+    #[test]
+    fn bel_during_provisional_confirms_and_completes() {
+        // A real fast turn (<2s) must not lose its bell.
+        let mut tracker = ClaudeActivityTracker::new();
+        tracker.track_terminal("t1", Some("S"), 0);
+        tracker.note_input("t1", "\r", 10, true);
+        let effects = tracker.note_output("t1", "\u{07}", 1500);
+        assert_eq!(completions(&effects), vec![1]);
+        assert_eq!(tracker.list()[0].phase, ClaudePhase::Idle);
+    }
+
+    #[test]
+    fn unconfirmable_enter_keeps_legacy_semantics() {
+        // No truth source: today's contract exactly (in_flight, BEL).
+        let mut tracker = ClaudeActivityTracker::new();
+        tracker.track_terminal("t1", None, 0);
+        tracker.note_input("t1", "\r", 10, false);
+        assert!(tracker.expire(2011).is_empty(), "no grace machinery");
+        let effects = tracker.note_output("t1", "\u{07}", 3000);
+        assert_eq!(completions(&effects), vec![1]);
     }
 }

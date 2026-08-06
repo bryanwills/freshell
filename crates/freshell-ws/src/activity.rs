@@ -305,6 +305,13 @@ struct HubInner {
     /// tests (fakes) — no truth source = probe failure = crash semantics
     /// (owner ruling).
     claude_truth: Option<Arc<dyn crate::claude_truth::ClaudeTruth>>,
+    /// #611: terminal id → `(session_id, transcript byte offset)` stashed
+    /// at submit time; consumed by the confirm probe ONLY when the
+    /// currently-bound session id equals the stashed one (else the probe
+    /// is Unavailable — deadman backstop). Session-scoping is
+    /// load-bearing: A7's resume/fork mints a new file, and Task 10's
+    /// rebinds re-point the tracker mid-flight.
+    claude_submit_offsets: HashMap<String, (String, u64)>,
     /// Test-only send-side recorder of `note_opencode_lane_event` calls:
     /// (generation, cycle, stream, event), in call order. The stamps are
     /// not wire-visible, so lane tests pin them here.
@@ -1179,8 +1186,35 @@ impl ActivityHub {
                     }
                     match mode.as_str() {
                         "claude" => {
-                            let effects = inner.claude.note_input(&terminal_id, &data, at);
-                            // ForceRead only arises from expire()
+                            let confirmable = if freshell_activity::signal::is_submit_input(&data) {
+                                let session = inner.claude.session_id_of(&terminal_id);
+                                let truth = inner.claude_truth.clone();
+                                match (&session, &truth) {
+                                    (Some(session_id), Some(truth)) => {
+                                        match truth.transcript_len(session_id) {
+                                            Some(len) => {
+                                                // #611 + A7: the offset is
+                                                // valid ONLY for this
+                                                // session — resume/fork
+                                                // mints a new file.
+                                                inner.claude_submit_offsets.insert(
+                                                    terminal_id.clone(),
+                                                    (session_id.clone(), len),
+                                                );
+                                                true
+                                            }
+                                            None => false,
+                                        }
+                                    }
+                                    _ => false,
+                                }
+                            } else {
+                                false
+                            };
+                            let effects =
+                                inner
+                                    .claude
+                                    .note_input(&terminal_id, &data, at, confirmable);
                             let (frames, _) = claude_frames(&mut inner.idle, effects);
                             frames
                         }
@@ -1282,6 +1316,7 @@ impl ActivityHub {
                     if let Some(mode) = inner.modes.remove(&terminal_id) {
                         inner.idle.note_exit(&terminal_id);
                         inner.lanes.remove(&terminal_id);
+                        inner.claude_submit_offsets.remove(&terminal_id);
                         inner.lane_retries.remove(&terminal_id);
                         inner.codex_lanes.remove(&terminal_id);
                         if let Some((_, lane_task, _)) = inner.opencode_lanes.remove(&terminal_id) {
@@ -1719,13 +1754,57 @@ impl ActivityHub {
     /// = crash semantics (owner ruling).
     fn service_claude_verify(&self, terminal_id: &str) {
         use crate::claude_truth::TurnProbe;
-        let (session, truth) = {
+        let (session, truth, awaiting_confirm, offset) = {
             let inner = self.inner.lock().expect("activity hub lock");
             (
                 inner.claude.session_id_of(terminal_id),
                 inner.claude_truth.clone(),
+                inner.claude.is_awaiting_submit_confirm(terminal_id),
+                inner.claude_submit_offsets.get(terminal_id).cloned(),
             )
         };
+        if awaiting_confirm {
+            use crate::claude_truth::SubmitProbe;
+            // #611 + A7: the stash is (session_id, offset) — usable ONLY
+            // if the currently-bound session equals the stashed one.
+            // Resume/fork mints a NEW <session-id>.jsonl and Task 10's
+            // rebinds re-point the tracker mid-flight; probing a foreign
+            // file with a stale offset would be an undefined read, so a
+            // mismatch is a probe failure (Unavailable) and the #606
+            // deadman backstop takes over.
+            let probe = match (&session, &truth, &offset) {
+                (Some(session_id), Some(truth), Some((stashed_session, offset)))
+                    if stashed_session == session_id =>
+                {
+                    truth.probe_submit(session_id, *offset)
+                }
+                _ => SubmitProbe::Unavailable,
+            };
+            let frames = {
+                let mut inner = self.inner.lock().expect("activity hub lock");
+                let at = now_ms();
+                let effects = match probe {
+                    SubmitProbe::Confirmed => inner.claude.note_submit_confirmed(terminal_id, at),
+                    SubmitProbe::NoTurnStarted => {
+                        inner.claude.note_submit_unconfirmed(terminal_id, at)
+                    }
+                    SubmitProbe::Unavailable => {
+                        // Dead stash — drop it. The tracker call clears the
+                        // grace deadline and thereby exits the awaiting-
+                        // confirm state, so the pane's NEXT ForceRead falls
+                        // through to the deadman-verify flavor below and
+                        // crash semantics stay reachable at the 120s mark.
+                        inner.claude_submit_offsets.remove(terminal_id);
+                        inner.claude.note_submit_probe_unavailable(terminal_id);
+                        Vec::new()
+                    }
+                };
+                let (frames, _) = claude_frames(&mut inner.idle, effects);
+                frames
+            };
+            self.emit(frames);
+            return;
+        }
         let probe = match (&session, &truth) {
             (Some(session_id), Some(truth)) => truth.probe_turn_state(session_id),
             _ => TurnProbe::Unavailable,
@@ -5641,15 +5720,19 @@ mod tests {
 
     // ---- #606: claude deadman verified against the JSONL truth source ----
 
-    /// Fake truth source for the claude deadman tests: a settable
-    /// `TurnProbe` plus a log of every probed session id (the rebind
-    /// test asserts the probe follows the NEW session). `transcript_len
-    /// → None` — IMPORTANT: `None` keeps these deadman tests on the
-    /// legacy confirmed-busy input flavor once Task 11 lands, so they
-    /// stay valid; `probe_submit → SubmitProbe::Unavailable`.
+    /// Fake truth source for the claude deadman + submit-grace tests: a
+    /// settable `TurnProbe` plus a log of every probed session id (the
+    /// rebind test asserts the probe follows the NEW session). Defaults
+    /// keep the deadman tests on the legacy confirmed-busy input flavor:
+    /// `transcript_len → None`, `probe_submit → SubmitProbe::Unavailable`.
+    /// The #611 tests script both and read the `submit_probed` log.
     struct FakeClaudeTruth {
         probe: Mutex<crate::claude_truth::TurnProbe>,
         probed: Mutex<Vec<String>>,
+        transcript_len: Mutex<Option<u64>>,
+        submit_probe: Mutex<crate::claude_truth::SubmitProbe>,
+        /// (session_id, from_offset) of every probe_submit call.
+        submit_probed: Mutex<Vec<(String, u64)>>,
     }
 
     impl FakeClaudeTruth {
@@ -5657,6 +5740,9 @@ mod tests {
             Self {
                 probe: Mutex::new(probe),
                 probed: Mutex::new(Vec::new()),
+                transcript_len: Mutex::new(None),
+                submit_probe: Mutex::new(crate::claude_truth::SubmitProbe::Unavailable),
+                submit_probed: Mutex::new(Vec::new()),
             }
         }
     }
@@ -5671,15 +5757,19 @@ mod tests {
         }
 
         fn transcript_len(&self, _session_id: &str) -> Option<u64> {
-            None
+            *self.transcript_len.lock().expect("fake transcript len")
         }
 
         fn probe_submit(
             &self,
-            _session_id: &str,
-            _from_offset: u64,
+            session_id: &str,
+            from_offset: u64,
         ) -> crate::claude_truth::SubmitProbe {
-            crate::claude_truth::SubmitProbe::Unavailable
+            self.submit_probed
+                .lock()
+                .expect("submit probed log")
+                .push((session_id.to_string(), from_offset));
+            *self.submit_probe.lock().expect("fake submit probe")
         }
     }
 
@@ -5838,6 +5928,162 @@ mod tests {
             probed.last().map(String::as_str),
             Some("S1"),
             "the LAST probe still targets the stale session: {probed:?}"
+        );
+    }
+
+    /// #611 end-to-end: a bare Enter goes provisional; the confirm probe
+    /// says NoTurnStarted; the pane silently reverts to idle well before
+    /// the 120s deadman — and no bell rings.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn claude_bare_enter_reverts_via_submit_probe() {
+        let (hub, mut rx) = hub();
+        let fake = Arc::new(FakeClaudeTruth::new(
+            crate::claude_truth::TurnProbe::InFlight,
+        ));
+        *fake.transcript_len.lock().expect("fake transcript len") = Some(100);
+        *fake.submit_probe.lock().expect("fake submit probe") =
+            crate::claude_truth::SubmitProbe::NoTurnStarted;
+        // Deadman stays at its production 120s: the ONLY ForceRead in this
+        // window is the 2s submit-grace lapse.
+        hub.set_claude_truth(fake.clone());
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "claude".into(),
+                resume_session_id: Some("S".to_string()),
+                at: now_ms(),
+            },
+        );
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "t1".into(),
+                data: "\r".into(),
+                at: now_ms(),
+            },
+        );
+        next_frame_matching(&mut rx, "claude.activity.updated", 3_000, |v| {
+            v["upsert"][0]["phase"] == "busy" && v["upsert"][0]["terminalId"] == "t1"
+        })
+        .await
+        .expect("provisional busy upsert from the submit");
+
+        // Within ~3s (grace lapse at 2s → confirm probe → NoTurnStarted):
+        // the idle upsert lands, and NO bell frame precedes it.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(3_500);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "no silent revert within the grace window"
+            );
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(frame)) => {
+                    let value: serde_json::Value =
+                        serde_json::from_str(&frame).expect("frame json");
+                    assert!(
+                        value["type"] != "terminal.turn.complete",
+                        "a phantom Enter must not mint a completion: {frame}"
+                    );
+                    assert!(
+                        value["type"] != "terminal.idle",
+                        "a phantom Enter must not ring the attention bell: {frame}"
+                    );
+                    if value["type"] == "claude.activity.updated"
+                        && value["upsert"].as_array().is_some_and(|u| {
+                            u.iter()
+                                .any(|r| r["terminalId"] == "t1" && r["phase"] == "idle")
+                        })
+                    {
+                        break;
+                    }
+                }
+                _ => panic!("frame stream ended before the silent revert"),
+            }
+        }
+        // The probe consumed the SESSION-SCOPED stash from submit time.
+        assert_eq!(
+            fake.submit_probed
+                .lock()
+                .expect("submit probed log")
+                .clone(),
+            vec![("S".to_string(), 100)],
+            "one confirm probe against the stashed (session, offset)"
+        );
+    }
+
+    /// #611 + A7 session-scoping: a rebind between the stash and the
+    /// confirm probe makes the stash foreign — the probe must NOT read
+    /// the new session's file with the old offset (Unavailable instead),
+    /// and the #606 deadman verify remains the backstop (reachable
+    /// because the Unavailable resolution cleared the grace deadline and
+    /// with it `is_awaiting_submit_confirm`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn claude_rebind_between_stash_and_probe_is_unavailable() {
+        let (hub, mut rx) = hub();
+        let fake = Arc::new(FakeClaudeTruth::new(
+            crate::claude_truth::TurnProbe::InFlight,
+        ));
+        *fake.transcript_len.lock().expect("fake transcript len") = Some(100);
+        *fake.submit_probe.lock().expect("fake submit probe") =
+            crate::claude_truth::SubmitProbe::Confirmed;
+        // Helper shrinks the deadman to 300ms: the deadman ForceRead
+        // arrives BEFORE the 2s grace lapse and routes to the confirm
+        // flavor while the pane awaits confirmation.
+        verified_busy_claude_terminal(&hub, &mut rx, fake.clone(), "S").await;
+
+        // Rebind BEFORE any probe fires: the stash ("S", 100) is now
+        // foreign to the bound session.
+        hub.bind_claude_session("t1", "S2");
+
+        // Across the grace window: the pane stays provisionally busy —
+        // no idle upsert, no bell, no completion.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(2_500);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(frame)) => {
+                    let value: serde_json::Value =
+                        serde_json::from_str(&frame).expect("frame json");
+                    assert!(
+                        !(value["type"] == "claude.activity.updated"
+                            && value["upsert"].as_array().is_some_and(|u| {
+                                u.iter()
+                                    .any(|r| r["terminalId"] == "t1" && r["phase"] == "idle")
+                            })),
+                        "a mismatched stash must keep provisional busy: {frame}"
+                    );
+                    assert!(
+                        value["type"] != "terminal.idle",
+                        "a mismatched stash must not ring a bell: {frame}"
+                    );
+                    assert!(
+                        value["type"] != "terminal.turn.complete",
+                        "a mismatched stash must not mint a completion: {frame}"
+                    );
+                }
+                _ => break,
+            }
+        }
+        assert!(
+            fake.submit_probed
+                .lock()
+                .expect("submit probed log")
+                .is_empty(),
+            "session mismatch ⇒ probe_submit never reads a foreign file"
+        );
+        // The #606 deadman path remains armed: once the Unavailable
+        // resolution cleared the grace, the deadman ForceRead routes to
+        // the turn-state verify flavor against the NEW session.
+        let probed = fake.probed.lock().expect("probed log").clone();
+        assert!(
+            probed.iter().any(|s| s == "S2"),
+            "the deadman turn-state verify fires against the rebound \
+             session, got {probed:?}"
         );
     }
 }
