@@ -219,6 +219,10 @@ pub(crate) enum OpencodeLaneEvent {
     },
     /// `permission.replied` — the pause ends.
     PermissionReplied { permission_id: String },
+    /// The verify/connect `/session/status` probe failed in a way that
+    /// must NOT read as idle (#603/#604). The hub applies crash semantics
+    /// via [`OpencodeActivityTracker::note_verify_failed`].
+    SnapshotFailed { error: String },
 }
 
 struct AmplifierLane {
@@ -268,12 +272,21 @@ struct HubInner {
     lane_retries: HashMap<String, LaneRetry>,
     codex_lanes: HashMap<String, CodexLane>,
     codex_rollout_locator: Option<CodexRolloutLocator>,
-    /// Task 8/9: terminal id → (hub-issued attach generation, lane task).
-    /// The `OpencodeLane` ingress guard drops any event whose stamped
-    /// generation doesn't match the CURRENT entry; Exit removes the entry
-    /// so post-exit stragglers fail the match too. The `OpencodeAttach`
-    /// arm populates this for real; hub-level tests insert dummies.
-    opencode_lanes: HashMap<String, (u64, tokio::task::JoinHandle<()>)>,
+    /// Task 8/9: terminal id → (hub-issued attach generation, lane task,
+    /// verify-request sender — #603: `expire_due` asks the lane to
+    /// re-fetch `/session/status` through it). The `OpencodeLane` ingress
+    /// guard drops any event whose stamped generation doesn't match the
+    /// CURRENT entry; Exit removes the entry so post-exit stragglers fail
+    /// the match too. The `OpencodeAttach` arm populates this for real;
+    /// hub-level tests insert dummies.
+    opencode_lanes: HashMap<
+        String,
+        (
+            u64,
+            tokio::task::JoinHandle<()>,
+            tokio::sync::mpsc::UnboundedSender<()>,
+        ),
+    >,
     /// Task 9: monotonic attach-generation counter — bumped on EVERY
     /// `OpencodeAttach` (A6), so events from a replaced lane can never
     /// impersonate its successor.
@@ -497,7 +510,7 @@ impl ActivityHub {
             .expect("activity hub lock")
             .opencode_lanes
             .get(terminal_id)
-            .map(|(generation, _)| *generation)
+            .map(|(generation, _, _)| *generation)
     }
 
     /// Hub-level episode tests register a dummy `opencode_lanes` entry so
@@ -507,10 +520,26 @@ impl ActivityHub {
     #[cfg(test)]
     pub(crate) fn register_opencode_lane_for_tests(&self, terminal_id: &str, generation: u64) {
         let mut inner = self.inner.lock().expect("activity hub lock");
+        // Dummy verify channel: episode tests never service verify
+        // requests (the receiver is dropped, sends fail silently).
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         inner.opencode_lanes.insert(
             terminal_id.to_string(),
-            (generation, tokio::spawn(async {})),
+            (generation, tokio::spawn(async {}), tx),
         );
+    }
+
+    /// Test-scale hook: shrink the opencode busy-deadman window. Call
+    /// BEFORE driving any busy event — the hub scheduler recomputes its
+    /// one-shot deadline only on a HubEvent or timer fire, so a shrink
+    /// after the busy edge leaves the production window armed.
+    #[cfg(test)]
+    pub(crate) fn set_opencode_busy_deadman_for_tests(&self, ms: i64) {
+        self.inner
+            .lock()
+            .expect("activity hub lock")
+            .opencode
+            .set_busy_deadman_ms(ms);
     }
 
     /// Install the resume-time rollout locator (called once from
@@ -818,7 +847,9 @@ impl ActivityHub {
                 let frames = {
                     let mut inner = self.inner.lock().expect("activity hub lock");
                     let effects = inner.opencode.bind_session(&terminal_id, &session_id, at);
-                    opencode_frames(&mut inner.idle, effects)
+                    // ForceRead only arises from expire()
+                    let (frames, _) = opencode_frames(&mut inner.idle, effects);
+                    frames
                 };
                 self.emit(frames);
             }
@@ -838,54 +869,67 @@ impl ActivityHub {
                     // not stamped with the CURRENT lane generation (Exit removes the map
                     // entry, so post-exit stragglers drop too). cycle/stream still guard
                     // intra-lane reconnect staleness inside the tracker.
-                    if inner.opencode_lanes.get(&terminal_id).map(|(g, _)| *g) != Some(generation) {
+                    if inner.opencode_lanes.get(&terminal_id).map(|(g, _, _)| *g)
+                        != Some(generation)
+                    {
                         return;
                     }
-                    let effects =
-                        match event {
-                            OpencodeLaneEvent::Snapshot { statuses } => inner
+                    let effects = match event {
+                        OpencodeLaneEvent::Snapshot { statuses } => {
+                            inner
                                 .opencode
-                                .note_snapshot(&terminal_id, &statuses, cycle, stream, at),
-                            OpencodeLaneEvent::SessionCreated {
-                                session_id,
-                                parent_id,
-                            } => inner.opencode.note_session_created(
-                                &terminal_id,
-                                &session_id,
-                                parent_id.as_deref(),
-                                at,
-                            ),
-                            OpencodeLaneEvent::Status { session_id, status } => inner
-                                .opencode
-                                .note_status(&terminal_id, &session_id, status, cycle, stream, at),
-                            OpencodeLaneEvent::SessionIdle { session_id } => inner
-                                .opencode
-                                .note_session_idle(&terminal_id, &session_id, cycle, stream, at),
-                            OpencodeLaneEvent::SessionError {
-                                session_id,
-                                error_name,
-                            } => inner.opencode.note_error(
-                                &terminal_id,
-                                &session_id,
-                                &error_name,
-                                cycle,
-                                stream,
-                                at,
-                            ),
-                            OpencodeLaneEvent::PermissionAsked {
-                                session_id,
-                                permission_id,
-                            } => inner.opencode.note_permission_asked(
-                                &terminal_id,
-                                &session_id,
-                                &permission_id,
-                                at,
-                            ),
-                            OpencodeLaneEvent::PermissionReplied { permission_id } => inner
-                                .opencode
-                                .note_permission_replied(&terminal_id, &permission_id, at),
-                        };
-                    opencode_frames(&mut inner.idle, effects)
+                                .note_snapshot(&terminal_id, &statuses, cycle, stream, at)
+                        }
+                        OpencodeLaneEvent::SessionCreated {
+                            session_id,
+                            parent_id,
+                        } => inner.opencode.note_session_created(
+                            &terminal_id,
+                            &session_id,
+                            parent_id.as_deref(),
+                            at,
+                        ),
+                        OpencodeLaneEvent::Status { session_id, status } => inner
+                            .opencode
+                            .note_status(&terminal_id, &session_id, status, cycle, stream, at),
+                        OpencodeLaneEvent::SessionIdle { session_id } => inner
+                            .opencode
+                            .note_session_idle(&terminal_id, &session_id, cycle, stream, at),
+                        OpencodeLaneEvent::SessionError {
+                            session_id,
+                            error_name,
+                        } => inner.opencode.note_error(
+                            &terminal_id,
+                            &session_id,
+                            &error_name,
+                            cycle,
+                            stream,
+                            at,
+                        ),
+                        OpencodeLaneEvent::PermissionAsked {
+                            session_id,
+                            permission_id,
+                        } => inner.opencode.note_permission_asked(
+                            &terminal_id,
+                            &session_id,
+                            &permission_id,
+                            at,
+                        ),
+                        OpencodeLaneEvent::PermissionReplied { permission_id } => inner
+                            .opencode
+                            .note_permission_replied(&terminal_id, &permission_id, at),
+                        OpencodeLaneEvent::SnapshotFailed { error } => {
+                            tracing::error!(
+                                terminal_id = %terminal_id,
+                                %error,
+                                "opencode snapshot probe failed; applying crash semantics (clear busy + attention)"
+                            );
+                            inner.opencode.note_verify_failed(&terminal_id, at)
+                        }
+                    };
+                    // ForceRead only arises from expire()
+                    let (frames, _) = opencode_frames(&mut inner.idle, effects);
+                    frames
                 };
                 self.emit(frames);
             }
@@ -913,7 +957,7 @@ impl ActivityHub {
                 let generation = inner.opencode_lane_next_generation;
                 match inner.opencode_lane_deps.clone() {
                     Some(deps) => {
-                        let handle = crate::opencode_lane::spawn_opencode_lane(
+                        let (handle, verify_tx) = crate::opencode_lane::spawn_opencode_lane(
                             deps,
                             self.clone(),
                             terminal_id.clone(),
@@ -924,18 +968,18 @@ impl ActivityHub {
                         // re-allocates a NEW port, so the old lane is
                         // aborted, never shared. (Its already-enqueued
                         // events fail the generation guard.)
-                        if let Some((_, old)) = inner
+                        if let Some(old) = inner
                             .opencode_lanes
-                            .insert(terminal_id, (generation, handle))
+                            .insert(terminal_id, (generation, handle, verify_tx))
                         {
-                            old.abort();
+                            old.1.abort();
                         }
                     }
                     None => {
                         // No deps installed (unit tests / pre-Task-10 boot):
                         // still retire any existing lane so stragglers fail
                         // the guard.
-                        if let Some((_, old)) = inner.opencode_lanes.remove(&terminal_id) {
+                        if let Some((_, old, _)) = inner.opencode_lanes.remove(&terminal_id) {
                             old.abort();
                         }
                     }
@@ -994,7 +1038,9 @@ impl ActivityHub {
                                 resume_session_id.as_deref(),
                                 at,
                             );
-                            frames.extend(opencode_frames(&mut inner.idle, effects));
+                            // ForceRead only arises from expire()
+                            let (mut f, _) = opencode_frames(&mut inner.idle, effects);
+                            frames.append(&mut f);
                         }
                         // Gemini/Kimi and every other mode: status-inert.
                         _ => {}
@@ -1171,7 +1217,7 @@ impl ActivityHub {
                         inner.lanes.remove(&terminal_id);
                         inner.lane_retries.remove(&terminal_id);
                         inner.codex_lanes.remove(&terminal_id);
-                        if let Some((_, lane_task)) = inner.opencode_lanes.remove(&terminal_id) {
+                        if let Some((_, lane_task, _)) = inner.opencode_lanes.remove(&terminal_id) {
                             // Stop the SSE lane with its pane; the map removal
                             // ALSO makes any already-enqueued stragglers fail
                             // the generation guard (abort never retracts
@@ -1195,7 +1241,9 @@ impl ActivityHub {
                             }
                             "opencode" => {
                                 let effects = inner.opencode.note_exit(&terminal_id);
-                                opencode_frames(&mut inner.idle, effects)
+                                // ForceRead only arises from expire()
+                                let (frames, _) = opencode_frames(&mut inner.idle, effects);
+                                frames
                             }
                             _ => Vec::new(),
                         };
@@ -1476,10 +1524,11 @@ impl ActivityHub {
     }
 
     /// The one-shot deadline fired: run every tracker's expiry + the idle
-    /// gate, then service any codex + amplifier force-read requests.
+    /// gate, then service any codex + amplifier force-read requests and
+    /// opencode verify requests (#603).
     fn expire_due(&self) {
         let now = now_ms();
-        let (frames, codex_force_reads, force_reads, reattaches) = {
+        let (frames, codex_force_reads, force_reads, opencode_verifies, reattaches) = {
             let mut inner = self.inner.lock().expect("activity hub lock");
             let mut frames = Vec::new();
             let claude = inner.claude.expire(now);
@@ -1491,7 +1540,8 @@ impl ActivityHub {
             let (mut f, force_reads) = amplifier_frames(&mut inner.idle, amplifier);
             frames.append(&mut f);
             let opencode = inner.opencode.expire(now);
-            frames.extend(opencode_frames(&mut inner.idle, opencode));
+            let (mut f, opencode_verifies) = opencode_frames(&mut inner.idle, opencode);
+            frames.append(&mut f);
             for emission in inner.idle.expire(now) {
                 frames.push(ServerMessage::TerminalIdle(TerminalIdle {
                     terminal_id: emission.terminal_id,
@@ -1512,7 +1562,13 @@ impl ActivityHub {
                     ));
                 }
             }
-            (frames, codex_force_reads, force_reads, reattaches)
+            (
+                frames,
+                codex_force_reads,
+                force_reads,
+                opencode_verifies,
+                reattaches,
+            )
         };
         self.emit(frames);
         // KATA namg: service codex deadman force-reads -- the self-healing
@@ -1524,6 +1580,9 @@ impl ActivityHub {
         }
         for terminal_id in force_reads {
             self.drain_lane(&terminal_id);
+        }
+        for terminal_id in opencode_verifies {
+            self.request_opencode_verify(&terminal_id);
         }
         for (terminal_id, session_id, stored_path) in reattaches {
             // Port of the legacy resolveEventsPath semantics: the path is
@@ -1546,6 +1605,29 @@ impl ActivityHub {
             // (both degrade latches are sticky), and its failure paths feed
             // back into note_lane_failure, escalating `failures`.
             self.attach_lane(&terminal_id, &session_id, &events_path, AttachAt::Eof);
+        }
+    }
+
+    /// #603: ask the terminal's lane to re-fetch /session/status. A pane
+    /// with no lane has no truth source — owner ruling: probe failure =
+    /// crash semantics, applied immediately.
+    fn request_opencode_verify(&self, terminal_id: &str) {
+        let send_failed = {
+            let inner = self.inner.lock().expect("activity hub lock");
+            match inner.opencode_lanes.get(terminal_id) {
+                Some((_, _, verify_tx)) => verify_tx.send(()).is_err(),
+                None => true,
+            }
+        };
+        if send_failed {
+            let frames = {
+                let mut inner = self.inner.lock().expect("activity hub lock");
+                let at = now_ms();
+                let effects = inner.opencode.note_verify_failed(terminal_id, at);
+                let (frames, _) = opencode_frames(&mut inner.idle, effects);
+                frames
+            };
+            self.emit(frames);
         }
     }
 }
@@ -1707,12 +1789,15 @@ fn codex_frames(
 }
 
 /// Map opencode tracker effects onto wire frames + idle-gate interactions.
-/// No force-reads: the opencode lane is SSE-push, not file-tail.
+/// Opencode effects additionally surface deadman verify requests
+/// (`ForceRead`, #603) — the hub services them through the SSE lane's
+/// verify channel after the lock is released (expire_due only).
 fn opencode_frames(
     idle: &mut IdleGate,
     effects: Vec<TrackerEffect<OpencodeActivityRecord>>,
-) -> Vec<ServerMessage> {
+) -> (Vec<ServerMessage>, Vec<String>) {
     let mut frames = Vec::new();
+    let mut force_reads = Vec::new();
     for effect in effects {
         match effect {
             TrackerEffect::Changed { upsert, remove } => {
@@ -1753,11 +1838,12 @@ fn opencode_frames(
                 // processed first, so the boundary arms.
                 idle.note_turn_boundary(&terminal_id, at);
             }
-            // The opencode tracker never emits force-reads (SSE lane, no tailer).
-            TrackerEffect::ForceRead { .. } => {}
+            // #603: the deadman's verify request — the hub re-fetches
+            // /session/status through the lane's verify channel.
+            TrackerEffect::ForceRead { terminal_id, .. } => force_reads.push(terminal_id),
         }
     }
-    frames
+    (frames, force_reads)
 }
 
 /// Amplifier effects additionally surface force-read requests (the lane
@@ -5192,5 +5278,229 @@ mod tests {
             .await;
         }
         assert_eq!(hub.opencode_lane_generation("t-oc"), None);
+    }
+
+    // ---- #603: deadman verify serviced through the REAL lane ----
+
+    /// Minimal lane fakes for the hub-level verify-cycle tests (the
+    /// `opencode_lane.rs` harness is module-private): an HTTP fake with a
+    /// shared call log + injected responder, and an event stream that acks
+    /// the connect and then parks forever (the cycle stays open).
+    type VerifyHttpResponder =
+        Box<dyn Fn(&str) -> Result<(u16, serde_json::Value), String> + Send + Sync>;
+
+    struct VerifyLaneHttp {
+        log: Arc<Mutex<Vec<String>>>,
+        respond: VerifyHttpResponder,
+    }
+
+    impl crate::opencode_lane::OpencodeLaneHttp for VerifyLaneHttp {
+        fn get_json<'a>(
+            &'a self,
+            url: &'a str,
+        ) -> futures::future::BoxFuture<'a, Result<(u16, serde_json::Value), String>> {
+            Box::pin(async move {
+                self.log
+                    .lock()
+                    .expect("call log")
+                    .push(format!("GET {url}"));
+                (self.respond)(url)
+            })
+        }
+    }
+
+    struct ParkedStream;
+    impl crate::opencode_lane::OpencodeEventStream for ParkedStream {
+        fn connect<'a>(
+            &'a self,
+            _url: &'a str,
+        ) -> futures::future::BoxFuture<
+            'a,
+            Result<Box<dyn crate::opencode_lane::ConnectedOpencodeStream>, String>,
+        > {
+            Box::pin(async {
+                Ok(Box::new(ParkedConnection)
+                    as Box<dyn crate::opencode_lane::ConnectedOpencodeStream>)
+            })
+        }
+    }
+
+    struct ParkedConnection;
+    impl crate::opencode_lane::ConnectedOpencodeStream for ParkedConnection {
+        fn drive(
+            self: Box<Self>,
+            events_tx: tokio::sync::mpsc::UnboundedSender<freshell_opencode::ParsedServeEvent>,
+        ) -> futures::future::BoxFuture<'static, Result<(), String>> {
+            Box::pin(async move {
+                // Keep the sender alive while parked: a dropped sender
+                // reads as a clean stream end and would close the cycle.
+                let _keep_pump_open = events_tx;
+                std::future::pending::<()>().await;
+                unreachable!()
+            })
+        }
+    }
+
+    /// Shared setup for the verify-cycle tests: install the fake deps,
+    /// shrink the deadman BEFORE driving any busy event (ORDERING IS
+    /// LOAD-BEARING: the hub scheduler recomputes its one-shot deadline
+    /// only when a HubEvent arrives or the armed timer fires, and the
+    /// lock-and-set hook does neither — shrinking after the busy edge
+    /// leaves the production 120s deadline armed), then create + attach
+    /// and wait for the connect snapshot's busy upsert.
+    async fn verified_busy_opencode_terminal(
+        hub: &ActivityHub,
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+        http: VerifyLaneHttp,
+    ) {
+        hub.set_opencode_lane_deps(Arc::new(crate::opencode_lane::OpencodeLaneDeps {
+            http: Arc::new(http),
+            events: Arc::new(ParkedStream),
+        }));
+        hub.set_opencode_busy_deadman_for_tests(500);
+        observer_send(
+            hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "opencode".into(),
+                resume_session_id: Some("ses-1".into()),
+                at: now_ms(),
+            },
+        );
+        hub.attach_opencode_serve("t1", "127.0.0.1", 1);
+        // The real lane's connect snapshot lights the busy record.
+        next_frame_matching(rx, "opencode.activity.updated", 3_000, |v| {
+            v["upsert"][0]["phase"] == "busy" && v["upsert"][0]["terminalId"] == "t1"
+        })
+        .await
+        .expect("busy upsert from the connect snapshot");
+    }
+
+    /// #603 end-to-end: deadman fires ⇒ exactly one verification GET ⇒ the
+    /// busy record STAYS on the wire (no removal frame, no idle).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opencode_deadman_verify_keeps_busy_on_the_wire() {
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let http = VerifyLaneHttp {
+            log: log.clone(),
+            respond: Box::new(|url| {
+                if url.ends_with("/global/health") {
+                    return Ok((
+                        200,
+                        serde_json::json!({"healthy": true, "version": "1.18.14"}),
+                    ));
+                }
+                if url.ends_with("/session/status") {
+                    // Connect snapshot AND every verify: still busy.
+                    return Ok((200, serde_json::json!({"ses-1": {"type": "busy"}})));
+                }
+                if url.ends_with("/session/ses-1") {
+                    return Ok((200, serde_json::json!({"id": "ses-1"})));
+                }
+                Ok((404, serde_json::json!({})))
+            }),
+        };
+        let (hub, mut rx) = hub();
+        verified_busy_opencode_terminal(&hub, &mut rx, http).await;
+
+        // Let the shrunk deadman (500ms) fire at least once.
+        tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+
+        // (a) the deadman verified through the lane: the connect snapshot
+        //     plus at least one verification GET.
+        let status_gets = log
+            .lock()
+            .expect("call log")
+            .iter()
+            .filter(|c| c.ends_with("/session/status"))
+            .count();
+        assert!(
+            status_gets >= 2,
+            "expected the connect snapshot plus >=1 verification GET, got {status_gets}"
+        );
+
+        // (b) the busy record never left the wire: no removal frame, no
+        //     terminal.idle — a single pass over everything broadcast in
+        //     the interval, so neither frame type can mask the other.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(200);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(frame)) => {
+                    let value: serde_json::Value =
+                        serde_json::from_str(&frame).expect("frame json");
+                    assert!(
+                        !(value["type"] == "opencode.activity.updated"
+                            && value["remove"]
+                                .as_array()
+                                .is_some_and(|r| r.iter().any(|t| t == "t1"))),
+                        "the verified-busy record was dropped: {frame}"
+                    );
+                    assert!(
+                        value["type"] != "terminal.idle",
+                        "idle rang during a verified-busy turn: {frame}"
+                    );
+                }
+                _ => break,
+            }
+        }
+    }
+
+    /// #603 end-to-end sibling: the deadman's verify probe FAILS ⇒ crash
+    /// semantics — the busy record is removed AND the attention bell rings
+    /// (terminal.idle, reason grace).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opencode_deadman_verify_failure_rings() {
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let status_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let status_calls_in_responder = status_calls.clone();
+        let http = VerifyLaneHttp {
+            log: log.clone(),
+            respond: Box::new(move |url| {
+                if url.ends_with("/global/health") {
+                    return Ok((
+                        200,
+                        serde_json::json!({"healthy": true, "version": "1.18.14"}),
+                    ));
+                }
+                if url.ends_with("/session/status") {
+                    let n =
+                        status_calls_in_responder.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if n == 0 {
+                        // Connect snapshot: busy.
+                        return Ok((200, serde_json::json!({"ses-1": {"type": "busy"}})));
+                    }
+                    // Every verify probe: the serve is dead.
+                    return Err("connection refused".to_string());
+                }
+                if url.ends_with("/session/ses-1") {
+                    return Ok((200, serde_json::json!({"id": "ses-1"})));
+                }
+                Ok((404, serde_json::json!({})))
+            }),
+        };
+        let (hub, mut rx) = hub();
+        verified_busy_opencode_terminal(&hub, &mut rx, http).await;
+
+        // Deadman fires → verify → the probe fails → SnapshotFailed →
+        // crash semantics: the removal frame lands (boundary is LAST in
+        // the effect batch, so the remove is on the wire first)...
+        next_frame_matching(&mut rx, "opencode.activity.updated", 5_000, |v| {
+            v["remove"]
+                .as_array()
+                .is_some_and(|r| r.iter().any(|t| t == "t1"))
+        })
+        .await
+        .expect("crash semantics remove the busy record");
+
+        // ...and the attention bell rings after the grace.
+        let idle =
+            next_frame_matching(&mut rx, "terminal.idle", 5_000, |v| v["terminalId"] == "t1")
+                .await
+                .expect("verify-probe failure rings the attention bell");
+        assert_eq!(idle["reason"], "grace");
     }
 }

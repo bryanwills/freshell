@@ -105,7 +105,11 @@ pub(crate) fn spawn_opencode_lane(
     terminal_id: String,
     base_url: String,
     generation: u64,
-) -> tokio::task::JoinHandle<()> {
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::mpsc::UnboundedSender<()>,
+) {
+    let (verify_tx, verify_rx) = tokio::sync::mpsc::unbounded_channel();
     let lane = Lane {
         deps,
         hub,
@@ -113,7 +117,7 @@ pub(crate) fn spawn_opencode_lane(
         base_url,
         generation,
     };
-    tokio::spawn(lane.run())
+    (tokio::spawn(lane.run(verify_rx)), verify_tx)
 }
 
 /// Abort the inner drive task when the lane task itself is aborted/dropped —
@@ -142,7 +146,7 @@ impl Lane {
             .note_opencode_lane_event(&self.terminal_id, self.generation, cycle, stream, event);
     }
 
-    async fn run(self) {
+    async fn run(self, mut verify_rx: tokio::sync::mpsc::UnboundedReceiver<()>) {
         let mut cycle: u64 = 0;
         let mut stream: u64 = 0;
         let mut backoff = OPENCODE_RECONNECT_BASE_MS;
@@ -202,32 +206,41 @@ impl Lane {
                 //    be the seam). Buffered frames flush IN ORDER, then live.
                 let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
                 let mut drive_task = AbortOnDrop(tokio::spawn(conn.drive(events_tx)));
-                while let Some(parsed) = events_rx.recv().await {
-                    let Some(event) = translate_serve_event(&parsed) else {
-                        continue;
-                    };
-                    match &event {
-                        OpencodeLaneEvent::SessionCreated {
-                            session_id,
-                            parent_id,
-                        } => {
-                            known_sessions.insert(session_id.clone());
-                            if let Some(parent_id) = parent_id {
-                                known_sessions.insert(parent_id.clone());
+                loop {
+                    tokio::select! {
+                        maybe_parsed = events_rx.recv() => {
+                            let Some(parsed) = maybe_parsed else { break };
+                            let Some(event) = translate_serve_event(&parsed) else {
+                                continue;
+                            };
+                            match &event {
+                                OpencodeLaneEvent::SessionCreated {
+                                    session_id,
+                                    parent_id,
+                                } => {
+                                    known_sessions.insert(session_id.clone());
+                                    if let Some(parent_id) = parent_id {
+                                        known_sessions.insert(parent_id.clone());
+                                    }
+                                }
+                                OpencodeLaneEvent::Status { session_id, .. }
+                                | OpencodeLaneEvent::SessionIdle { session_id }
+                                | OpencodeLaneEvent::SessionError { session_id, .. }
+                                | OpencodeLaneEvent::PermissionAsked { session_id, .. } => {
+                                    self.resolve_root(cycle, stream, session_id, &mut known_sessions)
+                                        .await;
+                                }
+                                // No session id to resolve.
+                                OpencodeLaneEvent::PermissionReplied { .. }
+                                | OpencodeLaneEvent::Snapshot { .. }
+                                | OpencodeLaneEvent::SnapshotFailed { .. } => {}
                             }
+                            self.note(cycle, stream, event);
                         }
-                        OpencodeLaneEvent::Status { session_id, .. }
-                        | OpencodeLaneEvent::SessionIdle { session_id }
-                        | OpencodeLaneEvent::SessionError { session_id, .. }
-                        | OpencodeLaneEvent::PermissionAsked { session_id, .. } => {
-                            self.resolve_root(cycle, stream, session_id, &mut known_sessions)
-                                .await;
+                        Some(()) = verify_rx.recv() => {
+                            self.verify(cycle, stream, &mut known_sessions).await;
                         }
-                        // No session id to resolve.
-                        OpencodeLaneEvent::PermissionReplied { .. }
-                        | OpencodeLaneEvent::Snapshot { .. } => {}
                     }
-                    self.note(cycle, stream, event);
                 }
                 // rx drains to None only after drive dropped the sender on
                 // disconnect — every buffered/live event was pumped, none
@@ -240,7 +253,19 @@ impl Lane {
                 backoff = OPENCODE_RECONNECT_BASE_MS;
             }
             // 5. backoff between cycles (doubled after failures, capped).
-            tokio::time::sleep(Duration::from_millis(backoff)).await;
+            // Between cycles: a verify request arriving while disconnected
+            // still probes once — on a dead serve that yields
+            // SnapshotFailed → crash semantics, exactly the owner ruling.
+            let sleep = tokio::time::sleep(Duration::from_millis(backoff));
+            tokio::pin!(sleep);
+            loop {
+                tokio::select! {
+                    _ = &mut sleep => break,
+                    Some(()) = verify_rx.recv() => {
+                        self.verify(cycle, stream, &mut known_sessions).await;
+                    }
+                }
+            }
             backoff = (backoff * 2).min(OPENCODE_RECONNECT_MAX_MS);
         }
     }
@@ -275,6 +300,26 @@ impl Lane {
         tokio::time::timeout(Duration::from_millis(OPENCODE_HEALTH_TIMEOUT_MS), poll)
             .await
             .unwrap_or(false)
+    }
+
+    /// #603: service one hub verify request — re-fetch /session/status and
+    /// note the answer with the CURRENT cycle/stream stamps so the
+    /// tracker's stream guards accept it. A probe failure is noted as
+    /// SnapshotFailed (crash semantics downstream) — NEVER as an empty
+    /// (idle-shaped) snapshot.
+    async fn verify(&self, cycle: u64, stream: u64, known_sessions: &mut HashSet<String>) {
+        match self.fetch_snapshot().await {
+            Ok(statuses) => {
+                for (session_id, _) in &statuses {
+                    self.resolve_root(cycle, stream, session_id, known_sessions)
+                        .await;
+                }
+                self.note(cycle, stream, OpencodeLaneEvent::Snapshot { statuses });
+            }
+            Err(error) => {
+                self.note(cycle, stream, OpencodeLaneEvent::SnapshotFailed { error });
+            }
+        }
     }
 
     /// Step 3: GET {base}/session/status → object map. Entries whose
@@ -1070,7 +1115,8 @@ mod tests {
             at: 1_000,
         });
         hub.register_opencode_lane_for_tests("t-oc", 1);
-        let lane = spawn_opencode_lane(deps, hub.clone(), "t-oc".into(), "http://fake".into(), 1);
+        let (lane, _verify_tx) =
+            spawn_opencode_lane(deps, hub.clone(), "t-oc".into(), "http://fake".into(), 1);
 
         // Ingress order + stamping: Snapshot BEFORE the buffered
         // SessionIdle, all (generation 1, cycle 1, stream 1).
@@ -1174,7 +1220,8 @@ mod tests {
 
         let (hub, _rx) = hub();
         hub.register_opencode_lane_for_tests("t-oc", 1);
-        let lane = spawn_opencode_lane(deps, hub.clone(), "t-oc".into(), "http://fake".into(), 1);
+        let (lane, _verify_tx) =
+            spawn_opencode_lane(deps, hub.clone(), "t-oc".into(), "http://fake".into(), 1);
 
         let ingress = wait_for_ingress(&hub, 2, 5_000).await;
         assert_eq!(
@@ -1250,7 +1297,7 @@ mod tests {
 
         let (hub_ok, _rx) = hub();
         hub_ok.register_opencode_lane_for_tests("t-oc", 1);
-        let lane =
+        let (lane, _verify_tx) =
             spawn_opencode_lane(deps, hub_ok.clone(), "t-oc".into(), "http://fake".into(), 1);
 
         let ingress = wait_for_ingress(&hub_ok, 4, 5_000).await;
@@ -1330,7 +1377,7 @@ mod tests {
 
         let (hub_fail, _rx_fail) = hub();
         hub_fail.register_opencode_lane_for_tests("t-oc", 1);
-        let lane_fail = spawn_opencode_lane(
+        let (lane_fail, _verify_tx_fail) = spawn_opencode_lane(
             deps_fail,
             hub_fail.clone(),
             "t-oc".into(),
@@ -1368,5 +1415,83 @@ mod tests {
             "the resolver probe was attempted"
         );
         lane_fail.abort();
+    }
+
+    /// #603: a verify request makes the lane re-fetch /session/status and
+    /// note the result with the CURRENT cycle/stream stamps (so the
+    /// tracker's sameSessionStream guards accept it); a failing probe
+    /// notes SnapshotFailed instead of anything idle-shaped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_request_refetches_snapshot_with_current_stamps() {
+        let log: CallLog = Arc::new(Mutex::new(Vec::new()));
+        let snapshot_calls = Arc::new(AtomicUsize::new(0));
+        let snapshot_calls_in_responder = snapshot_calls.clone();
+        let http = FakeLaneHttp {
+            log: log.clone(),
+            respond: Box::new(move |url| {
+                if url.ends_with("/global/health") {
+                    return Ok((200, json!({"healthy": true, "version": "1.18.14"})));
+                }
+                if url.ends_with("/session/status") {
+                    let n = snapshot_calls_in_responder.fetch_add(1, Ordering::SeqCst);
+                    if n <= 1 {
+                        // connect snapshot + first verify: busy
+                        return Ok((200, json!({"ses-1": {"type": "busy"}})));
+                    }
+                    // second verify: probe failure
+                    return Err("connection refused".to_string());
+                }
+                if url.ends_with("/session/ses-1") {
+                    return Ok((200, json!({"id": "ses-1"})));
+                }
+                Ok((404, json!({})))
+            }),
+        };
+        let stream = FakeLaneStream {
+            log: log.clone(),
+            scripts: Mutex::new(VecDeque::from([StreamScript {
+                buffered: vec![],
+                live: vec![],
+                finish: false, // park: the cycle stays open
+            }])),
+        };
+        let (hub, _rx) = hub();
+        hub.register_opencode_lane_for_tests("t1", 7);
+        let deps = Arc::new(OpencodeLaneDeps {
+            http: Arc::new(http),
+            events: Arc::new(stream),
+        });
+        let (lane, verify_tx) = spawn_opencode_lane(
+            deps,
+            hub.clone(),
+            "t1".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            7,
+        );
+        // Connect snapshot arrives first.
+        let log1 = wait_for_ingress(&hub, 2, 2000).await; // SessionCreated + Snapshot
+        let (gen0, cycle0, stream0, _) = log1[log1.len() - 1].clone();
+        // Verify request → a SECOND /session/status GET, same stamps.
+        verify_tx.send(()).expect("verify channel open");
+        let log2 = wait_for_ingress(&hub, 3, 2000).await;
+        let (gen1, cycle1, stream1, event1) = log2[log2.len() - 1].clone();
+        assert_eq!((gen1, cycle1, stream1), (gen0, cycle0, stream0));
+        assert_eq!(
+            event1,
+            OpencodeLaneEvent::Snapshot {
+                statuses: vec![("ses-1".to_string(), OpencodeStatus::Busy)]
+            }
+        );
+        // Second verify: the probe fails → SnapshotFailed, never idle.
+        verify_tx.send(()).expect("verify channel open");
+        let log3 = wait_for_ingress(&hub, 4, 2000).await;
+        match &log3[log3.len() - 1].3 {
+            OpencodeLaneEvent::SnapshotFailed { error } => {
+                assert!(error.contains("connection refused"), "got: {error}");
+            }
+            other => panic!("expected SnapshotFailed, got {other:?}"),
+        }
+        assert_eq!(snapshot_calls.load(Ordering::SeqCst), 3);
+        lane.abort();
     }
 }

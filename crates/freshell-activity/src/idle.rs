@@ -83,11 +83,11 @@
 //!     quit inputs dispose runners via the abort path before exit); the
 //!     wire-flush instant is unprovable from code but mitigated upstream by
 //!     graceful SSE stream termination.
-//! 12. The opencode 120s busy deadman is EVENT-SILENCE-keyed (deltas and
-//!     heartbeats do not refresh it): a single >120s silent tool call trips it
-//!     mid-turn. Ownership survives and the turn's completion still rings —
-//!     the cost is the dropped busy light plus lost post-deadman death
-//!     engagement (the removal itself stays silent).
+//! 12. (CLOSED by #603, 2026-08-06) The opencode busy deadman no longer
+//!     drops the record on event silence: it verifies via GET
+//!     /session/status through the lane and stays busy; a failed probe
+//!     clears busy AND rings the attention boundary (owner ruling:
+//!     verify-probe failure = crash/needs-attention).
 
 use std::collections::HashMap;
 
