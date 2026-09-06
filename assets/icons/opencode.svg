@@ -1,15 +1,1 @@
-<svg height="64" width="64" id="Layer_1" xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="444.00 174.00 312.00 312.00">
-  <defs>
-    <style>
-      .st0 {
-        fill: #1e1e1e;
-      }
-
-      .st1 {
-        fill: #cdcdcd;
-      }
-    </style>
-  </defs>
-  <path class="st0" d="M520,180h200v300h-240V180h40ZM540,300v120h120v-180h-120v60Z"/>
-  <path class="st1" d="M660,300v120h-120v-120h120Z"/>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" id="Layer_1" width="64" height="64" version="1.1" viewBox="444 174 312 312"><defs><style>.st0{fill:#1e1e1e}.st1{fill:#cdcdcd}</style></defs><path d="M520,180h200v300h-240V180h40ZM540,300v120h120v-180h-120v60Z" class="st0"/><path d="M660,300v120h-120v-120h120Z" class="st1"/></svg>
